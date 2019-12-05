@@ -36,8 +36,7 @@ delete_data(Pid, TableName, ColName, Val) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init([]) ->
     %% システムテーブル作成
-    ets:new(ms_tables, [set, named_table, public]),
-    ets:new(ms_tab_columns, [set, named_table, public]),
+    create_system_tables(),
     {ok, []}.
 
 handle_call({create_table, {TableName, ColumnList}}, _From, _State) ->
@@ -46,12 +45,6 @@ handle_call({create_table, {TableName, ColumnList}}, _From, _State) ->
     {reply, ok, []};
 handle_call({drop_table, {TableName}}, _From, _State) ->
     ColumnList = get_column_list(TableName),
-    %% テーブルの全レコードを削除
-    drop_kvstore(TableName),
-    %% 全カラムインデックスを削除
-    lists:map(fun(ColumnName) ->
-        drop_column_index(get_column_index_id(TableName, ColumnName))
-    end, ColumnList),
     unregister_table(TableName),
     unregister_column(TableName, ColumnList),
     {reply, ok, []};
@@ -164,6 +157,10 @@ delete_column_index(ColumnIndexId, Val, Oid) ->
 select_column_index(ColumnIndexId, Val) ->
     ets:lookup(ColumnIndexId, Val).
 
+%% カラムインデックスを作成する
+create_column_index(ColumnIndexName) ->
+    ets:new(ColumnIndexName, [set, named_table, public]).
+
 %% カラムインデックスを削除する
 drop_column_index(ColumnIndexId) ->
     ets:delete(ColumnIndexId).
@@ -242,15 +239,21 @@ delete_kvstore(TableName, Oid) ->
 % System Table mng functions.
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% ms_tablesにテーブルを登録する
+%% システムテーブルを作成する
+create_system_tables() ->
+    ets:new(ms_tables, [set, named_table, public]),
+    ets:new(ms_tab_columns, [set, named_table, public]).
+
+%% テーブルを作成して、ms_tablesにテーブルを登録する
 register_table(TableName, ColumnList) ->
-    TableId = ets:new(TableName, [set, named_table, public]),
+    TableId = create_kvstore(TableName),
     ets:insert(ms_tables, {TableName, TableId, ColumnList}).
 
-%% ms_tablesからテーブルを削除する
+%% ms_tablesからテーブル情報を削除し、テーブルを削除する
 unregister_table(TableName) ->
     TableId = get_table_id(TableName),
-    ets:delete(ms_tables, TableId).
+    ets:delete(ms_tables, TableId),
+    drop_kvstore(TableName).
 
 %% テーブル名からテーブルIDを取得する
 get_table_id(TableName)->
@@ -263,7 +266,7 @@ register_column(TableName, ColumnNameList) when is_list(ColumnNameList) ->
         ColumnNameList);
 register_column(TableName, ColumnName) ->
     ColumnIndexName = get_tab_column_key(TableName, ColumnName),
-    ColumnIndexId = ets:new(ColumnIndexName, [set, named_table, public]),
+    ColumnIndexId = create_column_index(ColumnIndexName),
     ets:insert(ms_tab_columns, {ColumnIndexName, TableName, ColumnName, ColumnIndexId}).
 
 %% ms_tab_columnsからカラムを削除する
@@ -273,7 +276,8 @@ unregister_column(TableName, ColumnNameList) when is_list(ColumnNameList) ->
         ColumnNameList);
 unregister_column(TableName, ColumnName) ->
     ColumnIndexName = get_tab_column_key(TableName, ColumnName),
-    ets:delete(ms_tab_columns, ColumnIndexName).
+    ets:delete(ms_tab_columns, ColumnIndexName),
+    drop_column_index(ColumnIndexName).
 
 get_column_list(TableName) ->
     case ets:lookup_element(ms_tables, TableName, 3) of
