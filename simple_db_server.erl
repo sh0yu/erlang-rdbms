@@ -82,7 +82,6 @@ handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, _State) ->
         %% 更新対象のカラムごとにカラムインデックスを更新する
         %% ex. {name, apple}
         FF = fun({ColumnN, NewColVal}) ->
-            %% 古いインデックス情報を削除する
             ColumnIndexId = get_column_index_id(TableName, ColumnN),
             {_Key, OldColVal} = lists:keyfind(ColumnN, 1, OldValWithCol),
             update_column_index(ColumnIndexId, OldColVal, NewColVal, Oid)
@@ -157,7 +156,7 @@ delete_column_index(ColumnIndexId, Val, Oid) ->
             NewOidList = lists:filter(fun(X) -> X =/= Oid end, OidList),
             case NewOidList of
                 [] -> ets:delete(ColumnIndexId, Val);
-                true -> ets:insert(ColumnIndexId, {Val, NewOidList})
+                _ -> ets:insert(ColumnIndexId, {Val, NewOidList})
             end
     end.
 
@@ -190,7 +189,7 @@ select_object_id_list(TableName, ColumnName, Val) ->
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 create_kvstore(TableName) ->
-    ets:new(TableName, [set, named_table]).
+    ets:new(TableName, [set, named_table, public]).
 
 drop_kvstore(TableName) ->
     ets:delete(TableName).
