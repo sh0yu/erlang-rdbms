@@ -54,14 +54,14 @@ handle_call({insert, {TableName, Val}}, _From, _State) ->
     insert_all_column_index(TableName, Val, Oid),
     {reply, Oid, []};
 handle_call({select, {TableName, ColumnName, Val}}, _From, _State) ->
-    OidList = select_object_id_list(TableName, ColumnName, Val),
+    OidList = select_column_index(TableName, ColumnName, Val),
     case select_kvstore(TableName, OidList) of
             table_not_found -> table_not_found;
             [] -> {reply, not_found, []};
             RetVal -> {reply, RetVal, []}
     end;
 handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, _State) ->
-    OidList = select_object_id_list(TableName, ColumnName, Val),
+    OidList = select_column_index(TableName, ColumnName, Val),
     ColumnList = get_column_list(TableName),
     SetQueryConverted = convert_set_query(SetQuery, ColumnList),
     F = fun(Oid) ->
@@ -84,7 +84,7 @@ handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, _State) ->
     lists:map(F, OidList),
     {reply, ok, []};
 handle_call({delete, {TableName, ColumnName, Val}}, _From, _State) ->
-    OidList = select_object_id_list(TableName, ColumnName, Val),
+    OidList = select_column_index(TableName, ColumnName, Val),
     ColumnList = get_column_list(TableName),
     F = fun(Oid) ->
         KvVal = select_kvstore(TableName, Oid),
@@ -154,8 +154,12 @@ delete_column_index(ColumnIndexId, Val, Oid) ->
     end.
 
 %% カラムインデックスからオブジェクトIDを取得する
-select_column_index(ColumnIndexId, Val) ->
-    ets:lookup(ColumnIndexId, Val).
+select_column_index(TableName, ColumnName, Val) ->
+    ColumnIndexId = get_column_index_id(TableName, ColumnName),
+    case ets:lookup(ColumnIndexId, Val) of
+        [] -> [];
+        [{_Val, OidList}] -> OidList
+    end.
 
 %% カラムインデックスを作成する
 create_column_index(ColumnIndexName) ->
@@ -174,13 +178,6 @@ insert_all_column_index(TableName, ValList, Oid) ->
     end,
     lists:map(InsertColumnIndex, lists:zip(ColumnList, ValList)).
     
-%% 指定されたテーブルで条件に当てはまるオブジェクトIDのリストを取得する
-select_object_id_list(TableName, ColumnName, Val) ->
-    ColumnIndexId = get_column_index_id(TableName, ColumnName),
-    case ets:lookup(ColumnIndexId, Val) of
-        [] -> [];
-        [{_Val, OidList}] -> OidList
-    end.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Datastore mng functions.
 %
