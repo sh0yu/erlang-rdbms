@@ -1,11 +1,12 @@
 -module(client_query_executor).
 -compile(export_all).
 
-exec([SdsPid, TxMngPid]) ->
-    {ok, Pid} = query_executor:start_link([SdsPid, TxMngPid]),
+exec() ->
+    sup:start_link(),
+    Pid = whereis(query_executor),
     Price1 = rand:uniform(3),
     io:format("ClientPid: ~p, QueryExecutorPid: ~p~n", [self(), Pid]),
-    % query_executor:exec_query(Pid, {create_table, fruit, [name, price]}),
+    query_executor:exec_query(Pid, {create_table, fruit, [name, price]}),
     Txid = query_executor:exec_query(Pid, {begin_tx}),
     query_executor:exec_query(Pid, {insert, fruit, [apple, Price1]}),
     query_executor:exec_query(Pid, {insert, fruit, [apple, rand:uniform(3)]}),

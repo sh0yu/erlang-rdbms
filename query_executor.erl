@@ -2,8 +2,10 @@
 -compile(export_all).
 -behaviour(gen_server).
 -record(state, {sdsPid, txMngPid, txid, lKvstore, lColumnIndex, msQueryLog, queryId}).
-start_link([SdsPid, TxMngPid]) ->
-    gen_server:start_link(?MODULE, [SdsPid, TxMngPid], [{debug, [log]}]).
+-include_lib("kernel/include/logger.hrl").
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], [{debug, [log]}]).
 
 stop(Pid) ->
     gen_server:call(Pid, terminate).
@@ -23,7 +25,9 @@ exec_query(Pid, Query) ->
 % Callback functions of gen_server.
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-init([SdsPid, TxMngPid]) ->
+init([]) ->
+    SdsPid = whereis(simple_db_server),
+    TxMngPid = whereis(tx_mng),
     {LKvstore, LColumnIndex, MsQueryLog} = create_local_tables(),
     {ok, #state{sdsPid = SdsPid, txMngPid = TxMngPid, lKvstore = LKvstore,
     lColumnIndex = LColumnIndex, msQueryLog = MsQueryLog, queryId = []}}.
