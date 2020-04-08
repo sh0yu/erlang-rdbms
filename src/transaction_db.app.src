@@ -1,0 +1,16 @@
+{application, transaction_db,
+ [{description, "Transaction support rdbms"},
+  {vsn, "0.0.1"},
+  {modules, [
+	     query_exec,
+         simple_db_server,
+         sup,
+         tx_mng
+        ]},
+  {registered, [
+         query_exec,
+         simple_db_server,
+         tx_mng
+	    ]},
+  {applications, [kernel, stdlib]},
+  {mod, {app, []}}]}.

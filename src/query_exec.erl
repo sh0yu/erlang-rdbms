@@ -1,11 +1,12 @@
--module(query_executor).
+-module(query_exec).
 -compile(export_all).
 -behaviour(gen_server).
 -record(state, {sdsPid, txMngPid, txid, lKvstore, lColumnIndex, msQueryLog, queryId}).
 -include_lib("kernel/include/logger.hrl").
 
 start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], [{debug, [log]}]).
+    % gen_server:start_link({local, ?MODULE}, ?MODULE, [], [{debug, [log]}]).
+    gen_server:start_link(?MODULE, [], [{debug, [log]}]).
 
 stop(Pid) ->
     gen_server:call(Pid, terminate).
@@ -15,7 +16,7 @@ stop(Pid) ->
 % Client program call these APIs.
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% Pid: query_executorサーバのPID
+%% Pid: query_execサーバのPID
 %% CPid: クライアントのPID
 %% Query: SQLクエリ
 exec_query(Pid, Query) ->
