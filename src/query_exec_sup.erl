@@ -9,6 +9,6 @@ start_link() ->
 
 %% 各サーバを起動する
 init(_Args) ->
-    SupFlags = {simple_one_for_one, 3, 30},
+    SupFlags = {simple_one_for_one, 0, 1},
     QueryExecSpec = {query_exec, {query_exec, start_link, []}, temporary, 1000, worker, [query_exec]},
     {ok, {SupFlags, [QueryExecSpec]}}.

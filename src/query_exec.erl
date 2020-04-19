@@ -5,7 +5,6 @@
 -include_lib("kernel/include/logger.hrl").
 
 start_link() ->
-    % gen_server:start_link({local, ?MODULE}, ?MODULE, [], [{debug, [log]}]).
     gen_server:start_link(?MODULE, [], [{debug, [log]}]).
 
 stop(Pid) ->
@@ -33,11 +32,6 @@ init([]) ->
     {ok, #state{sdsPid = SdsPid, txMngPid = TxMngPid, lKvstore = LKvstore,
     lColumnIndex = LColumnIndex, msQueryLog = MsQueryLog, queryId = []}}.
 
-handle_call({exec_query, {allow_tx}}, _From, State)->
-    TPid = get_tx_mng_pid(State),
-    Txid = get_txid(State),
-    Rep = tx_mng:allow_tx(TPid, Txid),
-    {reply, Rep, State};
 handle_call({exec_query, {begin_tx}}, _From, State)->
     TPid = get_tx_mng_pid(State),
     %% トランザクションを開始する
@@ -85,7 +79,6 @@ handle_call({exec_query, {insert, TableName, Val}}, _From, State)->
         transaction_not_found ->
             {reply, transaction_not_found, State};
         ok -> 
-        % timer:sleep(10000),
             QueryId = generate_query_id(),
             ObjectId = generate_object_id(),
             case check_table_exists(TableName, Val) of
@@ -101,12 +94,11 @@ handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State)->
         transaction_not_found ->
             {reply, transaction_not_found, State};
         ok -> 
-            SPid = get_db_pid(State),
             QueryIdList = get_query_id_list(State),
             %% オブジェクトIDを取得する
-            OidList = select_object_id_list(State, SPid, TableName, ColName, Val, QueryIdList),
+            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
             %% オブジェクトIDから値を取得する
-            {reply, select_data(State, SPid, TableName, OidList, QueryIdList), State}
+            {reply, select_data(State, TableName, OidList, QueryIdList), State}
     end;
 handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State)->
     %% トランザクションが許可されている場合のみ次に進める
@@ -117,15 +109,14 @@ handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, St
             QueryId = generate_query_id(),
             LKvstore = get_local_kvstore(State),
             LColumnIndex = get_local_column_index(State),
-            SPid = get_db_pid(State),
             QueryIdList = get_query_id_list(State),
             ColumnList = simple_db_server:get_column_list(TableName),
             SetQueryConverted = simple_db_server:convert_set_query(SetQuery, ColumnList),
-            OidList = select_object_id_list(State, SPid, TableName, ColName, Val, QueryIdList),
+            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
             F = fun(Oid) ->
                 %% OldVal -> [banana, 100]
                 %% NewVal -> [apple, 100]
-                OldVal = select_data(State, SPid, TableName, Oid, QueryIdList),
+                OldVal = select_data(State, TableName, Oid, QueryIdList),
                 OldValWithCol = lists:zip(simple_db_server:get_column_list(TableName),OldVal),
                 NewVal = simple_db_server:build_new_val(OldVal, SetQueryConverted),
                 %% 更新前値をローカルデータから削除
@@ -151,12 +142,10 @@ handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State)->
             {reply, transaction_not_found, State};
         ok -> 
             QueryId = generate_query_id(),
-            io:format("QueryId: ~p~n", [QueryId]),
-            SPid = get_db_pid(State),
             QueryIdList = get_query_id_list(State),
             %% オブジェクトIDを取得する
-            OidList = select_object_id_list(State, SPid, TableName, ColName, Val, QueryIdList),
-            lists:map(fun(Oid) -> local_delete_data(State, QueryId, TableName, Oid, select_data(State, SPid, TableName, Oid, QueryIdList)) end,
+            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+            lists:map(fun(Oid) -> local_delete_data(State, QueryId, TableName, Oid, select_data(State, TableName, Oid, QueryIdList)) end,
             OidList),
             {reply, ok, State#state{queryId = QueryIdList ++ [QueryId]}}
     end;
@@ -256,14 +245,13 @@ generate_query_id() ->
     erlang:system_time(nanosecond).
 
 %% 共有領域にテーブルとカラムが存在するかチェックする
-check_table_exists(TableName, Val) ->
+check_table_exists(_TableName, _Val) ->
     %% TODO: 実装
     true.
 
 %% オブジェクトIDのリストを取得する
 %% 共有データを検索し、さらにローカルデータを検索する
-select_object_id_list(State, SPid, TableName, ColName, Val, QueryIdList) ->
-    io:format("QueryIdList: ~p~n", [QueryIdList]),
+select_object_id_list(State, TableName, ColName, Val, QueryIdList) ->
     %% 共有データを検索
     ShareData = simple_db_server:select_column_index(TableName, ColName, Val),
     %% QueryIdListの順にローカルデータを検索してマージする
@@ -287,11 +275,10 @@ merge_local_index_local(ShareData, {_QueryId, del, _TableName, _ColName, _Val, O
 
 %% オブジェクトIDを使ってデータを取得する
 %% 共有データとローカルデータからデータを取得し、マージして返却する
-select_data(State, SPid, TableName, OidList, QueryIdList) when is_list(OidList)->
-    lists:map(fun(Oid) -> select_data(State, SPid, TableName, Oid, QueryIdList) end, OidList);
-select_data(State, SPid, TableName, Oid, QueryIdList) ->
+select_data(State, TableName, OidList, QueryIdList) when is_list(OidList)->
+    lists:map(fun(Oid) -> select_data(State, TableName, Oid, QueryIdList) end, OidList);
+select_data(State,TableName, Oid, QueryIdList) ->
     ShareData = simple_db_server:select_kvstore(TableName, Oid),
-    io:format("ShareData: ~p~n", [ShareData]),
     lists:foldl(fun(QueryId, SData) -> merge_local_data(State, SData, Oid, QueryId) end,
     ShareData, QueryIdList).
 
@@ -321,7 +308,7 @@ commit_local_index(State, QueryId) ->
     LocalDataList = ets:lookup(LColumnIndex, QueryId),
     DelList = lists:filter(fun({_QueryId, Act, _TableName, _ColName, _Val, _Oid}) -> Act =:= del end, LocalDataList),
     InsList = lists:filter(fun({_QueryId, Act, _TableName, _ColName, _Val, _Oid}) -> Act =:= ins end, LocalDataList),
-    io:format("DelListIndex: ~p, InsListIndex: ~p~n", [DelList, InsList]),
+    % io:format("DelListIndex: ~p, InsListIndex: ~p~n", [DelList, InsList]),
     FDel = fun({_QueryId, del, TableName, ColName, Val, Oid}) ->
         ColumnIndexId = simple_db_server:get_column_index_id(TableName, ColName),
         simple_db_server:delete_column_index(ColumnIndexId, Val, Oid)
@@ -339,9 +326,9 @@ commit_kvstore(State, QueryId) ->
     LocalDataList = ets:lookup(LKvstore, QueryId),
     DelList = lists:filter(fun({_QueryId, Act, _TableName, _Oid, _Val}) -> Act =:= del end, LocalDataList),
     InsList = lists:filter(fun({_QueryId, Act, _TableName, _Oid, _Val}) -> Act =:= ins end, LocalDataList),
-    io:format("DelListKvstore: ~p, InsListKvstore: ~p~n", [DelList, InsList]),
-    FDel = fun({_QueryId, del, TableName, Oid, Val}) ->
-        simple_db_server:insert_kvstore(TableName, Oid, Val)
+    % io:format("DelListKvstore: ~p, InsListKvstore: ~p~n", [DelList, InsList]),
+    FDel = fun({_QueryId, del, TableName, Oid, _Val}) ->
+        simple_db_server:delete_kvstore(TableName, Oid)
     end,
     FIns = fun({_QueryId, ins, TableName, Oid, Val}) ->
         simple_db_server:insert_kvstore(TableName, Oid, Val)

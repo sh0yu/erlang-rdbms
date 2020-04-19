@@ -1,7 +1,7 @@
 -module(tx_mng).
 -compile(export_all).
 -behaviour(gen_server).
-
+-include_lib("kernel/include/logger.hrl").
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -25,6 +25,8 @@ allow_tx(Pid, Txid) ->
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init([]) ->
+    %% loggerの設定
+    logger:set_primary_config(level, info),
     %% システムテーブル作成
     ets:new(ms_tx_mng, [set, named_table, public]),
     ets:new(ms_waiting_proc, [set, named_table, public]),
@@ -34,17 +36,17 @@ handle_call(terminate, _From, _State) ->
     {stop, normal, ok, []};
 handle_call({begin_tx}, _From, _State) ->
     Txid = generate_txid(),
+    % ?LOG_INFO("TransactionId:~p", [Txid]),
     register_tx(Txid),
     {reply, Txid,[]};
 handle_call({allow_tx, Txid}, From, _State) ->
-    io:format("Is Active Tx:~p~n", [is_active_tx(Txid)]),
     case is_active_tx(Txid) of
         true -> {reply, ok, []};
         false -> 
-            io:format("transaction not allowed~n"),
             stack_waiting_process(Txid, From),
-            io:format("waiting list added~n"),
-            {noreply, [], infinity}
+            {noreply, [], infinity};
+        transaction_not_found ->
+            {reply, transaction_not_found, []}
     end;
 handle_call({commit_tx, Txid}, _From, _State) ->
     commit_tx(Txid),
@@ -82,7 +84,6 @@ activate_tx() ->
     case ets:match_object(ms_tx_mng, {'_', '_', active}) of 
         %% activeなトランザクションが存在する
         [_] -> 
-            io:format("Transaction not acquired.~n"),
             transaction_not_acquired;
         %% activeになっているトランザクションがいない
         [] -> 
@@ -94,7 +95,6 @@ activate_tx() ->
                 InactiveTxList ->
                     {OldestTxid, OldestTimestamp, _Status} = get_oldest_tx(InactiveTxList),
                     ets:insert(ms_tx_mng, {OldestTxid, OldestTimestamp, active}),
-                    io:format("Oldest Txid: ~p~n", [OldestTxid]),
                     notify_tx_active(ets:lookup(ms_waiting_proc, OldestTxid))
             end
     end.
@@ -151,11 +151,11 @@ is_active_tx(Txid) ->
 
 %% トランザクションの実行許可待ちリスト
 %% 実行許可依頼がリクエストされた際に、トランザクションがactiveではない場合に追加される
-stack_waiting_process(Txid, QPid) ->
-    ets:insert(ms_waiting_proc, {Txid, QPid}).
+stack_waiting_process(Txid, From) ->
+    ets:insert(ms_waiting_proc, {Txid, From}).
 
 notify_tx_active([]) ->
     transaction_not_found;
-notify_tx_active([{_Txid, From}]) ->
-    io:format("waiting transaction found~n"),
+notify_tx_active([{Txid, From}]) ->
+    ets:delete(ms_waiting_proc, Txid),
     gen_server:reply(From, ok).
