@@ -8,6 +8,8 @@ ebin/*.beam
 rel/example_project
 .concrete/DEV_MODE
 .rebar
+*.dat
+*.sys
 
 .DS_Store
 _build/

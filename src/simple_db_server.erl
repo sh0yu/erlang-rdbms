@@ -2,6 +2,12 @@
 -compile(export_all).
 -behaviour(gen_server).
 
+-include("../include/simple_db_server.hrl").
+
+-record(st, {
+    fd_ms_tables
+}).
+
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -36,31 +42,32 @@ delete_data(Pid, TableName, ColName, Val) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init([]) ->
     %% システムテーブル作成
-    create_system_tables(),
-    {ok, []}.
+    {ok, Fd} = load_system_tables(),
+    {ok, #st{fd_ms_tables=Fd}}.
 
-handle_call({create_table, {TableName, ColumnList}}, _From, _State) ->
-    register_table(TableName, ColumnList),
+handle_call({create_table, {TableName, ColumnList}}, _From, #st{fd_ms_tables=Fd} = State) ->
+    register_table(TableName, ColumnList, Fd),
     register_column(TableName, ColumnList),
-    {reply, ok, []};
-handle_call({drop_table, {TableName}}, _From, _State) ->
+    {reply, ok, State};
+%% TODO:テーブルが存在しなかったときのエラーハンドリング
+handle_call({drop_table, {TableName}}, _From, #st{fd_ms_tables=Fd} = State) ->
     ColumnList = get_column_list(TableName),
-    unregister_table(TableName),
+    unregister_table(TableName, Fd),
     unregister_column(TableName, ColumnList),
-    {reply, ok, []};
-handle_call({insert, {TableName, Val}}, _From, _State) ->
+    {reply, ok, State};
+handle_call({insert, {TableName, Val}}, _From, State) ->
     Oid = generate_object_id(),
     insert_kvstore(TableName, Oid, Val),
     insert_all_column_index(TableName, Val, Oid),
-    {reply, Oid, []};
-handle_call({select, {TableName, ColumnName, Val}}, _From, _State) ->
+    {reply, Oid, State};
+handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
     OidList = select_column_index(TableName, ColumnName, Val),
     case select_kvstore(TableName, OidList) of
             table_not_found -> table_not_found;
-            [] -> {reply, not_found, []};
-            RetVal -> {reply, RetVal, []}
+            [] -> {reply, not_found, State};
+            RetVal -> {reply, RetVal, State}
     end;
-handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, _State) ->
+handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, State) ->
     OidList = select_column_index(TableName, ColumnName, Val),
     ColumnList = get_column_list(TableName),
     SetQueryConverted = convert_set_query(SetQuery, ColumnList),
@@ -82,8 +89,8 @@ handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, _State) ->
         lists:map(FF, SetQuery)
     end,
     lists:map(F, OidList),
-    {reply, ok, []};
-handle_call({delete, {TableName, ColumnName, Val}}, _From, _State) ->
+    {reply, ok, State};
+handle_call({delete, {TableName, ColumnName, Val}}, _From, State) ->
     OidList = select_column_index(TableName, ColumnName, Val),
     ColumnList = get_column_list(TableName),
     F = fun(Oid) ->
@@ -100,16 +107,16 @@ handle_call({delete, {TableName, ColumnName, Val}}, _From, _State) ->
         lists:map(FF, lists:zip(ColumnList, KvVal))
     end,
     lists:map(F, OidList),
-    {reply, ok, []};
+    {reply, ok, State};
 handle_call(terminate, _From, _State) ->
     {stop, normal, ok, []}.
 
 handle_cast({get_config}, []) ->
     {noreply, []}.
 
-handle_info(Msg, _State) ->
+handle_info(Msg, State) ->
     io:format("Unexpected message: ~p~n", [Msg]),
-    {noreply, _State}.
+    {noreply, State}.
 
 terminate(normal, _State) ->
     io:format("Server teminated.~n"),
@@ -236,20 +243,53 @@ delete_kvstore(TableName, Oid) ->
 % System Table mng functions.
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% システムテーブルを作成する
-create_system_tables() ->
+%% システムテーブルを読み込む
+load_system_tables() ->
+    load_ms_tables().
+
+%% ms_tablesファイルから過去に作られたテーブル情報をetsに登録する
+%% TODO:fun渡したらうまく整形して返却してくれるようにソースを修正(システムファイルの読み込み方法は使い回せるようにしたい)
+load_ms_tables() ->
     ets:new(ms_tables, [set, named_table, public]),
-    ets:new(ms_tab_columns, [set, named_table, public]).
+    ets:new(ms_tab_columns, [set, named_table, public]),
+    {ok, FdMsTables} = file_mng:open("ms_tables.sys", [sys]),
+    case file:read_file("ms_tables.sys") of
+        {ok, <<>>} -> {ok, FdMsTables};
+        {ok, Data} ->
+            TableInfoList = string:split(binary_to_list(Data), "\n", all),
+            lists:map(
+                fun ([]) -> nop;
+                (TableInfo) ->
+                    [TableName | ColumnList] = string:split(TableInfo, " ", all),
+                    TableNameAtom = list_to_atom(TableName),
+                    ColumnListAtom = lists:map(fun(X) -> list_to_atom(X) end, ColumnList),
+                    TableId = create_kvstore(TableNameAtom),
+                    ets:insert(ms_tables, {TableNameAtom, TableId, ColumnListAtom}),
+                    register_column(TableNameAtom, ColumnListAtom)
+                 end
+                , TableInfoList),
+            {ok, FdMsTables}
+    end.
 
 %% テーブルを作成して、ms_tablesにテーブルを登録する
-register_table(TableName, ColumnList) ->
+register_table(TableName, ColumnList, FdMsTables) ->
     TableId = create_kvstore(TableName),
+    file_mng:append(FdMsTables, [TableName, ColumnList]),
     ets:insert(ms_tables, {TableName, TableId, ColumnList}).
 
 %% ms_tablesからテーブル情報を削除し、テーブルを削除する
-unregister_table(TableName) ->
-    TableId = get_table_id(TableName),
-    ets:delete(ms_tables, TableId),
+%% TODO:ms_tablesファイルから1行削除する際は、ファイルリネーム→新規ファイルにドロップするテーブル以外のテーブル情報を書き込み
+%% うまくいけばリネームしたファイルを削除する方式にしたい(ファイル削除してからプロセスが落ちた場合に復元できないから)
+unregister_table(TableName, FdMsTables) ->
+    TargetTableId = get_table_id(TableName),
+    AllTable = ets:match_object(ms_tables, {'$0', '$1', '$2'}),
+    RestTable = lists:filter(fun({_TableNm, TableId, _ColumnList}) -> TableId =/= TargetTableId end, AllTable),
+    %% ディスク上のms_tablesファイルを一度削除して、ドロップしたテーブル以外のテーブル情報を書き込む
+    file_mng:delete(FdMsTables),
+    lists:map(fun({TableNm, _TableId, ColumnList}) -> 
+        file_mng:append(FdMsTables, [TableNm, ColumnList])
+    end, RestTable),
+    ets:delete(ms_tables, TargetTableId),
     drop_kvstore(TableName).
 
 %% テーブル名からテーブルIDを取得する
