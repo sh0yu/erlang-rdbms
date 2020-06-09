@@ -3,7 +3,6 @@
 -behaviour(gen_server).
 -include("../include/simple_db_server.hrl").
 
--define(INITIAL_WAIT, 60000).
 -define(PAGE_SIZE, 16#100).
 -define(SLOT_SIZE, 4).
 -define(HEADER_SIZE, 12). %ヘッダのバイト数
@@ -14,9 +13,7 @@
     options,
     is_sys,
     is_ret = false,
-    eof = 0,
-    db_monitor,
-    pread_limit
+    eof = 0
 }).
 
 %%----------------------------------------------------------------------
@@ -25,7 +22,6 @@
 %% Returns: On success, {ok, Fd}
 %%  or {error, Reason} if the file could not be opened.
 %%----------------------------------------------------------------------
-
 open(Filepath) ->
     open(Filepath, []).
 
@@ -33,21 +29,10 @@ open(Filepath, Options) ->
     gen_server:start_link(file_mng, {Filepath, Options, self(), make_ref()}, []).
 
 %%----------------------------------------------------------------------
-%% Purpose: The length of a file, in bytes.
-%% Returns: {ok, Bytes}
-%%  or {error, Reason}.
-%%----------------------------------------------------------------------
-
-% length in bytes
-bytes(Fd) ->
-    gen_server:call(Fd, bytes, infinity).
-
-%%----------------------------------------------------------------------
 %% Purpose: Truncate a file to the number of bytes.
 %% Returns: ok
 %%  or {error, Reason}.
 %%----------------------------------------------------------------------
-
 truncate(Fd) ->
     gen_server:call(Fd, {truncate}, infinity).
 
@@ -77,12 +62,16 @@ append(Fd, DataList) ->
 %% Returns: {ok, Term}
 %%  or {error, Reason}.
 %%----------------------------------------------------------------------
-
-pread(Fd, Location, Number) ->
-    gen_server:call(Fd, {pread, Location, Number}).
+read(Fd, Location, Number) ->
+    gen_server:call(Fd, {read, Location, Number}).
 
 load_page(Fd, PageId) ->
     gen_server:call(Fd, {load_page, PageId}).
+get_page_header(Fd, PageId) ->
+    gen_server:call(Fd, {get_page_header, PageId}).
+
+write_page(Fd, PageId, SlotDataList) ->
+    gen_server:call(Fd, {write_page, PageId, SlotDataList}).
 
 init({Filepath, Options, ReturnPid, Ref}) ->
     SysFile = lists:member(sys, Options),
@@ -107,7 +96,7 @@ terminate(_Reason, #file{fd = Fd}) ->
 handle_call(close, _From, #file{fd=Fd}=File) ->
     {stop, normal, file:close(Fd), File#file{fd = nil}};
 
-handle_call(delete, _From, #file{fd=Fd, filepath=Filepath, options=Options} = File) ->
+handle_call(delete, _From, #file{fd=Fd, filepath=Filepath, options=Options}=File) ->
     ok = file:close(Fd),
     file:delete(Filepath),
     OpenOptions = file_open_options(Options),
@@ -116,15 +105,37 @@ handle_call(delete, _From, #file{fd=Fd, filepath=Filepath, options=Options} = Fi
     file:position(Fd, eof),
     {reply, ok, File#file{fd=NewFd}};
 
-handle_call({pread, Location, Number}, _From, #file{fd = Fd} = File) ->
+handle_call({read, Location, Number}, _From, #file{fd=Fd}=File) ->
     {ok, Res} = file:pread(Fd, Location, Number),
     {reply, {ok, Res}, File};
 
 handle_call({load_page, PageId}, _From, #file{fd=Fd}=File) ->
-    {ok, Data} = file:pread(Fd, PageId * ?PAGE_SIZE, ?PAGE_SIZE),
-    Ret = page2data(Data),
-    io:format("FileData:~p~n", [Ret]),
-    {reply, {ok, Ret}, File};
+    case file:pread(Fd, PageId * ?PAGE_SIZE, ?PAGE_SIZE) of
+        {ok, Data} ->
+            Ret = page2data(Data),
+            io:format("FileData:~p~n", [Ret]),
+            {reply, {ok, Ret}, File};
+        eof ->
+            {reply, {ok, eof}, File}
+    end;
+
+handle_call({get_page_header, PageId}, _From, #file{fd=Fd}=File) ->
+    case file:pread(Fd, PageId * ?PAGE_SIZE, ?HEADER_SIZE) of
+        eof -> {reply, eof, File};
+        {ok, <<_Flg:4/binary, EmptySize:32/integer, SlotCount:32/integer>>} ->
+            {reply, {EmptySize, SlotCount}, File}
+    end;
+
+handle_call({write_page, PageId, SlotDataList}, _From, #file{fd=Fd}=File) ->
+    io:format("SlotDataList@disk:~p~n", [data2page(SlotDataList)]),
+    D = data2page(SlotDataList),
+    [<<0:32, EmptySize:32/integer, SlotCount:32/integer>> | _] = D,
+    io:format("D:~p~n", [D]),
+    case file:pwrite(Fd, PageId * ?PAGE_SIZE, D) of
+        ok -> {reply, {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}}, File};
+        {error, Reason} ->
+            {reply, {error, Reason}, File}
+    end;
 
 handle_call({truncate}, _From, #file{fd=Fd}=File) ->
     case file:truncate(Fd) of
@@ -134,7 +145,7 @@ handle_call({truncate}, _From, #file{fd=Fd}=File) ->
         {reply, Error, File}
     end;
 
-handle_call({append, DataList}, _From, #file{fd = Fd, is_ret = IsRet} = File) ->
+handle_call({append, DataList}, _From, #file{fd=Fd, is_ret=IsRet}=File) ->
     FlatDataList = lists:flatten(DataList),
     Data = lists:map(fun(X) -> atom_to_list(X) end, FlatDataList),
     Pos = file:position(Fd, eof),
@@ -181,10 +192,15 @@ parse_data(Data) ->
 data2page(#disk_data{data_list=SlotDataList}) ->
     % SlotList = [{2,["orange","120"]},{1,["apple","100"]}]
     % SlotCount = 2
-    {EmptySize, SlotCount, BinData} = construct_data(lists:reverse(lists:keysort(1, SlotDataList))),
+    {EmptySize, SlotCount, BinData} = construct_data(lists:reverse(lists:keysort(2, SlotDataList))),
     [construct_header(SlotDataList, EmptySize, SlotCount), BinData].
 
+%% ヘッダを作成する(12バイト)
+construct_header(_Data, EmptySize, SlotCount) ->
+    <<0:32, EmptySize:32/integer, SlotCount:32/integer>>.
+
 construct_data(Data) ->
+    io:format("ConstructData:~p~n", [Data]),
     [#slot{slot_n=SlotCount} | _] = Data,
     {{OffsetList, DataList}, DataSize} = slot2page(Data, SlotCount, {[], []}, 0),
     PaddingSize = ?PAGE_SIZE - (?HEADER_SIZE + DataSize),
@@ -205,10 +221,6 @@ slot2page([#slot{slot_n=SlotCount, data=Data} | Rest], SlotCount, {OffsetList, D
     slot2page(Rest, SlotCount - 1, {[CurOffset | OffsetList], [DataList, PlainData]}, CurOffset + DataByteSize + ?SLOT_SIZE);
 slot2page(Rest, SlotCount, {OffsetList, DataList}, CurOffset) ->
     slot2page(Rest, SlotCount - 1, {[CurOffset | OffsetList], DataList}, CurOffset + ?SLOT_SIZE).
-    
-%% ヘッダを作成する(12バイト)
-construct_header(_Data, EmptySize, SlotCount) ->
-    <<0:32, EmptySize:32/integer, SlotCount:32/integer>>.
 
 init_status_error(ReturnPid, Ref, Error) ->
     ReturnPid ! {Ref, self(), Error},
@@ -222,6 +234,14 @@ disk_io_test() ->
     PageW = data2page(#disk_data{data_list=[Slot2, Slot3, Slot5]}),
     io:format("PageW:~p~n", [PageW]),
     file:pwrite(Fd, 0, PageW),
+    Slot6 = #slot{slot_n=1, data=["apple", "120"]},
+    Slot7 = #slot{slot_n=2, data=["pineapple", "150"]},
+    PageW2 = data2page(#disk_data{data_list=[Slot6, Slot7]}),
+    io:format("PageW2:~p~n", [PageW2]),
+    file:pwrite(Fd, ?PAGE_SIZE, PageW2),
     {ok, PageR} = file:pread(Fd, 0, ?PAGE_SIZE),
     #disk_data{empty_size=EmptySize, slot_count=SlotCount, data_list=DataR} = page2data(PageR),
-    io:format("EmptySize:~p, SlotCount:~p, DataList:~p~n", [EmptySize, SlotCount, DataR]).
+    io:format("EmptySize:~p, SlotCount:~p, DataList:~p~n", [EmptySize, SlotCount, DataR]),
+    {ok, PageR2} = file:pread(Fd, ?PAGE_SIZE, ?PAGE_SIZE),
+    #disk_data{empty_size=EmptySize2, slot_count=SlotCount2, data_list=DataR2} = page2data(PageR2),
+    io:format("EmptySize2:~p, SlotCount2:~p, DataList2:~p~n", [EmptySize2, SlotCount2, DataR2]).
