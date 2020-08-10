@@ -37,10 +37,12 @@ delete_data(Pid, TableName, ColName, Val) ->
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init([]) ->
+    index:init(),
     {ok, []}.
 
 handle_call({create_table, {TableName, ColumnList}}, _From, State) ->
     ok = sys_tbl_mng:create_table(whereis(sys_tbl_mng), TableName, ColumnList),
+    ok = index:create_table(TableName, ColumnList),
     {reply, ok, State};
 
 handle_call({drop_table, {TableName}}, _From, State) ->
@@ -51,14 +53,14 @@ handle_call({insert, {TableName, Val}}, _From, State) ->
     case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
         false -> {reply, {error, table_not_found}, State};
         true ->
-            Oid = data_buffer:write_data(whereis(data_buffer), TableName, Val),
-            IndexColumnList = sys_tbl_mng:get_index_column_list(whereis(sys_tbl_mng), TableName),
+            {ok, Oid} = data_buffer:write_data(whereis(data_buffer), TableName, Val),
+            {ok, IndexColumnList} = sys_tbl_mng:get_index_column_list(whereis(sys_tbl_mng), TableName),
             ok = index:insert_index(TableName, lists:zip(IndexColumnList, Val), Oid),
             {reply, Oid, State}
     end;
 
 handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
-    OidList = index:get_oid(TableName, ColumnName, Val),
+    OidList = index:select_index(TableName, ColumnName, Val),
     case read_data_oid(TableName, OidList) of
             table_not_found -> table_not_found;
             [] -> {reply, not_found, State};
