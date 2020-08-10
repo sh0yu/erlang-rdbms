@@ -1,0 +1,85 @@
+-module(log_util).
+-behavior(gen_server).
+-compile(export_all).
+-record(st, {
+    writer
+}).
+-record(file, {
+    file_path,
+    fd,
+    inode,
+    last_check
+}).
+-record(log_entry, {
+    level,
+    pid,
+    msg,
+    msg_id,
+    time_stamp
+}).
+
+-include_lib("kernel/include/file.hrl").
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init(_) ->
+    {ok, Writer} = writer_init(),
+    {ok, #st{writer=Writer}}.
+
+writer_init() ->
+    FilePath = "./query.log",
+    Opts = [append, raw],
+    case filelib:ensure_dir(FilePath) of
+        ok ->
+            case file:open(FilePath, Opts) of
+                {ok, Fd} ->
+                    case file:read_file_info(FilePath) of
+                        {ok, FInfo} ->
+                            {ok, #file{
+                                file_path = FilePath,
+                                fd = Fd,
+                                inode = FInfo#file_info.inode,
+                                last_check = os:timestamp()
+                            }};
+                        FInfoError ->
+                            ok = file:close(Fd),
+                            FInfoError
+                    end;
+                OpenError ->
+                    OpenError
+            end;
+        EnsureDirError ->
+            EnsureDirError
+    end.
+
+log(Entry) ->
+    gen_server:call(?MODULE, {log, Entry}).
+
+handle_call({log, Entry}, _From, #st{writer=Writer}=State) ->
+    ok = write(Entry, Writer),
+    {reply, ok, State}.
+
+handle_cast(_Msg, _St) ->
+    {stop, error}.
+
+write(Entry, Writer) ->
+    #log_entry{
+        level = Level,
+        pid = Pid,
+        msg = Msg,
+        msg_id = MsgId,
+        time_stamp = TimeStamp
+    } = Entry,
+    Args = {
+        Level,
+        TimeStamp,
+        node(),
+        Pid,
+        MsgId
+    },
+    Data = format(Args),
+    ok = file:write(Writer#file.fd, [Data, Msg, "\n"]).
+
+format({Level, Timestamp, Node, Pid, MsgId}) ->
+    "[" ++ Level ++ "] " ++ Timestamp ++ " " ++ atom_to_list(Node) ++ " " ++ pid_to_list(Pid) ++ " " ++ MsgId.
