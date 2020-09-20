@@ -68,7 +68,7 @@ handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
     end;
 
 handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, State) ->
-    OidList = index:get_oid(TableName, ColumnName, Val),
+    OidList = index:select_index(TableName, ColumnName, Val),
     {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
     SetQueryConverted = convert_set_query(SetQuery, ColumnList),
     F = fun(Oid) ->
@@ -93,7 +93,7 @@ handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, State) ->
     {reply, ok, State};
 
 handle_call({delete, {TableName, ColumnName, Val}}, _From, State) ->
-    OidList = index:get_oid(TableName, ColumnName, Val),
+    OidList = index:select_index(TableName, ColumnName, Val),
     {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
     F = fun(Oid) ->
         KvVal = read_data_oid(TableName, Oid),
