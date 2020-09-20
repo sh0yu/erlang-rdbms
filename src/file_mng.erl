@@ -213,12 +213,12 @@ construct_data(Data) ->
 
 % [{2,["orange","120"]},{1,["apple","100"]}]
 %% -> {[15, 0], ["orange 120", "apple 100"]}
-slot2page(_Rest, 0, Ret, CurOffset) ->
-    {Ret, CurOffset};
+slot2page(_Rest, 0, {OffsetList, DataList}, CurOffset) ->
+    {{OffsetList, lists:reverse(DataList)}, CurOffset};
 slot2page([#slot{slot_n=SlotCount, data=Data} | Rest], SlotCount, {OffsetList, DataList}, CurOffset) ->
     PlainData = list_to_binary(lists:join(?DATA_DELIMITER, Data)),
     DataByteSize = byte_size(PlainData),
-    slot2page(Rest, SlotCount - 1, {[CurOffset | OffsetList], [DataList, PlainData]}, CurOffset + DataByteSize + ?SLOT_SIZE);
+    slot2page(Rest, SlotCount - 1, {[CurOffset | OffsetList], [PlainData | DataList]}, CurOffset + DataByteSize + ?SLOT_SIZE);
 slot2page(Rest, SlotCount, {OffsetList, DataList}, CurOffset) ->
     slot2page(Rest, SlotCount - 1, {[CurOffset | OffsetList], DataList}, CurOffset + ?SLOT_SIZE).
 
