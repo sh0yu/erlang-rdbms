@@ -34,9 +34,14 @@ write_data(Pid, TableName, Val) ->
     gen_server:call(Pid, {write_data, TableName, Val}).
 
 update_data(Pid, TableName, Oid, Val) ->
+    % TODO: implement
+    % TODO: DataSizeを固定長の倍数として扱うようにするか検討
+    gen_server:call(Pid, {update_data, TableName, Oid, Val}),
     0.
 
 delete_data(Pid, TableName, Oid) ->
+    % TODO: implement
+    % 削除時、論削としてあとからバキュームするか、その方式など検討
     0.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -61,24 +66,8 @@ init_buf_info_list(Size) ->
     init_buf_info_list(Size - 1).
 
 handle_call({read_data, #oid{table_name=TableName, page_id=PageId}=Oid}, _From, State) ->
-    BufName = case is_data_in_buf(TableName, PageId) of
-        false ->
-            io:format("~p~n", [ets:match_object(buf_info_list, {'_', '_'})]),
-            %% ディスクからデータを読み込むためのFreeBufは空っぽのバッファ
-            %% それがなければ、最も古い時刻に読み込まれたバッファ
-            FreeBuf = case get_empty_buf() of
-                [] -> get_oldest_buf();
-                EmptyBuf -> EmptyBuf
-            end,
-            NewBufInfo = get_page_from_disk(TableName, PageId, FreeBuf),
-            ets:insert(buf_info_list, {FreeBuf, NewBufInfo}),
-            io:format("cache miss. load table_name=~p, page_id=~p to [~p].~n", [TableName, PageId, NewBufInfo]),
-            FreeBuf;
-        BName ->
-            io:format("cache hit [~p].~n", [BName]),
-            BName
-    end,
-    {reply, get_data_buf(BufName, Oid), State};
+    DataBuf = load_page(TableName, PageId),
+    {reply, get_data_buf(DataBuf, Oid), State};
     
 %% データの書き込みの際は、書き込むページをバッファ上に読み込み、そこに書き込みデータを挿入・更新しディスクに書き込む
 %% 読み込むためのバッファは、すでにバッファ上に読み込まれていて、空き容量が十分あるバッファ
@@ -107,7 +96,6 @@ handle_call({write_data, TableName, Data}, _from, State) ->
     Oid = #oid{table_name=TableName, page_id=PageId, slot=Slot+1},
     ets:insert(PlentySpaceBuf, {Oid, Data}),
     io:format("BufInfoList:~p~n", [ets:match_object(buf_info_list, {'_', '_'})]),
-    %% TODO:Diskに書き込む
     %% SlotDataListに整形する
     SlotDataList = lists:map(fun({#oid{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
     ets:match_object(PlentySpaceBuf, {'_', '_'})),
@@ -119,8 +107,32 @@ handle_call({write_data, TableName, Data}, _from, State) ->
             {reply, {ok, Oid}, State};
         {error, Reason} ->
             {reply, {error, Reason}, State}
+    end;
+
+%% データの更新は、指定されたOidのデータをバッファ上に読み込み、データを更新し、ディスクに書き込む
+%% すでにバッファ上にデータが読み込まれていれば更新してディスクに書きこむ
+%% TODO: 更新前データサイズに対して更新データサイズが大きすぎる場合、
+%% 更新前データをページから削除・ディスク書き込み、空きがあるページを読み込み、更新後データ挿入、ディスク書き込み
+%% さらに、Oidが変わるので、インデックス更新。といった処理が必要
+handle_call({update_data, TableName, #oid{table_name=TableName, page_id=PageId}=Oid, Data}, _from, State) ->
+    DataBuf = load_page(TableName, PageId),
+    ets:insert(DataBuf, {Oid, Data}),
+    SlotDataList = lists:map(fun({#oid{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
+    ets:match_object(DataBuf, {'_', '_'})),
+    io:format("SlotDataList:~p~n", [SlotDataList]),
+    Fd = get_fd(TableName),
+    BufInfo = case ets:lookup(buf_info_list, DataBuf) of
+        [] -> conflict_error;
+        [{DataBuf, BufI}] -> BufI
+    end,
+    io:format("BufInfo:L128:~p~n", [BufInfo]),
+    case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of
+        {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}} ->
+            ets:insert(buf_info_list, {DataBuf, BufInfo#buf_info{empty_size=EmptySize, slot_count=SlotCount}}),
+            {reply, {ok, Oid}, State};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
     end.
-    
 
 handle_cast({get_config}, []) ->
     {noreply, []}.
@@ -132,6 +144,25 @@ handle_info(Msg, State) ->
 terminate(normal, _State) ->
     io:format("Server teminated.~n"),
     ok.
+
+load_page(TableName, PageId) ->
+    case is_data_in_buf(TableName, PageId) of
+        false ->
+            io:format("~p~n", [ets:match_object(buf_info_list, {'_', '_'})]),
+            %% ディスクからデータを読み込むためのFreeBufは空っぽのバッファ
+            %% それがなければ、最も古い時刻に読み込まれたバッファ
+            FreeBuf = case get_empty_buf() of
+                [] -> get_oldest_buf();
+                EmptyBuf -> EmptyBuf
+            end,
+            NewBufInfo = get_page_from_disk(TableName, PageId, FreeBuf),
+            ets:insert(buf_info_list, {FreeBuf, NewBufInfo}),
+            io:format("cache miss. load table_name=~p, page_id=~p to [~p].~n", [TableName, PageId, NewBufInfo]),
+            FreeBuf;
+        BName ->
+            io:format("cache hit [~p].~n", [BName]),
+            BName
+    end.
 
 %% 取得したいデータがバッファに格納されているかチェックする
 %% -> false | BufName
