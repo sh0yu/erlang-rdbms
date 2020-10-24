@@ -30,19 +30,19 @@ read_data(Pid, Oid) ->
     gen_server:call(Pid, {read_data, Oid}).
 
 %% Val: ["apple", "100"]
-write_data(Pid, TableName, Val) ->
-    gen_server:call(Pid, {write_data, TableName, Val}).
+write_data(Pid, TableName, Oid, Val) ->
+    %% TODO: vacuumを実行
+    gen_server:call(Pid, {write_data, TableName, Oid, Val}).
 
 update_data(Pid, TableName, Oid, Val) ->
     % TODO: implement
     % TODO: DataSizeを固定長の倍数として扱うようにするか検討
-    gen_server:call(Pid, {update_data, TableName, Oid, Val}),
-    0.
+    gen_server:call(Pid, {update_data, TableName, Oid, Val}).
 
-delete_data(Pid, TableName, Oid) ->
-    % TODO: implement
-    % 削除時、論削としてあとからバキュームするか、その方式など検討
-    0.
+delete_data(Pid, Oid) ->
+    % インデックスから参照を削除することで、論理削除
+    % データをinsertもしくはupdateする際に、vacuumを実行
+    gen_server:call(Pid, {delete_data, Oid}).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Callback functions of gen_server.
@@ -52,8 +52,12 @@ init([]) ->
     %% [ETS]buf_info_list:バッファにロードされているテーブルとページ情報を保持する
     %% [ETS]fd_tables:テーブルデータが保存されているファイルのFdを管理する
     %% [ETS]bufxxx:ディスク上のデータをロードしたバッファ
+    %% [DETS]oid_phys_loc:オブジェクトIDとファイル上のアドレスの紐付け
+    %% [DETS]vacuum_oid:削除されたオブジェクトIDを保持。delete時に更新、vacuum時に参照・削除
     ets:new(buf_info_list, [set, named_table, public]),
     ets:new(fd_tables, [set, named_table, public]),
+    dets:open_file(oid_phys_loc, []),
+    dets:open_file(vacuum_oid, []),
     ok = init_buf_info_list(?BUF_N),
     {ok, []}.
 
@@ -65,16 +69,21 @@ init_buf_info_list(Size) ->
     ets:new(EtsName, [set, named_table, public]),
     init_buf_info_list(Size - 1).
 
-handle_call({read_data, #oid{table_name=TableName, page_id=PageId}=Oid}, _From, State) ->
-    DataBuf = load_page(TableName, PageId),
-    {reply, get_data_buf(DataBuf, Oid), State};
+handle_call({read_data, Oid}, _From, State) ->
+    case oid2physloc(Oid) of
+        oid_not_found -> {reply, {error, oid_not_found}, State};
+        PhysLoc ->
+            #phys_loc{table_name=TableName, page_id=PageId} = PhysLoc,
+            DataBuf = load_page(TableName, PageId),
+            {reply, get_data_buf(DataBuf, PhysLoc), State}
+    end;
     
 %% データの書き込みの際は、書き込むページをバッファ上に読み込み、そこに書き込みデータを挿入・更新しディスクに書き込む
 %% 読み込むためのバッファは、すでにバッファ上に読み込まれていて、空き容量が十分あるバッファ
 %% なければデータファイルから空き容量のあるページを取り出す
 %% 一つも空き容量があるページがなければ新規に作り出す
-%% Oidを返すか
-handle_call({write_data, TableName, Data}, _from, State) ->
+%% PhysLocを返すか
+handle_call({write_data, TableName, Oid, Data}, _from, State) ->
     DataSize = get_data_size(Data),
     io:format("DataSize:~p~n", [DataSize]),
     PlentySpaceBuf = case get_plenty_space_buf(TableName, DataSize) of
@@ -93,31 +102,33 @@ handle_call({write_data, TableName, Data}, _from, State) ->
     io:format("PlentySpaceBuf:~p~n", [PlentySpaceBuf]),
     io:format("buf_info:~p~n", [ets:lookup(buf_info_list, PlentySpaceBuf)]),
     [{_PlentySpaceBuf, #buf_info{page_id=PageId, slot_count=Slot}=BufInfo}] = ets:lookup(buf_info_list, PlentySpaceBuf),
-    Oid = #oid{table_name=TableName, page_id=PageId, slot=Slot+1},
-    ets:insert(PlentySpaceBuf, {Oid, Data}),
+    %% TODO: どのスロットにデータを入れるか算出するスロット戦略の改善
+    PhysLoc = #phys_loc{table_name=TableName, page_id=PageId, slot=Slot+1},
+    ets:insert(PlentySpaceBuf, {PhysLoc, Data}),
     io:format("BufInfoList:~p~n", [ets:match_object(buf_info_list, {'_', '_'})]),
     %% SlotDataListに整形する
-    SlotDataList = lists:map(fun({#oid{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
+    SlotDataList = lists:map(fun({#phys_loc{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
     ets:match_object(PlentySpaceBuf, {'_', '_'})),
     io:format("SlotDataList:~p~n", [SlotDataList]),
     Fd = get_fd(TableName),
     case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of
         {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}} ->
             ets:insert(buf_info_list, {PlentySpaceBuf, BufInfo#buf_info{empty_size=EmptySize, slot_count=SlotCount}}),
-            {reply, {ok, Oid}, State};
+            dets:insert(oid_phys_loc, {Oid, PhysLoc}),
+            {reply, ok, State};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
 
-%% データの更新は、指定されたOidのデータをバッファ上に読み込み、データを更新し、ディスクに書き込む
+%% データの更新は、指定されたPhysLocのデータをバッファ上に読み込み、データを更新し、ディスクに書き込む
 %% すでにバッファ上にデータが読み込まれていれば更新してディスクに書きこむ
 %% TODO: 更新前データサイズに対して更新データサイズが大きすぎる場合、
 %% 更新前データをページから削除・ディスク書き込み、空きがあるページを読み込み、更新後データ挿入、ディスク書き込み
-%% さらに、Oidが変わるので、インデックス更新。といった処理が必要
-handle_call({update_data, TableName, #oid{table_name=TableName, page_id=PageId}=Oid, Data}, _from, State) ->
+%% さらに、PhysLocが変わるので、インデックス更新。といった処理が必要
+handle_call({update_data, TableName, #phys_loc{table_name=TableName, page_id=PageId}=PhysLoc, Data}, _from, State) ->
     DataBuf = load_page(TableName, PageId),
-    ets:insert(DataBuf, {Oid, Data}),
-    SlotDataList = lists:map(fun({#oid{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
+    ets:insert(DataBuf, {PhysLoc, Data}),
+    SlotDataList = lists:map(fun({#phys_loc{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
     ets:match_object(DataBuf, {'_', '_'})),
     io:format("SlotDataList:~p~n", [SlotDataList]),
     Fd = get_fd(TableName),
@@ -125,15 +136,28 @@ handle_call({update_data, TableName, #oid{table_name=TableName, page_id=PageId}=
         [] -> conflict_error;
         [{DataBuf, BufI}] -> BufI
     end,
-    io:format("BufInfo:L128:~p~n", [BufInfo]),
     case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of
         {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}} ->
             ets:insert(buf_info_list, {DataBuf, BufInfo#buf_info{empty_size=EmptySize, slot_count=SlotCount}}),
-            {reply, {ok, Oid}, State};
+            {reply, {ok, PhysLoc}, State};
         {error, Reason} ->
             {reply, {error, Reason}, State}
-    end.
+    end;
 
+handle_call({delete_data, Oid}, _From, State) ->
+    case oid2physloc(Oid) of
+        oid_not_found -> {reply, {error, oid_not_found}, State};
+        PhysLoc ->
+            #phys_loc{table_name=TableName, page_id=PageId, slot=Slot} = PhysLoc,
+            %% TODO: vacuum用にdeleteするデータのアドレスをdetsに書き込む
+            case dets:lookup(vacuum_oid, TableName) of
+                [] -> dets:insert(vacuum_oid, {TableName, [{PageId, Slot}]});
+                [{TableName, PhysLocList}] ->
+                    dets:insert(vacuum_oid, {TableName, [{PageId, Slot} | PhysLocList]})
+            end,
+            {reply, ok, State}
+    end.
+    
 handle_cast({get_config}, []) ->
     {noreply, []}.
 
@@ -174,29 +198,25 @@ is_data_in_buf(TableName, PageId) ->
             BufName
     end.
 
-%% バッファETSのキーをOidから作成する
-% get_data_key(#oid{table_name=TableName, page_id=PageId, slot=Slot}) ->
-%     list_to_atom(atom_to_list(TableName)++"_"++integer_to_list(PageId)++"_"++integer_to_list(Slot)).
-
 %% バッファからデータを取り出す
-get_data_buf(BufName, Oid) ->
-    case ets:lookup(BufName, Oid) of
+get_data_buf(BufName, PhysLoc) ->
+    case ets:lookup(BufName, PhysLoc) of
         [] -> item_not_found;
-        [{_Oid, []}] ->
+        [{_PhysLoc, []}] ->
             item_deleted;
-        [{_Oid, Val}] ->
+        [{_PhysLoc, Val}] ->
             Val
     end.
 
 %% ディスク上のTableNameデータファイルからPageIdのデータを抽出して、FreeBufに格納する
-%% バッファには、Oidを元に作成したキーとディスクから抽出したバリューをリスト形式で格納する
+%% バッファには、PhysLocを元に作成したキーとディスクから抽出したバリューをリスト形式で格納する
 get_page_from_disk(TableName, PageId, FreeBuf) ->
     Fd = get_fd(TableName),
     {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount, data_list=SlotDataList}} = file_mng:load_page(Fd, PageId),
     ets:delete(FreeBuf),
     ets:new(FreeBuf, [set, named_table, public]),
     lists:map(fun(#slot{slot_n=Slot, data=Data}) ->
-        ets:insert(FreeBuf, {#oid{table_name=TableName, page_id=PageId, slot=Slot}, Data}) end,
+        ets:insert(FreeBuf, {#phys_loc{table_name=TableName, page_id=PageId, slot=Slot}, Data}) end,
         SlotDataList),
     #buf_info{buf_name=FreeBuf, table_name=TableName, page_id=PageId, empty_size=EmptySize, slot_count=SlotCount, timestamp=erlang:system_time(nanosecond)}.
 
@@ -277,3 +297,9 @@ get_filename(TableName) ->
 %% Data:["apple", "100"]
 get_data_size(Data) ->
     byte_size(list_to_binary(lists:join(" ", Data))) + ?SLOT_SIZE.
+
+oid2physloc(Oid) ->
+    case dets:lookup(oid_phys_loc, Oid) of
+        [] -> oid_not_found;
+        [{Oid, PhysLoc}] -> PhysLoc
+    end.
