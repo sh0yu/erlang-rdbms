@@ -11,7 +11,10 @@ start_link() ->
 init(_Args) ->
     SupFlags = {one_for_one, 3, 5},
     SimpleDbServerSpec = {simple_db_server, {simple_db_server, start_link, []}, permanent, brutal_kill, worker, [simple_db_server]},
+    SysTblMngSpec = {sys_tbl_mng, {sys_tbl_mng, start_link, []}, permanent, brutal_kill, worker, [sys_tbl_mng]},
     TxMngSpec = {tx_mng, {tx_mng, start_link, []}, permanent, brutal_kill, worker, [tx_mng]},
+    DataBufferSpec = {data_buffer, {data_buffer, start_link, []}, permanent, brutal_kill, worker, [data_buffer]},
     QueryExecSupSpec = {query_exec_sup, {query_exec_sup, start_link, []}, permanent, brutal_kill, supervisor, [query_exec_sup]},
-    ChildSpec = [SimpleDbServerSpec, TxMngSpec, QueryExecSupSpec],
+    LogUtilSpec = {log_util, {log_util, start_link, []}, permanent, brutal_kill, supervisor, [log_util]},
+    ChildSpec = [SimpleDbServerSpec, SysTblMngSpec, TxMngSpec, QueryExecSupSpec, DataBufferSpec, LogUtilSpec],
     {ok, {SupFlags, ChildSpec}}.
