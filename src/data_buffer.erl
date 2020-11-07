@@ -86,24 +86,36 @@ handle_call({read_data, Oid}, _From, State) ->
 handle_call({write_data, TableName, Oid, Data}, _from, State) ->
     DataSize = get_data_size(Data),
     io:format("DataSize:~p~n", [DataSize]),
-    PlentySpaceBuf = case get_plenty_space_buf(TableName, DataSize) of
-        no_plenty_space_buf ->
-            %% 空き容量のあるバッファはバッファ上にないため、ディスクから空き容量のあるページを探す
-            FreeBuf = case get_empty_buf() of
-                [] -> get_oldest_buf();
+
+    %% データを挿入するバッファとロケーションを用意する
+    case oid2physloc(Oid) of
+        oid_not_found ->
+            %% 新規挿入ケース
+            PlentySpaceBuf = case get_plenty_space_buf(TableName, DataSize) of
+                no_plenty_space_buf ->
+                    %% 空き容量のあるバッファはバッファ上にないため、ディスクから空き容量のあるページを探す
+                    FreeBuf = case get_empty_buf() of
+                        [] -> get_oldest_buf();
+                        EmptyBuf -> EmptyBuf
+                    end,
+                    io:format("FreeBuf:~p~n", [FreeBuf]),
+                    NewBufInfo = get_plenty_space_page_from_disk(TableName, DataSize, FreeBuf),
+                    ets:insert(buf_info_list, {FreeBuf, NewBufInfo}),
+                    FreeBuf;
                 EmptyBuf -> EmptyBuf
+                %% 空き容量のあるバッファが見つかったケース
             end,
-            io:format("FreeBuf:~p~n", [FreeBuf]),
-            NewBufInfo = get_plenty_space_page_from_disk(TableName, DataSize, FreeBuf),
-            ets:insert(buf_info_list, {FreeBuf, NewBufInfo}),
-            FreeBuf;
-        EmptyBuf -> EmptyBuf
-    end,
-    io:format("PlentySpaceBuf:~p~n", [PlentySpaceBuf]),
-    io:format("buf_info:~p~n", [ets:lookup(buf_info_list, PlentySpaceBuf)]),
-    [{_PlentySpaceBuf, #buf_info{page_id=PageId, slot_count=Slot}=BufInfo}] = ets:lookup(buf_info_list, PlentySpaceBuf),
-    %% TODO: どのスロットにデータを入れるか算出するスロット戦略の改善
-    PhysLoc = #phys_loc{table_name=TableName, page_id=PageId, slot=Slot+1},
+            io:format("PlentySpaceBuf:~p~n", [PlentySpaceBuf]),
+            io:format("buf_info:~p~n", [ets:lookup(buf_info_list, PlentySpaceBuf)]),
+            [{_PlentySpaceBuf, #buf_info{page_id=PageId, slot_count=Slot}}] = ets:lookup(buf_info_list, PlentySpaceBuf),
+            %% TODO: どのスロットにデータを入れるか算出するスロット戦略の改善
+            PhysLoc = #phys_loc{table_name=TableName, page_id=PageId, slot=Slot+1};
+        #phys_loc{table_name=TableName, page_id=PageId} = PhysL ->
+            %% 更新ケース(冪等性のため)
+            PhysLoc = PhysL,
+            PlentySpaceBuf = load_page(TableName, PageId)
+        end,
+        %%TODO: buf_infoのupdateできているか確認
     ets:insert(PlentySpaceBuf, {PhysLoc, Data}),
     io:format("BufInfoList:~p~n", [ets:match_object(buf_info_list, {'_', '_'})]),
     %% SlotDataListに整形する
@@ -113,7 +125,7 @@ handle_call({write_data, TableName, Oid, Data}, _from, State) ->
     Fd = get_fd(TableName),
     case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of
         {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}} ->
-            ets:insert(buf_info_list, {PlentySpaceBuf, BufInfo#buf_info{empty_size=EmptySize, slot_count=SlotCount}}),
+            ets:insert(buf_info_list, {PlentySpaceBuf, #buf_info{table_name=TableName, page_id=PageId, empty_size=EmptySize, slot_count=SlotCount}}),
             dets:insert(oid_phys_loc, {Oid, PhysLoc}),
             {reply, ok, State};
         {error, Reason} ->
@@ -148,14 +160,22 @@ handle_call({delete_data, Oid}, _From, State) ->
     case oid2physloc(Oid) of
         oid_not_found -> {reply, {error, oid_not_found}, State};
         PhysLoc ->
-            #phys_loc{table_name=TableName, page_id=PageId, slot=Slot} = PhysLoc,
-            %% TODO: vacuum用にdeleteするデータのアドレスをdetsに書き込む
-            case dets:lookup(vacuum_oid, TableName) of
-                [] -> dets:insert(vacuum_oid, {TableName, [{PageId, Slot}]});
-                [{TableName, PhysLocList}] ->
-                    dets:insert(vacuum_oid, {TableName, [{PageId, Slot} | PhysLocList]})
-            end,
-            {reply, ok, State}
+            #phys_loc{table_name=TableName, page_id=PageId} = PhysLoc,
+            TargetBuf = load_page(TableName, PageId),
+            ets:delete(TargetBuf, PhysLoc),
+            SlotDataList = lists:map(fun({#phys_loc{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
+            ets:match_object(TargetBuf, {'_', '_'})),
+            io:format("SlotDataList:~p~n", [SlotDataList]),
+            %% TODO: buf_infoの更新できているか確認
+            Fd = get_fd(TableName),
+            case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of
+                {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}} ->
+                    ets:insert(buf_info_list, {TargetBuf, #buf_info{table_name=TableName, page_id=PageId, empty_size=EmptySize, slot_count=SlotCount}}),
+                    dets:insert(oid_phys_loc, {Oid, PhysLoc}),
+                    {reply, ok, State};
+                {error, Reason} ->
+                    {reply, {error, Reason}, State}
+            end
     end.
     
 handle_cast({get_config}, []) ->

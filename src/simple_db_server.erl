@@ -20,8 +20,8 @@ create_table(Pid, TableName, ColumnList) ->
 drop_table(Pid, TableName) ->
     gen_server:call(Pid, {drop_table, {TableName}}).
 
-insert_data(Pid, TableName, Val) ->
-    gen_server:call(Pid, {insert, {TableName, Val}}).
+insert_data(Pid, TableName, Oid, Val) ->
+    gen_server:call(Pid, {insert, {TableName, Oid, Val}}).
 
 select_data(Pid, TableName, ColName, Val) ->
     gen_server:call(Pid, {select, {TableName, ColName, Val}}).
@@ -29,8 +29,8 @@ select_data(Pid, TableName, ColName, Val) ->
 update_data(Pid, TableName, SetQuery, ColName, Val) ->
     gen_server:call(Pid, {update, {TableName, SetQuery, ColName, Val}}).
     
-delete_data(Pid, TableName, ColName, Val) ->
-    gen_server:call(Pid, {delete, {TableName, ColName, Val}}).
+delete_data(Pid, TableName, Oid) ->
+    gen_server:call(Pid, {delete, {TableName, Oid}}).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Callback functions of gen_server.
@@ -42,25 +42,25 @@ init([]) ->
 
 handle_call({create_table, {TableName, ColumnList}}, _From, State) ->
     ok = sys_tbl_mng:create_table(whereis(sys_tbl_mng), TableName, ColumnList),
-    ok = index:create_table(TableName, ColumnList),
+    ok = simple_index:create_table(TableName, ColumnList),
     {reply, ok, State};
 
 handle_call({drop_table, {TableName}}, _From, State) ->
     ok = sys_tbl_mng:drop_table(whereis(sys_tbl_mng), TableName),
     {reply, ok, State};
 
-handle_call({insert, {TableName, Val}}, _From, State) ->
+handle_call({insert, {TableName, Oid, Val}}, _From, State) ->
     case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
         false -> {reply, {error, table_not_found}, State};
         true ->
-            {ok, Oid} = data_buffer:write_data(whereis(data_buffer), TableName, Val),
+            ok = data_buffer:write_data(whereis(data_buffer), TableName, Oid, Val),
             {ok, IndexColumnList} = sys_tbl_mng:get_index_column_list(whereis(sys_tbl_mng), TableName),
-            ok = index:insert_index(TableName, lists:zip(IndexColumnList, Val), Oid),
-            {reply, Oid, State}
+            ok = simple_index:insert_index(TableName, lists:zip(IndexColumnList, Val), Oid),
+            {reply, ok, State}
     end;
 
 handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
-    OidList = index:select_index(TableName, ColumnName, Val),
+    OidList = simple_index:select_index(TableName, ColumnName, Val),
     case read_data_oid(TableName, OidList) of
             table_not_found -> table_not_found;
             [] -> {reply, not_found, State};
@@ -68,7 +68,7 @@ handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
     end;
 
 handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, State) ->
-    OidList = index:select_index(TableName, ColumnName, Val),
+    OidList = simple_index:select_index(TableName, ColumnName, Val),
     {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
     SetQueryConverted = convert_set_query(SetQuery, ColumnList),
     F = fun(Oid) ->
@@ -78,38 +78,20 @@ handle_call({update, {TableName, SetQuery, ColumnName, Val}}, _From, State) ->
         OldValWithCol = read_data_oid_with_column(TableName, Oid),
         NewVal = build_new_val(OldVal, SetQueryConverted),
         %% kvstoreを更新する
-        update_kvstore(TableName, Oid, NewVal)
-        %% TODO:インデックスの更新処理
+        update_kvstore(TableName, Oid, NewVal),
         %% 更新対象のカラムごとにカラムインデックスを更新する
-        %% ex. {name, apple}
-        % FF = fun({ColumnN, NewColVal}) ->
-        %     ColumnIndexId = get_column_index_id(TableName, ColumnN),
-        %     {_Key, OldColVal} = lists:keyfind(ColumnN, 1, OldValWithCol),
-        %     update_column_index(ColumnIndexId, OldColVal, NewColVal, Oid)
-        % end,
-        % lists:map(FF, SetQuery)
+        lists:map(fun({ColumnN, NewColVal, OldColVal}) ->
+            simple_index:update_index(TableName, ColumnN, NewColVal, OldColVal)
+        end, lists:zip(ColumnList, NewVal, OldVal))
     end,
     lists:map(F, OidList),
     {reply, ok, State};
 
-handle_call({delete, {TableName, ColumnName, Val}}, _From, State) ->
-    OidList = index:select_index(TableName, ColumnName, Val),
-    {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-    F = fun(Oid) ->
-        KvVal = read_data_oid(TableName, Oid),
-        %% kvstoreを削除する
-        delete_kvstore(TableName, Oid)
-        %% TODO:インデックスの削除処理追加
-        %% 各カラムごとにカラムインデックスを削除更新する
-        %% ex. {name, apple}
-        % FF = fun({ColumnN, ColVal}) ->
-        %     %% 古いインデックス情報を削除する
-        %     ColumnIndexId = get_column_index_id(TableName, ColumnN),
-        %     delete_column_index(ColumnIndexId, ColVal, Oid)
-        % end,
-        % lists:map(FF, lists:zip(ColumnList, KvVal))
-    end,
-    lists:map(F, OidList),
+%% delete処理は、各カラムインデックスからオブジェクトへの参照を論理削除するのみ
+%% vacuumが実行されるまで、削除されたデータは実ファイルから削除されない
+handle_call({delete, {TableName, Oid}}, _From, State) ->
+    ok = delete_index(TableName, Oid),
+    ok = data_buffer:delete_data(data_buffer, Oid),
     {reply, ok, State};
 
 handle_call(terminate, _From, _State) ->
@@ -220,3 +202,13 @@ convert_set_query(SetQuery, ColumnList) ->
                 end
             end,
     Sub(SetQuery, ColumnList, 1, []).
+
+%% 指定されたテーブルの各カラムインデックスからOidを削除する
+delete_index(TableName, Oid) ->
+    {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
+    io:format("[DELETE_INDEX]~p,~p~n", [TableName, Oid]),
+    Val = read_data_oid(TableName, Oid),
+    lists:map(fun({ColName, ColVal}) ->
+        ok = simple_index:delete_index(TableName, ColName, ColVal, Oid)
+    end, lists:zip(ColumnList, Val)),
+    ok.

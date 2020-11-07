@@ -33,9 +33,12 @@ delete_index(TableName, ColName, Val, Oid) ->
     ColIndexName = get_tab_column_key(TableName, ColName),
     delete_column_index(ColIndexName, Val, Oid).
 
-update_index(TableName, ColName, Val, Oid) ->
 %% TODO: update_index実装
-0.
+update_index(_TableName, _ColName, OldVal, NewVal, _Oid) when OldVal =:= NewVal->
+    nop;
+update_index(TableName, ColName, OldVal, NewVal, Oid) ->
+    ColIndexName = get_tab_column_key(TableName, ColName),
+    update_column_index(ColIndexName, OldVal, NewVal, Oid).
 
 select_index(TableName, ColName, Val) ->
     ColIndexName = get_tab_column_key(TableName, ColName),

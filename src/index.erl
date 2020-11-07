@@ -259,6 +259,7 @@ delete_item([H | T], Val, Oid) ->
 
 %% when first call, Pointer is ColName
 traverse_index_tree(IndexName, Search, Pointer, oid) ->
+    %% TODO: 値がない場合の処理実装
     %% to get oid of search value
     case ets:lookup(IndexName, Pointer) of
         [] -> [err_3];
@@ -275,9 +276,9 @@ traverse_index_tree(IndexName, Search, Pointer, node) ->
             [Pointer | get_oid(IndexName, Search, Type, Page, node)]
     end.
 
-get_oid(_IndexName, _Search, leaf, [#item{pointer=Oid}], _Method) ->
+get_oid(_IndexName, _Search, leaf, [], _Method) ->
     %% case: reach leafnode
-    Oid;
+    [];
 get_oid(_IndexName, Search, leaf, [#item{val=Search, pointer=Oid} | _T], _Method) ->
     Oid;
 get_oid(IndexName, Search, _, [#item{pointer=[Pointer]}], Method) ->
@@ -312,12 +313,12 @@ print_page(IndexName, leaf, [#item{pointer=OidList} | T]) ->
     print_page(IndexName, leaf, T).
 
 test() ->
-    Oid13 = #oid{table_name=fruit, page_id=1, slot=13},
-    Oid25 = #oid{table_name=fruit, page_id=1, slot=25},
-    Oid28 = #oid{table_name=fruit, page_id=1, slot=28},
-    Oid50 = #oid{table_name=fruit, page_id=1, slot=50},
-    Oid51 = #oid{table_name=fruit, page_id=1, slot=51},
-    Oid75 = #oid{table_name=fruit, page_id=1, slot=75},
+    Oid13 = #phys_loc{table_name=fruit, page_id=1, slot=13},
+    Oid25 = #phys_loc{table_name=fruit, page_id=1, slot=25},
+    Oid28 = #phys_loc{table_name=fruit, page_id=1, slot=28},
+    Oid50 = #phys_loc{table_name=fruit, page_id=1, slot=50},
+    Oid51 = #phys_loc{table_name=fruit, page_id=1, slot=51},
+    Oid75 = #phys_loc{table_name=fruit, page_id=1, slot=75},
     ets:new(test, [set, named_table]),
     ets:insert(test, {col1, root, a}),
     ets:insert(test, {a, #node{type=non_leaf, page=[#item{val=nil, pointer=[b]}, #item{val=50, pointer=[c]}]}}),
@@ -332,19 +333,19 @@ test() ->
     lists:map(fun(K) ->
         io:format("Key:~p, Oid:~p~n", [K, traverse_index_tree(test, K, get_tree_top(test, col1), oid)])
     end, Key),
-    InsOid18 = #oid{table_name=fruit, page_id=1, slot=18},
-    InsOid15 = #oid{table_name=fruit, page_id=1, slot=15},
-    InsOid76 = #oid{table_name=fruit, page_id=1, slot=76},
-    InsOid77 = #oid{table_name=fruit, page_id=1, slot=77},
-    InsOid78 = #oid{table_name=fruit, page_id=1, slot=78},
-    InsOid79 = #oid{table_name=fruit, page_id=1, slot=79},
-    InsOid80 = #oid{table_name=fruit, page_id=1, slot=80},
-    InsOid81 = #oid{table_name=fruit, page_id=1, slot=81},
-    InsOid82 = #oid{table_name=fruit, page_id=1, slot=82},
-    InsOid83 = #oid{table_name=fruit, page_id=1, slot=83},
-    InsOid84 = #oid{table_name=fruit, page_id=1, slot=84},
-    InsOid85 = #oid{table_name=fruit, page_id=1, slot=85},
-    InsOid85_2 = #oid{table_name=fruit, page_id=1, slot=852},
+    InsOid18 = #phys_loc{table_name=fruit, page_id=1, slot=18},
+    InsOid15 = #phys_loc{table_name=fruit, page_id=1, slot=15},
+    InsOid76 = #phys_loc{table_name=fruit, page_id=1, slot=76},
+    InsOid77 = #phys_loc{table_name=fruit, page_id=1, slot=77},
+    InsOid78 = #phys_loc{table_name=fruit, page_id=1, slot=78},
+    InsOid79 = #phys_loc{table_name=fruit, page_id=1, slot=79},
+    InsOid80 = #phys_loc{table_name=fruit, page_id=1, slot=80},
+    InsOid81 = #phys_loc{table_name=fruit, page_id=1, slot=81},
+    InsOid82 = #phys_loc{table_name=fruit, page_id=1, slot=82},
+    InsOid83 = #phys_loc{table_name=fruit, page_id=1, slot=83},
+    InsOid84 = #phys_loc{table_name=fruit, page_id=1, slot=84},
+    InsOid85 = #phys_loc{table_name=fruit, page_id=1, slot=85},
+    InsOid85_2 = #phys_loc{table_name=fruit, page_id=1, slot=852},
     insert(test, col1, 18, InsOid18),
     insert(test, col1, 15, InsOid15),
     insert(test, col1, 76, InsOid76),
@@ -394,7 +395,8 @@ test() ->
     % print_tree(test, get_tree_top(test, col1)),
     % io:format("col2~n"),
     % print_tree(test, get_tree_top(test, col2)),
-    ets:delete(test).
+    ets:delete(test),
+    ok.
 
 get_left_node_test() ->
     ItemNil = #item{val=nil, pointer=[item_nil]},

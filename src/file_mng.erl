@@ -130,7 +130,7 @@ handle_call({write_page, PageId, SlotDataList}, _From, #file{fd=Fd}=File) ->
     io:format("SlotDataList@disk:~p~n", [data2page(SlotDataList)]),
     D = data2page(SlotDataList),
     [<<0:32, EmptySize:32/integer, SlotCount:32/integer>> | _] = D,
-    io:format("D:~p~n", [D]),
+    % io:format("D:~p~n", [D]),
     case file:pwrite(Fd, PageId * ?PAGE_SIZE, D) of
         ok -> {reply, {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}}, File};
         {error, Reason} ->
@@ -208,7 +208,7 @@ construct_data(Data) ->
     <<0:(8*PaddingSize)>>,
     DataList],
     io:format("PageSize:~p, HeaderSize:~p, DataSize:~p, PaddingSize:~p~n", [?PAGE_SIZE, ?HEADER_SIZE, DataSize, PaddingSize]),
-    io:format("Data:~p~n", [Ret]),
+    % io:format("Data:~p~n", [Ret]),
     {PaddingSize, SlotCount, Ret}.
 
 % [{2,["orange","120"]},{1,["apple","100"]}]
