@@ -16,5 +16,7 @@ init(_Args) ->
     DataBufferSpec = {data_buffer, {data_buffer, start_link, []}, permanent, brutal_kill, worker, [data_buffer]},
     QueryExecSupSpec = {query_exec_sup, {query_exec_sup, start_link, []}, permanent, brutal_kill, supervisor, [query_exec_sup]},
     LogUtilSpec = {log_util, {log_util, start_link, []}, permanent, brutal_kill, supervisor, [log_util]},
-    ChildSpec = [SimpleDbServerSpec, SysTblMngSpec, TxMngSpec, QueryExecSupSpec, DataBufferSpec, LogUtilSpec],
+    ChildSpec = [SysTblMngSpec, DataBufferSpec, LogUtilSpec, SimpleDbServerSpec, TxMngSpec, QueryExecSupSpec],
     {ok, {SupFlags, ChildSpec}}.
+
+%% TODO:エラーが発生してプロセスが落ちた時、recoverプロセスのrecoverを実行し、コミット済みのデータをディスクに書き込む

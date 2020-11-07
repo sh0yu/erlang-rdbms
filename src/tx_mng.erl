@@ -25,6 +25,7 @@ allow_tx(Pid, Txid) ->
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 init([]) ->
+    recover:recover(),
     %% loggerの設定
     logger:set_primary_config(level, info),
     %% システムテーブル作成

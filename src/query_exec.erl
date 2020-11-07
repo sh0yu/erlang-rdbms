@@ -49,6 +49,7 @@ handle_call({exec_query, {commit_tx}}, _From, State)->
             QueryIdList = get_query_id_list(State),
             lists:map(fun(QueryId) -> commit_local_index(State, QueryId) end, QueryIdList),
             lists:map(fun(QueryId) -> commit_kvstore(State, QueryId) end, QueryIdList),
+            log_util:redo_log_put_checkpoint(),
             Rep = tx_mng:commit_tx(TPid, Txid),
             {reply, Rep, State#state{txid=undefined, queryId = []}}
     end;

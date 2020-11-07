@@ -1,4 +1,4 @@
--record(oid, {
+-record(phys_loc, {
     table_name,
     page_id,
     slot
@@ -18,4 +18,20 @@
     empty_size,
     slot_count,
     data_list
+}).
+
+%% REDOログ
+%% タイムスタンプ
+%% トランザクションID
+%% アクション(ins,del)
+%% オブジェクトID
+%% 更新後値
+-record(redo_log, {
+    timestamp,
+    txid,
+    query_id,
+    action,
+    table_name,
+    oid,
+    val
 }).

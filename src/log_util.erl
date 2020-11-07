@@ -19,11 +19,13 @@
 }).
 
 -include_lib("kernel/include/file.hrl").
+-include("../include/simple_db_server.hrl").
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init(_) ->
+    {ok, _Log} = disk_log:open([{name, redo_log}]),
     {ok, Writer} = writer_init(),
     {ok, #st{writer=Writer}}.
 
@@ -83,3 +85,15 @@ write(Entry, Writer) ->
 
 format({Level, Timestamp, Node, Pid, MsgId}) ->
     "[" ++ Level ++ "] " ++ Timestamp ++ " " ++ atom_to_list(Node) ++ " " ++ pid_to_list(Pid) ++ " " ++ MsgId.
+
+redo_log_write(RedoLog) ->
+    ok = disk_log:log(redo_log, RedoLog).
+
+redo_log_chunk(Cont) ->
+    disk_log:chunk(redo_log, Cont).
+
+redo_log_put_checkpoint() ->
+    ok = disk_log:log(redo_log, #redo_log{timestamp=erlang:system_time(), action=checkpoint}).
+
+redo_log_truncate() ->
+    ok = disk_log:truncate(redo_log).
