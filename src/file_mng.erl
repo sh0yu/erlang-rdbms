@@ -113,7 +113,7 @@ handle_call({load_page, PageId}, _From, #file{fd=Fd}=File) ->
     case file:pread(Fd, PageId * ?PAGE_SIZE, ?PAGE_SIZE) of
         {ok, Data} ->
             Ret = page2data(Data),
-            io:format("FileData:~p~n", [Ret]),
+            % io:format("FileData:~p~n", [Ret]),
             {reply, {ok, Ret}, File};
         eof ->
             {reply, {ok, eof}, File}
@@ -127,7 +127,7 @@ handle_call({get_page_header, PageId}, _From, #file{fd=Fd}=File) ->
     end;
 
 handle_call({write_page, PageId, SlotDataList}, _From, #file{fd=Fd}=File) ->
-    io:format("SlotDataList@disk:~p~n", [data2page(SlotDataList)]),
+    % io:format("SlotDataList@disk:~p~n", [data2page(SlotDataList)]),
     D = data2page(SlotDataList),
     [<<0:32, EmptySize:32/integer, SlotCount:32/integer>> | _] = D,
     % io:format("D:~p~n", [D]),
@@ -200,7 +200,7 @@ construct_header(_Data, EmptySize, SlotCount) ->
     <<0:32, EmptySize:32/integer, SlotCount:32/integer>>.
 
 construct_data(Data) ->
-    io:format("ConstructData:~p~n", [Data]),
+    % io:format("ConstructData:~p~n", [Data]),
     [#slot{slot_n=SlotCount} | _] = Data,
     {{OffsetList, DataList}, DataSize} = slot2page(Data, SlotCount, {[], []}, 0),
     PaddingSize = ?PAGE_SIZE - (?HEADER_SIZE + DataSize),

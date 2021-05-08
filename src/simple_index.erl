@@ -14,7 +14,7 @@ create_table(TableName, ColNameList) ->
     ok.
 
 drop_table(TableName) ->
-    ColNameList = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
+    {ok, ColNameList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
     lists:map(fun(ColName) ->
         ColIndexName = get_tab_column_key(TableName, ColName),
         drop_column_index(ColIndexName) end, ColNameList),

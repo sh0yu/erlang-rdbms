@@ -121,7 +121,7 @@ handle_call({write_data, TableName, Oid, Data}, _from, State) ->
     %% SlotDataListに整形する
     SlotDataList = lists:map(fun({#phys_loc{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
     ets:match_object(PlentySpaceBuf, {'_', '_'})),
-    io:format("SlotDataList:~p~n", [SlotDataList]),
+    % io:format("SlotDataList:~p~n", [SlotDataList]),
     Fd = get_fd(TableName),
     case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of
         {ok, #disk_data{empty_size=EmptySize, slot_count=SlotCount}} ->
@@ -142,7 +142,7 @@ handle_call({update_data, TableName, #phys_loc{table_name=TableName, page_id=Pag
     ets:insert(DataBuf, {PhysLoc, Data}),
     SlotDataList = lists:map(fun({#phys_loc{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
     ets:match_object(DataBuf, {'_', '_'})),
-    io:format("SlotDataList:~p~n", [SlotDataList]),
+    % io:format("SlotDataList:~p~n", [SlotDataList]),
     Fd = get_fd(TableName),
     BufInfo = case ets:lookup(buf_info_list, DataBuf) of
         [] -> conflict_error;
@@ -165,7 +165,7 @@ handle_call({delete_data, Oid}, _From, State) ->
             ets:delete(TargetBuf, PhysLoc),
             SlotDataList = lists:map(fun({#phys_loc{slot=SlotN}, SlotData}) -> #slot{slot_n=SlotN, data=SlotData} end,
             ets:match_object(TargetBuf, {'_', '_'})),
-            io:format("SlotDataList:~p~n", [SlotDataList]),
+            % io:format("SlotDataList:~p~n", [SlotDataList]),
             %% TODO: buf_infoの更新できているか確認
             Fd = get_fd(TableName),
             case file_mng:write_page(Fd, PageId, #disk_data{data_list=SlotDataList}) of

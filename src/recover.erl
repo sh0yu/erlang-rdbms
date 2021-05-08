@@ -14,7 +14,6 @@ recover(Cont, RedoList) ->
             recover(Cont2, RedoLog++RedoList);
         eof -> 
             RedoL = seek_checkpoint(RedoList, []),
-            test_print_redo_log(RedoL),
             do_recover(build_redo_list(RedoL)),
             log_util:redo_log_truncate()
     end.

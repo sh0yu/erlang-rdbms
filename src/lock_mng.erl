@@ -31,7 +31,7 @@ init([]) ->
     ets:new(ms_locking_oid, [bag, named_table, public]),
     %% ロックが取れず待っているオブジェクトIDとプロセスIDを管理
     %% ロックが取れたとき、次にロックを獲得しなければならないオブジェクトIDのリストも保持
-    ets:new(ms_waiting_proc, [bag, named_table, public]),
+    ets:new(ms_lock_waiting_proc, [bag, named_table, public]),
     {ok, []}.
 
 handle_call(terminate, _From, _State) ->
@@ -84,7 +84,7 @@ acquire(LockId, [Oid | OidList], Timestamp, From, RW, Rep) ->
         false ->
             % lockが取れなかった場合、そのOidのロックが解放されるまで待つ
             % ロックが解放されたら、残されたOidについてロックを獲得する
-            ets:insert(ms_waiting_proc, {Oid, LockId, OidList, Timestamp, From, RW}),
+            ets:insert(ms_lock_waiting_proc, {Oid, LockId, OidList, Timestamp, From, RW}),
             queued
     end;
 acquire(_LockId, [], _Timestamp, _From, _RW, Rep) ->
@@ -124,12 +124,12 @@ is_only_read_lock(_LockId, _Mode, _) ->
 %% あるオブジェクトのロックが解放されたとき、次にロックをかけたいプロセスが存在すれば
 %% そのプロセスがロックを獲得する
 dequeue_lock(Oid) ->
-    case ets:lookup(ms_waiting_proc, Oid) of
+    case ets:lookup(ms_lock_waiting_proc, Oid) of
         [] -> no;
         OidList -> 
             {Oid, LockId, OidL, Timestamp, From, RW}=Lock = get_oldest_lock(OidList),
             %% ロック待ちのキューから一番古いロックを削除
-            true = ets:delete_object(ms_waiting_proc, Lock),
+            true = ets:delete_object(ms_lock_waiting_proc, Lock),
             case acquire(LockId, [Oid | OidL], Timestamp, From, RW, ok) of
                 %% ロック待ちが解消されればokを返す
                 ok -> 

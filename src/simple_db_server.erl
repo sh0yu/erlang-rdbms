@@ -46,6 +46,7 @@ handle_call({create_table, {TableName, ColumnList}}, _From, State) ->
     {reply, ok, State};
 
 handle_call({drop_table, {TableName}}, _From, State) ->
+    ok = simple_index:drop_table(TableName),
     ok = sys_tbl_mng:drop_table(whereis(sys_tbl_mng), TableName),
     {reply, ok, State};
 
@@ -206,7 +207,6 @@ convert_set_query(SetQuery, ColumnList) ->
 %% 指定されたテーブルの各カラムインデックスからOidを削除する
 delete_index(TableName, Oid) ->
     {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-    io:format("[DELETE_INDEX]~p,~p~n", [TableName, Oid]),
     Val = read_data_oid(TableName, Oid),
     lists:map(fun({ColName, ColVal}) ->
         ok = simple_index:delete_index(TableName, ColName, ColVal, Oid)

@@ -1,9 +1,9 @@
 -module(query_exec).
 -compile(export_all).
 -behaviour(gen_server).
--record(state, {sdsPid, txMngPid, txid, lKvstore, lColumnIndex, queryId}).
+-record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex, queryId}).
 -include("../include/simple_db_server.hrl").
--include_lib("kernel/include/logger.hrl").
+% -include_lib("kernel/include/logger.hrl").
 
 start_link() ->
     gen_server:start_link(?MODULE, [], [{debug, [log]}]).
@@ -29,8 +29,9 @@ exec_query(Pid, Query) ->
 init([]) ->
     SdsPid = whereis(simple_db_server),
     TxMngPid = whereis(tx_mng),
+    LockMngPid = whereis(lock_mng),
     {LKvstore, LColumnIndex} = create_local_tables(),
-    {ok, #state{sdsPid = SdsPid, txMngPid = TxMngPid, lKvstore = LKvstore,
+    {ok, #state{sdsPid = SdsPid, txMngPid = TxMngPid, lockMngPid = LockMngPid, lKvstore = LKvstore,
     lColumnIndex = LColumnIndex, queryId = []}}.
 
 handle_call({exec_query, {begin_tx}}, _From, State)->
@@ -49,6 +50,7 @@ handle_call({exec_query, {commit_tx}}, _From, State)->
             QueryIdList = get_query_id_list(State),
             lists:map(fun(QueryId) -> commit_local_index(State, QueryId) end, QueryIdList),
             lists:map(fun(QueryId) -> commit_kvstore(State, QueryId) end, QueryIdList),
+            release_lock(State),
             log_util:redo_log_put_checkpoint(),
             Rep = tx_mng:commit_tx(TPid, Txid),
             {reply, Rep, State#state{txid=undefined, queryId = []}}
@@ -64,6 +66,7 @@ handle_call({exec_query, {rollback_tx}}, _From, State)->
             QueryIdList = get_query_id_list(State),
             lists:map(fun(QueryId) -> rollback_local_index(State, QueryId) end, QueryIdList),
             lists:map(fun(QueryId) -> rollback_kvstore(State, QueryId) end, QueryIdList),
+            release_lock(State),
             Rep = tx_mng:rollback_tx(TPid, Txid),
             {reply, Rep, State#state{txid=undefined, queryId = []}}
     end;
@@ -99,6 +102,7 @@ handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State)->
             QueryIdList = get_query_id_list(State),
             %% オブジェクトIDを取得する
             OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+            ok = acquire_lock(State, OidList, read),
             %% オブジェクトIDから値を取得する
             {reply, select_data(State, TableName, OidList, QueryIdList), State}
     end;
@@ -115,6 +119,7 @@ handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, St
             {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
             SetQueryConverted = simple_db_server:convert_set_query(SetQuery, ColumnList),
             OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+            ok = acquire_lock(State, OidList, write),
             F = fun(Oid) ->
                 %% OldVal -> [banana, 100]
                 %% NewVal -> [apple, 100]
@@ -148,6 +153,7 @@ handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State)->
             QueryIdList = get_query_id_list(State),
             %% オブジェクトIDを取得する
             OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+            ok = acquire_lock(State, OidList, write),
             lists:map(fun(Oid) -> local_delete_data(State, QueryId, TableName, Oid, select_data(State, TableName, Oid, QueryIdList)) end,
             OidList),
             {reply, ok, State#state{queryId = QueryIdList ++ [QueryId]}}
@@ -175,6 +181,9 @@ get_db_pid(State) ->
 
 get_tx_mng_pid(State) ->
     State#state.txMngPid.
+
+get_lock_mng_pid(State) ->
+    State#state.lockMngPid.
 
 get_txid(State) ->
     State#state.txid.
@@ -276,7 +285,7 @@ merge_local_index_local(ShareData, {_QueryId, del, _TableName, _ColName, _Val, O
 %% 共有データとローカルデータからデータを取得し、マージして返却する
 select_data(State, TableName, OidList, QueryIdList) when is_list(OidList)->
     lists:map(fun(Oid) -> select_data(State, TableName, Oid, QueryIdList) end, OidList);
-select_data(State,TableName, Oid, QueryIdList) ->
+select_data(State, TableName, Oid, QueryIdList) ->
     ShareData = simple_db_server:read_data_oid(TableName, Oid),
     lists:foldl(fun(QueryId, SData) -> merge_local_data(State, SData, Oid, QueryId) end,
     ShareData, QueryIdList).
@@ -341,3 +350,19 @@ rollback_local_index(State, QueryId) ->
 rollback_kvstore(State, QueryId) ->
     LKvstore = get_local_kvstore(State),
     ets:delete(LKvstore, QueryId).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Lock funcs.
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+acquire_lock(State, ObjectId, RW) when is_list(ObjectId) ->
+    LockMngPid = get_lock_mng_pid(State),
+    Txid = get_txid(State),
+    lock_mng:acquire_lock(LockMngPid, Txid, ObjectId, RW);
+acquire_lock(State, ObjectId, RW) ->
+    acquire_lock(State, [ObjectId], RW).
+
+release_lock(State) ->
+    LockMngPid = get_lock_mng_pid(State),
+    Txid = get_txid(State),
+    lock_mng:release_lock(LockMngPid, Txid).
