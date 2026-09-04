@@ -106,6 +106,9 @@ handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State) ->
 handle_call({exec_query, {scan, TableName}}, _From, State) ->
     with_transaction(State, fun() -> do_scan(State, TableName) end);
 
+handle_call({exec_query, {sql, Sql}}, _From, State) ->
+    with_transaction(State, fun() -> do_sql(State, Sql) end);
+
 handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State) ->
     with_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
 
@@ -174,6 +177,26 @@ do_select(State, TableName, ColName, Val) ->
             Rows = [R || R <- select_data(State, TableName, OidList, QueryIdList),
                          R =/= not_found],
             {reply, Rows, State}
+    end.
+
+%% SQL文を実行する。
+%% 字句解析 -> 構文解析 -> 意味解析(カラムを位置に解決) -> 実行。
+do_sql(State, Sql) ->
+    case sql:parse(Sql) of
+        {error, Reason} ->
+            {reply, {error, Reason}, State};
+        {ok, Ast} ->
+            case sql_analyzer:analyze(Ast) of
+                {error, Reason} ->
+                    {reply, {error, Reason}, State};
+                {ok, Plan} ->
+                    %% 実行器にはストレージへの入口を関数で渡す。
+                    %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
+                    %% かつ走査がこのトランザクションの未コミット変更を見られる。
+                    Ctx = {fun(T) -> tx_scan_open(State, T) end,
+                           fun(C) -> tx_scan_next(C) end},
+                    {reply, sql_exec:run(Plan, Ctx), State}
+            end
     end.
 
 %% テーブル全体を走査する。索引を使わないので任意のカラムの条件に使える。
