@@ -372,12 +372,40 @@ do_commit(State) ->
     Txid = get_txid(State),
     QueryIdList = get_query_id_list(State),
     Changes = collect_changes(State, QueryIdList),
-    ok = write_redo_log(Txid, Changes),
-    ok = apply_changes(Changes),
-    ok = log_util:redo_log_put_checkpoint(),
-    clear_local(State, QueryIdList),
-    Rep = tx_mng:commit_tx(TPid, Txid),
-    {reply, Rep, State#state{txid = undefined, queryId = []}}.
+    %% 適用も、REDOログの書き込みもする前に、全変更が通ることを確かめる。
+    %%
+    %% これが無いと、apply_changes/1 が途中で失敗したときに、
+    %% それまでに適用した分だけが共有データに残る(千切れたコミット)。
+    %% REDOのみでUNDOログが無いので、適用済みの分を戻す手段が無い。
+    %% 検証で弾けばまだ何も書いていないので、ロールバックが常に安全になる。
+    case validate_changes(Changes) of
+        {error, Reason} ->
+            %% コミットできないトランザクションは破棄する。
+            %% ログを書いていないのでリカバリが再実行することもない。
+            {reply, _, State2} = do_rollback(State),
+            {reply, {error, Reason}, State2};
+        ok ->
+            ok = write_redo_log(Txid, Changes),
+            ok = apply_changes(Changes),
+            ok = log_util:redo_log_put_checkpoint(),
+            clear_local(State, QueryIdList),
+            Rep = tx_mng:commit_tx(TPid, Txid),
+            {reply, Rep, State#state{txid = undefined, queryId = []}}
+    end.
+
+%% 共有データを一切変更せずに、全変更が適用可能かを確かめる。
+validate_changes([]) ->
+    ok;
+validate_changes([{_QId, ins, TableName, Oid, Val} | T]) ->
+    case simple_db_server:validate_insert(TableName, Oid, Val) of
+        {ok, _ColumnList} -> validate_changes(T);
+        {error, Reason} -> {error, Reason}
+    end;
+validate_changes([{_QId, del, TableName, _Oid, _Val} | T]) ->
+    case simple_db_server:validate_delete(TableName) of
+        ok -> validate_changes(T);
+        {error, Reason} -> {error, Reason}
+    end.
 
 %% ロールバックはローカル領域を捨てるだけでよい。
 %% 共有データにはまだ何も書いていない。
@@ -419,10 +447,10 @@ apply_changes([{_QId, ins, TableName, Oid, Val} | T]) ->
     ok = ensure_ok(simple_db_server:insert_data(simple_db_server, TableName, Oid, Val)),
     apply_changes(T).
 
-%% コミット中にテーブルが消えているなど、反映できない変更は
-%% 落とさずに読み飛ばす。REDOログにも同じ判断が入る。
+%% ここに来る変更は validate_changes/1 を通っている。
+%% それでも失敗するなら想定外なので、握り潰さずに落とす
+%% (REDOログは書いてありチェックポイントはまだなので、リカバリで再実行される)。
 ensure_ok(ok) -> ok;
-ensure_ok({error, table_not_found}) -> ok;
 ensure_ok({error, Reason}) -> error({commit_failed, Reason}).
 
 clear_local(State, QueryIdList) ->

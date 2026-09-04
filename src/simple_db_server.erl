@@ -21,6 +21,7 @@
          select_data/4, update_data/5, vacuum/2, list_tables/1]).
 -export([read_data_oid/2, read_data_oid_with_column/2]).
 -export([scan_open/1, scan_next/1, scan_fold/3]).
+-export([validate_insert/3, validate_delete/1]).
 -export([convert_set_query/2, build_new_val/2, get_tab_column_key/2]).
 -export([index_module/0]).
 
@@ -122,16 +123,20 @@ handle_call({drop_table, {TableName}}, _From, State) ->
     {reply, Reply, State};
 
 handle_call({insert, {TableName, Oid, Val}}, _From, State) ->
-    Reply = case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
-                {error, table_not_found} ->
-                    {error, table_not_found};
-                {ok, ColumnList} when length(ColumnList) =/= length(Val) ->
-                    {error, column_count_mismatch};
+    Reply = case validate_insert(TableName, Oid, Val) of
+                {error, Reason} ->
+                    {error, Reason};
                 {ok, ColumnList} ->
-                    %% 同じOidの上書きなら、古い値のインデックスを先に外す
-                    ok = unindex_existing(TableName, ColumnList, Oid),
+                    %% 索引より先に行を書く。
+                    %%
+                    %% 逆順にすると、書き込みが失敗したときに古い値の索引だけが
+                    %% 消えて行が残り、索引とヒープが食い違う(索引検索からは
+                    %% 見えず走査からは見える幽霊行になる)。
+                    %% 古い値は索引を外すのに要るので、上書きする前に控えておく。
+                    OldVal = existing_row(TableName, ColumnList, Oid),
                     case data_buffer:write_data(whereis(data_buffer), TableName, Oid, Val) of
                         ok ->
+                            ok = unindex(TableName, ColumnList, Oid, OldVal),
                             ok = (index_module()):insert_index(
                                    TableName, lists:zip(ColumnList, Val), Oid),
                             ok;
@@ -161,12 +166,17 @@ handle_call({delete, {TableName, Oid}}, _From, State) ->
                 {error, table_not_found} ->
                     {error, table_not_found};
                 {ok, ColumnList} ->
-                    ok = unindex_existing(TableName, ColumnList, Oid),
+                    %% 挿入と同じ理由で、行を消してから索引を外す
+                    OldVal = existing_row(TableName, ColumnList, Oid),
                     case data_buffer:delete_data(whereis(data_buffer), Oid) of
-                        ok -> ok;
-                        %% すでに消えている場合も削除は成功とみなす(冪等)
-                        {error, oid_not_found} -> ok;
-                        {error, Reason} -> {error, Reason}
+                        ok ->
+                            unindex(TableName, ColumnList, Oid, OldVal);
+                        %% すでに消えている場合も削除は成功とみなす(冪等)。
+                        %% 索引に参照が残っていれば外しておく。
+                        {error, oid_not_found} ->
+                            unindex(TableName, ColumnList, Oid, OldVal);
+                        {error, Reason} ->
+                            {error, Reason}
                     end
             end,
     {reply, Reply, State};
@@ -311,19 +321,50 @@ unknown_columns(SetQuery, ColumnList) ->
 
 %% すでに同じOidの行がある場合、その古い値のインデックス参照を外す。
 %% 外しておかないと、上書き後に古い値でも引けてしまう。
-unindex_existing(TableName, ColumnList, Oid) ->
+%%----------------------------------------------------------------------
+%% @doc 書き込む前に、すでに入っている行を控える。索引を外すのに要る。
+%% Returns: [Val] | none
+%%----------------------------------------------------------------------
+existing_row(TableName, ColumnList, Oid) ->
     case read_data_oid(TableName, Oid) of
-        not_found ->
-            ok;
-        {error, _} ->
-            ok;
-        OldVal when length(OldVal) =:= length(ColumnList) ->
-            lists:foreach(fun({ColName, ColVal}) ->
-                                  ok = (index_module()):delete_index(TableName, ColName, ColVal, Oid)
-                          end, lists:zip(ColumnList, OldVal)),
-            ok;
-        _ ->
-            ok
+        OldVal when is_list(OldVal), length(OldVal) =:= length(ColumnList) -> OldVal;
+        _ -> none
+    end.
+
+%% 控えておいた古い値の索引参照を外す。
+unindex(_TableName, _ColumnList, _Oid, none) ->
+    ok;
+unindex(TableName, ColumnList, Oid, OldVal) ->
+    lists:foreach(fun({ColName, ColVal}) ->
+                          ok = (index_module()):delete_index(TableName, ColName, ColVal, Oid)
+                  end, lists:zip(ColumnList, OldVal)),
+    ok.
+
+%%----------------------------------------------------------------------
+%% @doc 挿入が成功しうるかを、共有データを一切変更せずに確かめる。
+%% コミットが途中で失敗して千切れるのを防ぐため、適用の前に全件これを通す。
+%% Returns: {ok, ColumnList} | {error, Reason}
+%%----------------------------------------------------------------------
+validate_insert(TableName, Oid, Val) ->
+    case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+        {error, table_not_found} ->
+            {error, table_not_found};
+        {ok, ColumnList} when length(ColumnList) =/= length(Val) ->
+            {error, column_count_mismatch};
+        {ok, ColumnList} ->
+            case data_buffer:row_fits(Oid, Val) of
+                true -> {ok, ColumnList};
+                false -> {error, row_too_large}
+            end
+    end.
+
+%%----------------------------------------------------------------------
+%% @doc 削除が成功しうるかを確かめる。
+%%----------------------------------------------------------------------
+validate_delete(TableName) ->
+    case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
+        true -> ok;
+        false -> {error, table_not_found}
     end.
 
 %%%===================================================================

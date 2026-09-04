@@ -25,6 +25,7 @@
 -export([read_data/2, write_data/4, update_data/4, delete_data/2,
          drop_table/2, vacuum/2, flush/1, all_rows/2]).
 -export([scan_open/2, scan_next/2]).
+-export([row_fits/2]).
 -export_type([scan_cursor/0]).
 
 %% gen_server callbacks
@@ -146,6 +147,14 @@ scan_open(Pid, TableName) ->
 scan_next(Pid, Cursor) ->
     gen_server:call(Pid, {scan_next, Cursor}, infinity).
 
+%%----------------------------------------------------------------------
+%% @doc 行が1ページに収まるかどうか。
+%% 純粋な計算なのでプロセスを経由しない。コミット前の検証で使う。
+%%----------------------------------------------------------------------
+-spec row_fits(term(), term()) -> boolean().
+row_fits(Oid, Val) ->
+    file_mng:payload_size(wrap(Oid, Val)) =< file_mng:max_payload_size().
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -263,10 +272,10 @@ do_scan_next(#scan_cursor{table_name = T, page_id = P} = C) ->
 %% 新規挿入と上書きの両方を扱う。
 %% 既存Oidの場合は同じPhysLocに書き戻し、収まらなければ別ページへ移す。
 do_write(TableName, Oid, Data) ->
-    case file_mng:payload_size(wrap(Oid, Data)) > file_mng:max_payload_size() of
-        true ->
-            {error, row_too_large};
+    case row_fits(Oid, Data) of
         false ->
+            {error, row_too_large};
+        true ->
             case oid2physloc(Oid) of
                 oid_not_found ->
                     insert_new(TableName, Oid, Data);
