@@ -22,7 +22,8 @@ commit_test_() ->
      [fun commit_is_all_or_nothing/1,
       fun failed_commit_reports_the_reason/1,
       fun failed_commit_releases_the_transaction/1,
-      fun commit_to_dropped_table_does_not_silently_succeed/1]}.
+      fun ddl_is_rejected_inside_a_transaction/1,
+      fun ddl_waits_for_the_running_transaction/1]}.
 
 %% 1件でも適用できない変更があれば、そのトランザクションの変更は
 %% ひとつも共有データに残らないこと。
@@ -68,18 +69,36 @@ failed_commit_releases_the_transaction(_) ->
         ok = q(C, {commit_tx})
     end.
 
-%% コミット中にテーブルが消えていた場合、成功扱いにして
-%% 変更を黙って捨てないこと
-commit_to_dropped_table_does_not_silently_succeed(_) ->
+%% 明示的なトランザクションの中のDDLは拒否されること。
+%% カタログ変更を戻す仕組みが無いので、ロールバックできないものを
+%% 黙って通さない。
+ddl_is_rejected_inside_a_transaction(_) ->
+    fun() ->
+        C = connect(),
+        _ = q(C, {begin_tx}),
+        ?assertEqual({error, ddl_in_transaction}, q(C, {create_table, t, [a, b]})),
+        ?assertEqual({error, ddl_in_transaction}, q(C, {drop_table, t})),
+        ok = q(C, {rollback_tx}),
+        %% トランザクションの外なら通る
+        ?assertEqual(ok, q(C, {create_table, t, [a, b]}))
+    end.
+
+%% 他の接続のトランザクションが動いている最中に、DDLが割り込めないこと。
+%% 割り込めると直列化可能性が成立しない。
+ddl_waits_for_the_running_transaction(_) ->
     fun() ->
         C1 = connect(),
         ok = q(C1, {create_table, t, [a, b]}),
         _ = q(C1, {begin_tx}),
         {ok, _} = q(C1, {insert, t, [x, 1]}),
-        %% DDLはトランザクションの外なので別接続から割り込める
+
         C2 = connect(),
-        ok = q(C2, {drop_table, t}),
-        ?assertEqual({error, table_not_found}, q(C1, {commit_tx}))
+        Self = self(),
+        spawn_link(fun() -> Self ! {dropped, q(C2, {drop_table, t})} end),
+        %% C1がコミットするまでDROPは進めない
+        ?assertEqual(timeout, recv(300)),
+        ok = q(C1, {commit_tx}),
+        ?assertEqual({dropped, ok}, recv(5000))
     end.
 
 %%%===================================================================
@@ -130,3 +149,6 @@ connect() ->
     Pid.
 
 q(Pid, Query) -> query_exec:exec_query(Pid, Query).
+
+recv(Timeout) ->
+    receive Msg -> Msg after Timeout -> timeout end.

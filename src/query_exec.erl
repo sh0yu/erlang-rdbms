@@ -90,12 +90,13 @@ handle_call({exec_query, {commit_tx}}, _From, State) ->
 handle_call({exec_query, {rollback_tx}}, _From, State) ->
     with_transaction(State, fun() -> do_rollback(State) end);
 
-%% DDLはトランザクションの対象外。即座に共有データへ反映する。
+%% DDLは暗黙のトランザクションとして実行する(下の with_ddl/2 を参照)。
 handle_call({exec_query, {create_table, TableName, ColumnList}}, _From, State) ->
-    {reply, simple_db_server:create_table(get_db_pid(State), TableName, ColumnList), State};
+    with_ddl(State,
+             fun() -> simple_db_server:create_table(get_db_pid(State), TableName, ColumnList) end);
 
 handle_call({exec_query, {drop_table, TableName}}, _From, State) ->
-    {reply, simple_db_server:drop_table(get_db_pid(State), TableName), State};
+    with_ddl(State, fun() -> simple_db_server:drop_table(get_db_pid(State), TableName) end);
 
 handle_call({exec_query, {insert, TableName, Val}}, _From, State) ->
     with_transaction(State, fun() -> do_insert(State, TableName, Val) end);
@@ -144,6 +145,35 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% クエリ本体
 %%%===================================================================
+
+%% DDLを暗黙のトランザクションとして実行する。
+%%
+%% 以前はトランザクションを介さず即座に反映していたため、2つ問題があった。
+%%   - 明示的なトランザクションの中で CREATE TABLE してロールバックしても
+%%     テーブルが残る
+%%   - 他の接続のトランザクションが実行中でも割り込めるので、
+%%     直列化可能性が成立しない
+%%
+%% ここで暗黙のトランザクションに包むことで、DDLも他のトランザクションと
+%% 同じ順番待ちの列に並ぶ。
+%%
+%% 明示的なトランザクションの中でのDDLは拒否する。カタログの変更を
+%% 元に戻す仕組み(UNDOログ)が無いため、ロールバックできないものを
+%% 黙って通すより、実行できないと言うほうが正直である。
+with_ddl(#state{txid = undefined} = State, Fun) ->
+    TPid = get_tx_mng_pid(State),
+    Txid = tx_mng:begin_tx(TPid),
+    %% 自分の順番が来るまで待つ
+    case tx_mng:allow_tx(TPid, Txid) of
+        ok ->
+            Reply = Fun(),
+            _ = tx_mng:commit_tx(TPid, Txid),
+            {reply, Reply, State};
+        transaction_not_found ->
+            {reply, {error, transaction_not_found}, State}
+    end;
+with_ddl(State, _Fun) ->
+    {reply, {error, ddl_in_transaction}, State}.
 
 %% トランザクションが開始済みで、かつ自分の順番が来ていることを確かめてから
 %% Funを実行する。順番待ちの間はここでブロックする。
