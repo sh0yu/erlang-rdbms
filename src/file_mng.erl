@@ -27,7 +27,7 @@
 -behaviour(gen_server).
 
 %% Public API
--export([open/1, open/2, close/1, delete/1, truncate/1]).
+-export([open/1, open/2, close/1, delete/1, truncate/1, sync/1]).
 -export([load_page/2, get_page_header/2, write_page/3, page_count/1]).
 -export([page_size/0, header_size/0, slot_entry_size/0, max_payload_size/0]).
 -export([encode_page/1, decode_page/1, payload_size/1, required_size/1]).
@@ -76,6 +76,14 @@ delete(Fd) ->
 
 truncate(Fd) ->
     gen_server:call(Fd, truncate, infinity).
+
+%%----------------------------------------------------------------------
+%% @doc 書き込んだ内容を実際にディスクへ落とす。
+%% file:pwrite/3 はOSのページキャッシュに置くだけなので、これを呼ばないと
+%% 電源断でデータが失われる。
+%%----------------------------------------------------------------------
+sync(Fd) ->
+    gen_server:call(Fd, sync, infinity).
 
 %%----------------------------------------------------------------------
 %% @doc PageIdのページを読み込む。
@@ -153,6 +161,9 @@ handle_call(delete, _From, #file{fd = Fd, filepath = Filepath} = File) ->
 handle_call(truncate, _From, #file{fd = Fd} = File) ->
     {ok, _} = file:position(Fd, bof),
     {reply, file:truncate(Fd), File};
+
+handle_call(sync, _From, #file{fd = Fd} = File) ->
+    {reply, file:sync(Fd), File};
 
 handle_call(page_count, _From, #file{fd = Fd} = File) ->
     {reply, do_page_count(Fd), File};

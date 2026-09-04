@@ -23,7 +23,8 @@ commit_test_() ->
       fun failed_commit_reports_the_reason/1,
       fun failed_commit_releases_the_transaction/1,
       fun ddl_is_rejected_inside_a_transaction/1,
-      fun ddl_waits_for_the_running_transaction/1]}.
+      fun ddl_waits_for_the_running_transaction/1,
+      fun commit_works_with_durable_commit_off/1]}.
 
 %% 1件でも適用できない変更があれば、そのトランザクションの変更は
 %% ひとつも共有データに残らないこと。
@@ -99,6 +100,25 @@ ddl_waits_for_the_running_transaction(_) ->
         ?assertEqual(timeout, recv(300)),
         ok = q(C1, {commit_tx}),
         ?assertEqual({dropped, ok}, recv(5000))
+    end.
+
+%% durable_commit を切っても結果は変わらないこと。
+%% 変わるのは電源断に耐えるかどうかだけで、意味論は同じ。
+commit_works_with_durable_commit_off(_) ->
+    fun() ->
+        application:set_env(transaction_db, durable_commit, false),
+        try
+            C = connect(),
+            ok = q(C, {create_table, t, [a, b]}),
+            _ = q(C, {begin_tx}),
+            {ok, _} = q(C, {insert, t, [x, 1]}),
+            ok = q(C, {commit_tx}),
+            _ = q(C, {begin_tx}),
+            ?assertEqual([[x, 1]], q(C, {select, t, a, x})),
+            ok = q(C, {commit_tx})
+        after
+            application:set_env(transaction_db, durable_commit, true)
+        end
     end.
 
 %%%===================================================================

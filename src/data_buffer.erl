@@ -23,7 +23,7 @@
 %% Public API
 -export([start_link/0, stop/1]).
 -export([read_data/2, write_data/4, update_data/4, delete_data/2,
-         drop_table/2, vacuum/2, flush/1, all_rows/2]).
+         drop_table/2, vacuum/2, flush/1, all_rows/2, sync/1]).
 -export([scan_open/2, scan_next/2]).
 -export([row_fits/2]).
 -export_type([scan_cursor/0]).
@@ -118,6 +118,18 @@ vacuum(Pid, TableName) ->
 %%----------------------------------------------------------------------
 flush(Pid) ->
     gen_server:call(Pid, flush, infinity).
+
+%%----------------------------------------------------------------------
+%% @doc ここまでの書き込みを実際にディスクへ落とす。
+%%
+%% file:pwrite/3 も dets:insert/2 も、呼んだ時点ではOSのページキャッシュや
+%% DETSのバッファに入るだけで、ディスクには届いていない。
+%% コミットのチェックポイントを書く前にこれを呼ばないと、
+%% 「チェックポイントより前は適用済み」という宣言が嘘になる
+%% (リカバリが再実行しないのに、実際のデータは失われている)。
+%%----------------------------------------------------------------------
+sync(Pid) ->
+    gen_server:call(Pid, sync, infinity).
 
 %%----------------------------------------------------------------------
 %% @doc テーブルの全行を返す。再起動後のインデックス再構築で使う。
@@ -218,6 +230,12 @@ handle_call({all_rows, TableName}, _From, State) ->
 handle_call(flush, _From, State) ->
     _ = dets:sync(oid_phys_loc),
     _ = dets:sync(vacuum_oid),
+    {reply, ok, State};
+
+handle_call(sync, _From, State) ->
+    lists:foreach(fun({_T, Fd}) -> ok = file_mng:sync(Fd) end, ets:tab2list(fd_tables)),
+    ok = dets:sync(oid_phys_loc),
+    ok = dets:sync(vacuum_oid),
     {reply, ok, State};
 
 handle_call(terminate, _From, State) ->

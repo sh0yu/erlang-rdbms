@@ -310,6 +310,17 @@ do_delete(State, TableName, ColName, Val) ->
 %%% トランザクションから見える走査
 %%%===================================================================
 
+%% コミット時にディスクへ同期する。
+%%
+%% 既定は同期する(durable_commit = true)。切ると1コミットあたりの
+%% fsyncが無くなって速くなるが、電源断でコミット済みのデータを失う。
+%% PostgreSQLの synchronous_commit と同じ性質のつまみ。
+sync_for_commit() ->
+    case application:get_env(transaction_db, durable_commit, true) of
+        true -> data_buffer:sync(whereis(data_buffer));
+        false -> ok
+    end.
+
 %% 共有データの走査に、このトランザクションのローカル差分を重ねる。
 %%
 %% 既存の重ね合わせ(merge_local_index/6)は「特定カラムが特定の値」という
@@ -417,6 +428,13 @@ do_commit(State) ->
         ok ->
             ok = write_redo_log(Txid, Changes),
             ok = apply_changes(Changes),
+            %% チェックポイントを書く前にディスクへ落とす。
+            %%
+            %% リカバリは最後のチェックポイント以降しか再実行しない。
+            %% よってチェックポイントは「これより前は永続化済み」という宣言になる。
+            %% ページキャッシュに置いただけの状態でこれを書くと、電源断のときに
+            %% データは失われるのにリカバリは再実行せず、黙って消える。
+            ok = sync_for_commit(),
             ok = log_util:redo_log_put_checkpoint(),
             clear_local(State, QueryIdList),
             Rep = tx_mng:commit_tx(TPid, Txid),
