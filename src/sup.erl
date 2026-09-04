@@ -1,3 +1,22 @@
+%%%-------------------------------------------------------------------
+%%% @doc
+%%% トップレベルのスーパーバイザ。
+%%%
+%%% 起動順に意味がある:
+%%%   sys_tbl_mng     カタログ(DETS)。他のサーバがテーブル定義を引く
+%%%   data_buffer     バッファプール。データファイルを開く
+%%%   log_util        REDOログ。リカバリが読む
+%%%   simple_db_server ストレージエンジン。起動時にインデックスを再構築する
+%%%   tx_mng          初期化でrecover:recover/0を呼ぶため、上記が揃った後
+%%%   lock_mng        ロック管理
+%%%   query_exec_sup  クライアント接続ごとのquery_execを起こす
+%%%
+%%% rest_for_oneにしているのは、下位のサーバが落ちたときに、その状態に
+%%% 依存している上位のサーバも作り直す必要があるため。例えばdata_bufferが
+%%% 落ちるとバッファ上のページが失われるので、simple_db_serverの
+%%% インデックスも再構築しないと整合しない。
+%%% @end
+%%%-------------------------------------------------------------------
 -module(sup).
 -behaviour(supervisor).
 
@@ -7,17 +26,28 @@
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-%% 各サーバを起動する
 init(_Args) ->
-    SupFlags = {one_for_one, 3, 5},
-    SimpleDbServerSpec = {simple_db_server, {simple_db_server, start_link, []}, permanent, brutal_kill, worker, [simple_db_server]},
-    SysTblMngSpec = {sys_tbl_mng, {sys_tbl_mng, start_link, []}, permanent, brutal_kill, worker, [sys_tbl_mng]},
-    TxMngSpec = {tx_mng, {tx_mng, start_link, []}, permanent, brutal_kill, worker, [tx_mng]},
-    LockMngSpec = {lock_mng, {lock_mng, start_link, []}, permanent, brutal_kill, worker, [lock_mng]},
-    DataBufferSpec = {data_buffer, {data_buffer, start_link, []}, permanent, brutal_kill, worker, [data_buffer]},
-    QueryExecSupSpec = {query_exec_sup, {query_exec_sup, start_link, []}, permanent, brutal_kill, supervisor, [query_exec_sup]},
-    LogUtilSpec = {log_util, {log_util, start_link, []}, permanent, brutal_kill, supervisor, [log_util]},
-    ChildSpec = [SysTblMngSpec, DataBufferSpec, LogUtilSpec, SimpleDbServerSpec, TxMngSpec, LockMngSpec, QueryExecSupSpec],
-    {ok, {SupFlags, ChildSpec}}.
+    SupFlags = #{strategy => rest_for_one, intensity => 3, period => 5},
+    ChildSpecs = [worker(sys_tbl_mng),
+                  worker(data_buffer),
+                  worker(log_util),
+                  worker(simple_db_server),
+                  worker(tx_mng),
+                  worker(lock_mng),
+                  #{id => query_exec_sup,
+                    start => {query_exec_sup, start_link, []},
+                    restart => permanent,
+                    shutdown => 5000,
+                    type => supervisor,
+                    modules => [query_exec_sup]}],
+    {ok, {SupFlags, ChildSpecs}}.
 
-%% TODO:エラーが発生してプロセスが落ちた時、recoverプロセスのrecoverを実行し、コミット済みのデータをディスクに書き込む
+%% DETSやディスクログを閉じる時間が要るので、brutal_killではなく
+%% 猶予を与えて終了させる。
+worker(Module) ->
+    #{id => Module,
+      start => {Module, start_link, []},
+      restart => permanent,
+      shutdown => 5000,
+      type => worker,
+      modules => [Module]}.

@@ -1,16 +1,20 @@
 {application, transaction_db,
- [{description, "Transaction support rdbms"},
-  {vsn, "0.0.1"},
-  {modules, [
-	     query_exec,
-         simple_db_server,
-         sup,
-         tx_mng
-        ]},
+ [{description, "Transaction support rdbms written in Erlang"},
+  {vsn, "0.1.0"},
+  {modules, []},
   {registered, [
-         query_exec,
-         simple_db_server,
-         tx_mng
-	    ]},
+      sup,
+      sys_tbl_mng,
+      data_buffer,
+      log_util,
+      simple_db_server,
+      tx_mng,
+      lock_mng,
+      query_exec_sup
+  ]},
   {applications, [kernel, stdlib]},
+  {env, [
+      %% データファイル・システムファイル・REDOログの置き場所
+      {data_dir, "./data"}
+  ]},
   {mod, {app, []}}]}.

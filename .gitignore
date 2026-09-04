@@ -14,3 +14,10 @@ rel/example_project
 .DS_Store
 _build/
 rebar.lock
+
+# build output
+ebin/
+*.LOG
+*.siz
+*.idx
+query.log

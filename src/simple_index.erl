@@ -1,109 +1,154 @@
+%%%-------------------------------------------------------------------
+%%% @doc
+%%% カラムインデックス。1テーブル1カラムにつき1つのETS(set)を持ち、
+%%% カラム値からオブジェクトIDのリストを引く。
+%%%
+%%%   ets: <TableName>_<ColumnName> :: {Val, [Oid]}
+%%%
+%%% 等値検索のみを対象とした素朴な実装。範囲検索を含む用途向けには
+%%% index.erl のB+treeを使う。
+%%%
+%%% 存在しないテーブル・カラムを引いた場合はクラッシュせず [] を返す。
+%%% ロールバックやリカバリの途中で、まだ作られていない(あるいは
+%%% すでに落とされた)インデックスに触れることがあるため。
+%%% @end
+%%%-------------------------------------------------------------------
 -module(simple_index).
--compile(export_all).
+
+-export([init/0, create_table/2, drop_table/2, exist_index/2]).
+-export([insert_index/3, delete_index/4, update_index/5, select_index/3]).
+-export([get_tab_column_key/2]).
 
 -include("../include/simple_db_server.hrl").
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Public APIs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%===================================================================
+%%% Public API
+%%%===================================================================
+
+%%----------------------------------------------------------------------
+%% @doc 起動時の初期化。カラムごとのETSを都度作るので、
+%% ここで用意しておくものはない(index.erlと同じ形にするために存在する)。
+%%----------------------------------------------------------------------
+init() ->
+    ok.
+
+%%----------------------------------------------------------------------
+%% @doc テーブルの全カラムにインデックスを作る。
+%%----------------------------------------------------------------------
 create_table(TableName, ColNameList) ->
-    lists:map(fun(ColName) ->
-        ColIndexName = get_tab_column_key(TableName, ColName),
-        create_column_index(ColIndexName) end, ColNameList),
+    lists:foreach(fun(ColName) ->
+                          create_column_index(get_tab_column_key(TableName, ColName))
+                  end, ColNameList),
     ok.
 
-drop_table(TableName) ->
-    {ok, ColNameList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-    lists:map(fun(ColName) ->
-        ColIndexName = get_tab_column_key(TableName, ColName),
-        drop_column_index(ColIndexName) end, ColNameList),
+%%----------------------------------------------------------------------
+%% @doc テーブルの全カラムのインデックスを破棄する。
+%% カラム一覧は呼び出し側から渡す。システムカタログから引くと
+%% drop_tableの処理順に依存してしまうため。
+%%----------------------------------------------------------------------
+drop_table(TableName, ColNameList) ->
+    lists:foreach(fun(ColName) ->
+                          drop_column_index(get_tab_column_key(TableName, ColName))
+                  end, ColNameList),
     ok.
 
-%% ColNameVal : [{ColumnName, Val},,,]
+exist_index(TableName, ColName) ->
+    ets:info(get_tab_column_key(TableName, ColName)) =/= undefined.
+
+%%----------------------------------------------------------------------
+%% @doc 1行分のインデックスを追加する。
+%% ColNameVal : [{ColumnName, Val}, ...]
+%%----------------------------------------------------------------------
 insert_index(TableName, ColNameVal, Oid) ->
-    %% 各カラムごとにインデックスを追加する
-    lists:map(fun({ColName, Val}) ->
-        ColIndexName = get_tab_column_key(TableName, ColName),
-        insert_column_index(ColIndexName, Val, Oid)
-    end, ColNameVal),
+    lists:foreach(fun({ColName, Val}) ->
+                          insert_column_index(get_tab_column_key(TableName, ColName), Val, Oid)
+                  end, ColNameVal),
     ok.
 
 delete_index(TableName, ColName, Val, Oid) ->
-    ColIndexName = get_tab_column_key(TableName, ColName),
-    delete_column_index(ColIndexName, Val, Oid).
-
-%% TODO: update_index実装
-update_index(_TableName, _ColName, OldVal, NewVal, _Oid) when OldVal =:= NewVal->
-    nop;
-update_index(TableName, ColName, OldVal, NewVal, Oid) ->
-    ColIndexName = get_tab_column_key(TableName, ColName),
-    update_column_index(ColIndexName, OldVal, NewVal, Oid).
-
-select_index(TableName, ColName, Val) ->
-    ColIndexName = get_tab_column_key(TableName, ColName),
-    case ets:lookup(ColIndexName, Val) of
-        [] -> [];
-        [{_Val, OidList}] -> OidList
-    end.
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% ColumnIndex mng functions.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% カラムインデックスを挿入する
-insert_column_index(ColIndexName, Val, Oid) ->
-    case ets:lookup(ColIndexName, Val) of
-        %% カラムの値が新規登録されるパターン
-        [] -> ets:insert(ColIndexName, {Val, [Oid]});
-        %% すでにカラムの値が登録されているパターン
-        %% 既存のオブジェクトIDのリストに新しいオブジェクトIDを追加する
-        [{_Val, OidList}] ->
-            case lists:member(Oid, OidList) of
-                false ->
-                    ets:insert(ColIndexName, {Val, [Oid | OidList]});
-                %% ただし、すでに同じオブジェクトIDが登録されている場合は追加しない
-                true -> nop
-            end
-    end.
-
-%% カラムインデックスからオブジェクトIDを削除する
-delete_column_index(ColIndexName, Val, Oid) ->
-    case ets:lookup(ColIndexName, Val) of
-        [] -> nop;
-        [{_Val, OidList}] ->
-            NewOidList = lists:filter(fun(X) -> X =/= Oid end, OidList),
-            case NewOidList of
-                [] -> ets:delete(ColIndexName, Val);
-                _ -> ets:insert(ColIndexName, {Val, NewOidList})
-            end
-    end,
+    delete_column_index(get_tab_column_key(TableName, ColName), Val, Oid),
     ok.
 
-%% カラムインデックスを更新する
-update_column_index(ColIndexName, OldVal, NewVal, Oid) ->
-    %% 更新前の値に紐づくオブジェクトIDを削除する
-    delete_column_index(ColIndexName, OldVal, Oid),
-    insert_column_index(ColIndexName, NewVal, Oid).
+update_index(_TableName, _ColName, OldVal, NewVal, _Oid) when OldVal =:= NewVal ->
+    ok;
+update_index(TableName, ColName, OldVal, NewVal, Oid) ->
+    IndexName = get_tab_column_key(TableName, ColName),
+    delete_column_index(IndexName, OldVal, Oid),
+    insert_column_index(IndexName, NewVal, Oid),
+    ok.
 
-%% カラムインデックスを作成する
-create_column_index(ColumnIndexName) ->
-    ets:new(ColumnIndexName, [set, named_table, public]).
+%%----------------------------------------------------------------------
+%% @doc 条件に一致する行のオブジェクトIDのリストを返す。
+%%----------------------------------------------------------------------
+select_index(TableName, ColName, Val) ->
+    IndexName = get_tab_column_key(TableName, ColName),
+    case ets:info(IndexName) of
+        undefined ->
+            [];
+        _ ->
+            case ets:lookup(IndexName, Val) of
+                [] -> [];
+                [{_Val, OidList}] -> OidList
+            end
+    end.
 
-%% カラムインデックスを削除する
-drop_column_index(ColIndexName) ->
-    ets:delete(ColIndexName).
+%%%===================================================================
+%%% ColumnIndex mng functions
+%%%===================================================================
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% util functions.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% tab_column_keyを取得する
+insert_column_index(IndexName, Val, Oid) ->
+    case ets:info(IndexName) of
+        undefined ->
+            ok;
+        _ ->
+            case ets:lookup(IndexName, Val) of
+                [] ->
+                    ets:insert(IndexName, {Val, [Oid]});
+                [{_Val, OidList}] ->
+                    %% 同じOidが二重に載らないようにする
+                    case lists:member(Oid, OidList) of
+                        false -> ets:insert(IndexName, {Val, [Oid | OidList]});
+                        true -> true
+                    end
+            end,
+            ok
+    end.
+
+delete_column_index(IndexName, Val, Oid) ->
+    case ets:info(IndexName) of
+        undefined ->
+            ok;
+        _ ->
+            case ets:lookup(IndexName, Val) of
+                [] ->
+                    ok;
+                [{_Val, OidList}] ->
+                    case lists:filter(fun(X) -> X =/= Oid end, OidList) of
+                        [] -> ets:delete(IndexName, Val);
+                        NewOidList -> ets:insert(IndexName, {Val, NewOidList})
+                    end,
+                    ok
+            end
+    end.
+
+%% 作成済みの場合は作り直す。テーブルを作り直した際に
+%% 前のインデックスの中身が残らないようにするため。
+create_column_index(IndexName) ->
+    _ = drop_column_index(IndexName),
+    ets:new(IndexName, [set, named_table, public]).
+
+drop_column_index(IndexName) ->
+    case ets:info(IndexName) of
+        undefined -> ok;
+        _ -> ets:delete(IndexName), ok
+    end.
+
+%%%===================================================================
+%%% util functions
+%%%===================================================================
+
+%% テーブル名とカラム名からインデックスのETS名を作る。
 get_tab_column_key(TableName, ColumnNameList) when is_list(ColumnNameList) ->
-    lists:map(fun(ColumnName) ->
-        get_tab_column_key(TableName, ColumnName) end,
-        ColumnNameList);
+    [get_tab_column_key(TableName, ColumnName) || ColumnName <- ColumnNameList];
 get_tab_column_key(TableName, ColumnName) ->
-    TableNameStr = atom_to_list(TableName),
-    ColumnNameStr = atom_to_list(ColumnName),
-    list_to_atom(TableNameStr ++ "_" ++ ColumnNameStr).
+    list_to_atom(atom_to_list(TableName) ++ "_" ++ atom_to_list(ColumnName)).

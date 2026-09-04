@@ -1,21 +1,15 @@
+%%%-------------------------------------------------------------------
+%%% @doc transaction_dbアプリケーションのエントリポイント。
+%%%-------------------------------------------------------------------
 -module(app).
-
 -behaviour(application).
 
 -export([start/2, stop/1]).
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% application callback functions
-
 start(normal, _Args) ->
-    case sup:start_link() of
-	{ok, Pid} ->
-	    {ok, Pid, {normal, _Args}};
-	Error ->
-	    Error
-    end;
-start(_, _) ->
+    sup:start_link();
+start(_Type, _Args) ->
     {error, badarg}.
 
-stop(_StartArgs) ->
+stop(_State) ->
     ok.

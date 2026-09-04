@@ -1,171 +1,237 @@
+%%%-------------------------------------------------------------------
+%%% @doc
+%%% ロック管理(2相ロック)。オブジェクトID単位に共有(read)・
+%%% 排他(write)ロックを管理する。
+%%%
+%%% ロックはトランザクションID(LockId)に紐づけて記録し、
+%%% コミット・ロールバック時にまとめて解放する(strict 2PL)。
+%%%
+%%% 管理しているデータ
+%%%   ms_locked_oid       : {Oid, Timestamp, LockId, RW} 誰がロック中か
+%%%   ms_locking_oid      : {LockId, Oid, Timestamp} 自分が持つロック
+%%%   ms_lock_waiting_proc: {Oid, LockId, RestOidList, Timestamp, From, RW}
+%%%                         ロック待ち。RestOidListはこのOidが取れた後に
+%%%                         続けて取るべきOidの残り。
+%%% @end
+%%%-------------------------------------------------------------------
 -module(lock_mng).
--compile(export_all).
 -behaviour(gen_server).
-% -include_lib("kernel/include/logger.hrl").
+
+%% Public API
+-export([start_link/0, stop/1]).
+-export([acquire_lock/4, release_lock/2, locks_held_by/2, is_locked/2]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3]).
+
+%%%===================================================================
+%%% Public API
+%%%===================================================================
+
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 stop(Pid) ->
     gen_server:call(Pid, terminate).
 
-get_lock_id() ->
-    erlang:system_time(nanosecond).
+%%----------------------------------------------------------------------
+%% @doc OidListの全てにロックをかける。取れるまでブロックする。
+%% ex) acquire_lock(P1, Txid, [Oid1, Oid2], read)
+%% Returns: ok
+%%----------------------------------------------------------------------
+acquire_lock(Pid, LockId, OidList, RW) when is_list(OidList) ->
+    gen_server:call(Pid, {acquire_lock, LockId, OidList, RW}, infinity);
+acquire_lock(Pid, LockId, Oid, RW) ->
+    acquire_lock(Pid, LockId, [Oid], RW).
 
-%% ex) acquire_lock(P1, [0001, 0002], read)
-%% ex) acquire_lock(P1, [0001, 0002], write)
-acquire_lock(Pid, LockId, OidList, RW) ->
-    gen_server:call(Pid, {acquire_lock, LockId, OidList, RW}, infinity).
-
+%%----------------------------------------------------------------------
+%% @doc LockIdが持つ全てのロックを解放する。
+%%----------------------------------------------------------------------
 release_lock(Pid, LockId) ->
-    gen_server:call(Pid, {release_lock, LockId}).
+    gen_server:call(Pid, {release_lock, LockId}, infinity).
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Callback functions of gen_server.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%----------------------------------------------------------------------
+%% @doc LockIdが現在ロックしているOidの一覧(テスト・デバッグ用)。
+%%----------------------------------------------------------------------
+locks_held_by(Pid, LockId) ->
+    gen_server:call(Pid, {locks_held_by, LockId}).
+
+%%----------------------------------------------------------------------
+%% @doc Oidが誰かにロックされているか(テスト・デバッグ用)。
+%%----------------------------------------------------------------------
+is_locked(Pid, Oid) ->
+    gen_server:call(Pid, {is_locked, Oid}).
+
+%%%===================================================================
+%%% Callback functions of gen_server
+%%%===================================================================
+
 init([]) ->
-    %% システムテーブル作成
-    %% ロックされているオブジェクトIDを管理
-    ets:new(ms_locked_oid, [bag, named_table, public]),
-    %% 自分ががロックしているオブジェクトIDを管理
-    ets:new(ms_locking_oid, [bag, named_table, public]),
-    %% ロックが取れず待っているオブジェクトIDとプロセスIDを管理
-    %% ロックが取れたとき、次にロックを獲得しなければならないオブジェクトIDのリストも保持
-    ets:new(ms_lock_waiting_proc, [bag, named_table, public]),
+    ets:new(ms_locked_oid, [bag, named_table, protected]),
+    ets:new(ms_locking_oid, [bag, named_table, protected]),
+    ets:new(ms_lock_waiting_proc, [bag, named_table, protected]),
     {ok, []}.
 
-handle_call(terminate, _From, _State) ->
-    {stop, normal, ok, []};
-handle_call({acquire_lock, LockId, OidList, RW}, From, _State) ->
-    Timestamp = get_timestamp(),
-    io:format("[acquire]From:~p~n", [From]),
-    case acquire(LockId, OidList, Timestamp, From, RW, ok) of
-        ok -> {reply, ok, []};
-        %% ロックが獲得できなかった場合は、replyせずにロック待ち状態にする
-        queued -> {noreply, [], infinity}
+handle_call({acquire_lock, LockId, OidList, RW}, From, State) ->
+    case acquire(LockId, OidList, get_timestamp(), From, RW) of
+        ok ->
+            {reply, ok, State};
+        %% 1つでも取れなければ待ち行列に入る。取れた時点でreplyする。
+        queued ->
+            {noreply, State}
     end;
-handle_call({release_lock, LockId}, _From, _State) ->
+
+handle_call({release_lock, LockId}, _From, State) ->
     release_locking_oid(LockId),
-    {reply, ok, []}.
-                        
-handle_cast({get_config}, []) ->
-    {noreply, []}.
+    {reply, ok, State};
 
-handle_info(Msg, _State) ->
-    io:format("Unexpected message: ~p~n", [Msg]),
-    {noreply, _State}.
+handle_call({locks_held_by, LockId}, _From, State) ->
+    {reply, lists:usort([Oid || {_L, Oid, _Ts} <- ets:lookup(ms_locking_oid, LockId)]), State};
 
-terminate(normal, _State) ->
-    io:format("Server teminated.~n"),
+handle_call({is_locked, Oid}, _From, State) ->
+    {reply, ets:lookup(ms_locked_oid, Oid) =/= [], State};
+
+handle_call(terminate, _From, State) ->
+    {stop, normal, ok, State};
+
+handle_call(Request, _From, State) ->
+    {reply, {error, {unknown_request, Request}}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
     ok.
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Transaction mng functions.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% オブジェクトをロックする
-%% すべてのオブジェクトに対して即時ロックが取れればokを返す
-%% 一つでもロックが取れずキューに入ることがあればqueuedを返す
-acquire(LockId, [Oid | OidList], Timestamp, From, RW, Rep) ->
-    %% TODO: lockをリリースした後、それを待っていたロックを取るときの不具合
-    %% ms_locking_procにレコードが追加されていない
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%%===================================================================
+%%% Lock mng functions
+%%%===================================================================
+
+%% OidListの先頭から順にロックを取る。
+%% 全て取れたら ok、途中で取れなければ残りごと待ち行列に入れて queued。
+acquire(_LockId, [], _Timestamp, _From, _RW) ->
+    ok;
+acquire(LockId, [Oid | Rest], Timestamp, From, RW) ->
     case can_lock(LockId, Oid, RW) of
-        already -> ok;
-        change_write -> 
-            %% readロックをwriteロックに書き換える
-            [{Oid, OldestTimestamp, LockId, _RW}=Object] = ets:match_object(ms_locked_oid, {Oid, '$1', LockId, '$3'}),
-            ets:delete_object(ms_locked_oid, Object),
-            ets:insert(ms_locked_oid, {Oid, OldestTimestamp, LockId, write}),
-            ok;
+        already ->
+            %% すでに十分なロックを持っている。残りのOidの処理は続ける。
+            acquire(LockId, Rest, Timestamp, From, RW);
+        upgrade ->
+            %% 自分だけがreadロックを持っている場合に限りwriteへ格上げする
+            upgrade_to_write(LockId, Oid),
+            acquire(LockId, Rest, Timestamp, From, RW);
         true ->
             ets:insert(ms_locked_oid, {Oid, Timestamp, LockId, RW}),
             ets:insert(ms_locking_oid, {LockId, Oid, Timestamp}),
-            acquire(LockId, OidList, Timestamp, From, RW, Rep);
+            acquire(LockId, Rest, Timestamp, From, RW);
         false ->
-            % lockが取れなかった場合、そのOidのロックが解放されるまで待つ
-            % ロックが解放されたら、残されたOidについてロックを獲得する
-            ets:insert(ms_lock_waiting_proc, {Oid, LockId, OidList, Timestamp, From, RW}),
+            %% このOidが解放されるまで待つ。解放時に残りのOidも続けて取る。
+            ets:insert(ms_lock_waiting_proc, {Oid, LockId, Rest, Timestamp, From, RW}),
             queued
-    end;
-acquire(_LockId, [], _Timestamp, _From, _RW, Rep) ->
-    Rep.
+    end.
 
-%% true: Read-Read ロック可
-%% false: Read-Write ロック不可
-%% false: Write-Write ロック不可
-%% already: 自分がすでにロックを取っているケース
-%% change_write: 自分がreadロックを取っており、writeロックを取るケース
+%% 自分が持つreadロックをwriteロックへ書き換える。
+upgrade_to_write(LockId, Oid) ->
+    lists:foreach(fun({_Oid, Ts, _L, _RW} = Object) ->
+                          ets:delete_object(ms_locked_oid, Object),
+                          ets:insert(ms_locked_oid, {Oid, Ts, LockId, write})
+                  end, own_locks(LockId, Oid)).
+
+%% true    : ロック可
+%% false   : ロック不可(他のトランザクションと競合)
+%% already : すでに十分なロックを持っている
+%% upgrade : 自分のreadロックをwriteロックに格上げすればよい
 can_lock(LockId, Oid, Mode) ->
-    is_only_read_lock(LockId, Mode, ets:lookup(ms_locked_oid, Oid)).
+    Holders = ets:lookup(ms_locked_oid, Oid),
+    Own = [RW || {_O, _Ts, L, RW} <- Holders, L =:= LockId],
+    Others = [RW || {_O, _Ts, L, RW} <- Holders, L =/= LockId],
+    case {Mode, Own, Others} of
+        %% 誰も持っていない
+        {_, [], []} ->
+            true;
+        %% 自分がwriteロックを持っていれば読み書きとも足りている
+        _ when Own =/= [] ->
+            case lists:member(write, Own) of
+                true ->
+                    already;
+                false when Mode =:= read ->
+                    already;
+                false ->
+                    %% 自分はreadのみ。他に誰も持っていなければ格上げできる。
+                    %% 他にreadを持つトランザクションがいる状態で格上げすると
+                    %% その相手の読んだ値を壊すため、待たせる。
+                    case Others of
+                        [] -> upgrade;
+                        _ -> false
+                    end
+            end;
+        %% 他がreadのみ持っていて、自分もreadを取りたい
+        {read, [], _} ->
+            case lists:member(write, Others) of
+                true -> false;
+                false -> true
+            end;
+        %% write要求は他に誰かいる時点で待つ
+        {write, [], _} ->
+            false
+    end.
 
-%% 基本的にはそのオブジェクトに対して、Writeロックがとられていたら自分は取れないという戦略
-%% しかし、自分がすでにそのオブジェクトのロックを取っている場合はロックが取れる
-is_only_read_lock(_LockId, _Mode, [])->
-    true;
-%% 自分がreadロックを取っており、readロックを取りたいケース
-%% ロック処理はスキップで良い
-is_only_read_lock(LockId, read, [{_Oid, _Timestamp, LockId, read} | _LockList]) ->
-    already;
-%% 自分がreadロックを取っており、writeロックを取りたいケース
-%% readロックをwriteロックに書き換える
-is_only_read_lock(LockId, write, [{_Oid, _Timestamp, LockId, read} | _LockList]) ->
-    change_write;
-%% 自分がwriteロックを取っているケース
-%% ロック処理はスキップで良い
-is_only_read_lock(LockId, _Mode, [{_Oid, _Timestamp, LockId, write} | _LockList]) ->
-    already;
-%% 他人がreadロックを取っており、自分もreadロックを取りたいケース
-is_only_read_lock(LockId, read, [{_Oid, _Timestamp, _LockId, read} | LockList]) ->
-    is_only_read_lock(LockId, read, LockList);
-%% ロック競合のケース
-is_only_read_lock(_LockId, _Mode, _) ->
-    false.
+own_locks(LockId, Oid) ->
+    [Obj || {_O, _Ts, L, _RW} = Obj <- ets:lookup(ms_locked_oid, Oid), L =:= LockId].
 
-%% あるオブジェクトのロックが解放されたとき、次にロックをかけたいプロセスが存在すれば
-%% そのプロセスがロックを獲得する
+%% Oidのロックが解放されたとき、待っているトランザクションに順番を渡す。
+%% 待っていたトランザクションは残りのOidも続けて取ってから応答を受け取る。
 dequeue_lock(Oid) ->
     case ets:lookup(ms_lock_waiting_proc, Oid) of
-        [] -> no;
-        OidList -> 
-            {Oid, LockId, OidL, Timestamp, From, RW}=Lock = get_oldest_lock(OidList),
-            %% ロック待ちのキューから一番古いロックを削除
+        [] ->
+            no_waiting_process;
+        Waiting ->
+            {Oid, LockId, Rest, Timestamp, From, RW} = Lock = get_oldest_lock(Waiting),
             true = ets:delete_object(ms_lock_waiting_proc, Lock),
-            case acquire(LockId, [Oid | OidL], Timestamp, From, RW, ok) of
-                %% ロック待ちが解消されればokを返す
-                ok -> 
-                io:format("[dequeue_lock]reply ok to ~p~n", [From]),    
-                gen_server:reply(From, ok);
+            case acquire(LockId, [Oid | Rest], Timestamp, From, RW) of
+                ok -> gen_server:reply(From, ok);
+                %% さらに別のOidで待つことになった
                 queued -> queued
             end
     end.
 
-%% 次にロックを取るプロセスをキューから選択する
-get_oldest_lock([H | _T]) ->
-    %% TODO:戦略改善
-    H.
+%% 次にロックを取るのは一番古くから待っているトランザクション。
+%% 到着順で選ぶことで、待ち続けるトランザクションが出ないようにする。
+get_oldest_lock([H | T]) ->
+    lists:foldl(fun({_O, _L, _R, Ts, _F, _RW} = W, {_O2, _L2, _R2, OTs, _F2, _RW2} = Oldest) ->
+                        case Ts < OTs of
+                            true -> W;
+                            false -> Oldest
+                        end
+                end, H, T).
 
-%% 自分が獲得したロックを解放する
+%% LockIdが獲得した全てのロックを解放する。
 release_locking_oid(LockId) ->
-    io:format("[release_locking_oid]LockId:~p~n", [LockId]),
-    case ets:lookup(ms_locking_oid, LockId) of
-        LockList ->
-            [release_locked_oid(Oid, LockId) || {_,Oid,_} <- LockList];
-        [] -> ok
-    end,
-    ets:delete(ms_locking_oid, LockId).
+    Oids = lists:usort([Oid || {_L, Oid, _Ts} <- ets:lookup(ms_locking_oid, LockId)]),
+    ets:delete(ms_locking_oid, LockId),
+    %% 待ち行列に残ったままの自分のエントリも消す(待っている最中の中断)
+    lists:foreach(fun({_Oid, L, _R, _Ts, _F, _RW} = W) when L =:= LockId ->
+                          ets:delete_object(ms_lock_waiting_proc, W);
+                     (_) ->
+                          ok
+                  end, ets:tab2list(ms_lock_waiting_proc)),
+    lists:foreach(fun(Oid) -> release_locked_oid(Oid, LockId) end, Oids),
+    ok.
 
-%% 指定されたオブジェクトのロックを解放する
-release_locked_oid(OidList, LockId) when is_list(OidList)->
-    [release_locked_oid(Oid, LockId) || Oid <- OidList];
+%% 指定のOidについて、指定のトランザクションのロックだけを解放する。
 release_locked_oid(Oid, LockId) ->
-    %% 指定のオブジェクトの指定のプロセスのロックのみ解放する
-    [Object] = ets:match_object(ms_locked_oid, {Oid, '$1', LockId, '$3'}),
-    % [Object] = ets:match_object(ms_locked_oid, {Oid, '$1', From, '$2'}),
-    io:format("release_locked_oid:~p~n", [Object]),
-    ets:delete_object(ms_locked_oid, Object),
-    %% ロック待ちになっていればロックを獲得する
+    lists:foreach(fun(Object) -> ets:delete_object(ms_locked_oid, Object) end,
+                  own_locks(LockId, Oid)),
     dequeue_lock(Oid).
 
-%% タイムスタンプを取得する
+%% 待ち行列の順序づけに使うので、同じ値が二度出ないことが要る。
+%% 実時刻は同じナノ秒を返しうるため、単調増加の整数を使う。
 get_timestamp() ->
-    erlang:system_time(nanosecond).
+    erlang:unique_integer([monotonic, positive]).

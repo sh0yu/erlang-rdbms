@@ -1,368 +1,440 @@
+%%%-------------------------------------------------------------------
+%%% @doc
+%%% クエリ実行プロセス。クライアント1接続につき1プロセスが起動し、
+%%% そのコネクションのトランザクションを実行する。
+%%%
+%%% トランザクション中の更新は共有データには書かず、このプロセスが
+%%% 持つローカル領域(lKvstore / lColumnIndex)にクエリID単位で溜める。
+%%% SELECTは共有データを読んだ上に、自分のローカル領域の変更を
+%%% 重ねて返す。これにより、コミット前の自分の変更は自分からは見え、
+%%% 他のトランザクションからは見えない。
+%%%
+%%%   lKvstore     : {QueryId, ins|del, TableName, Oid, Val}
+%%%   lColumnIndex : {QueryId, ins|del, TableName, ColName, Val, Oid}
+%%%
+%%% コミット時はまずREDOログを書いて同期し、その後で共有データへ
+%%% 反映してcheckpointを書く。ロールバック時はローカル領域を捨てるだけ。
+%%% @end
+%%%-------------------------------------------------------------------
 -module(query_exec).
--compile(export_all).
 -behaviour(gen_server).
--record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex, queryId}).
+
+%% Public API
+-export([start_link/0, stop/1, exec_query/2]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3]).
+
+-record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex, queryId = []}).
+
 -include("../include/simple_db_server.hrl").
-% -include_lib("kernel/include/logger.hrl").
+
+%%%===================================================================
+%%% Public APIs. Client program call these APIs.
+%%%===================================================================
 
 start_link() ->
-    gen_server:start_link(?MODULE, [], [{debug, [log]}]).
+    gen_server:start_link(?MODULE, [], []).
 
 stop(Pid) ->
     gen_server:call(Pid, terminate).
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Public APIs.
-% Client program call these APIs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% Pid: query_execサーバのPID
-%% CPid: クライアントのPID
-%% Query: SQLクエリ
+%%----------------------------------------------------------------------
+%% @doc クエリを実行する。
+%%
+%% サポートするクエリ:
+%%   {begin_tx}                                 -> Txid
+%%   {commit_tx}                                -> ok | transaction_not_found
+%%   {rollback_tx}                              -> ok | transaction_not_found
+%%   {create_table, TableName, ColumnList}      -> ok | {error, Reason}
+%%   {drop_table, TableName}                    -> ok | {error, Reason}
+%%   {insert, TableName, Val}                   -> {ok, Oid} | {error, Reason}
+%%   {select, TableName, ColName, Val}          -> [Val] | {error, Reason}
+%%   {update, TableName, SetQuery, ColName, Val}-> {ok, Count} | {error, Reason}
+%%   {delete, TableName, ColName, Val}          -> {ok, Count} | {error, Reason}
+%%----------------------------------------------------------------------
 exec_query(Pid, Query) ->
     gen_server:call(Pid, {exec_query, Query}, infinity).
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Callback functions of gen_server.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%===================================================================
+%%% Callback functions of gen_server
+%%%===================================================================
+
 init([]) ->
-    SdsPid = whereis(simple_db_server),
-    TxMngPid = whereis(tx_mng),
-    LockMngPid = whereis(lock_mng),
     {LKvstore, LColumnIndex} = create_local_tables(),
-    {ok, #state{sdsPid = SdsPid, txMngPid = TxMngPid, lockMngPid = LockMngPid, lKvstore = LKvstore,
-    lColumnIndex = LColumnIndex, queryId = []}}.
+    {ok, #state{sdsPid = whereis(simple_db_server),
+                txMngPid = whereis(tx_mng),
+                lockMngPid = whereis(lock_mng),
+                lKvstore = LKvstore,
+                lColumnIndex = LColumnIndex,
+                queryId = []}}.
 
-handle_call({exec_query, {begin_tx}}, _From, State)->
-    TPid = get_tx_mng_pid(State),
-    %% トランザクションを開始する
-    Txid = tx_mng:begin_tx(TPid),
-    {reply, Txid, State#state{txid = Txid}};
-handle_call({exec_query, {commit_tx}}, _From, State)->
-    %% トランザクションが許可されている場合のみ次に進める
-    case ask_transaction(State) of
-        transaction_not_found ->
-            {reply, transaction_not_found, State};
-        ok -> 
-            TPid = get_tx_mng_pid(State),
-            Txid = get_txid(State),
-            QueryIdList = get_query_id_list(State),
-            lists:map(fun(QueryId) -> commit_local_index(State, QueryId) end, QueryIdList),
-            lists:map(fun(QueryId) -> commit_kvstore(State, QueryId) end, QueryIdList),
-            release_lock(State),
-            log_util:redo_log_put_checkpoint(),
-            Rep = tx_mng:commit_tx(TPid, Txid),
-            {reply, Rep, State#state{txid=undefined, queryId = []}}
-    end;
-handle_call({exec_query, {rollback_tx}}, _From, State)->
-    %% トランザクションが許可されている場合のみ次に進める
-    case ask_transaction(State) of
-        transaction_not_found ->
-            {reply, transaction_not_found, State};
-        ok -> 
-            TPid = get_tx_mng_pid(State),
-            Txid = get_txid(State),
-            QueryIdList = get_query_id_list(State),
-            lists:map(fun(QueryId) -> rollback_local_index(State, QueryId) end, QueryIdList),
-            lists:map(fun(QueryId) -> rollback_kvstore(State, QueryId) end, QueryIdList),
-            release_lock(State),
-            Rep = tx_mng:rollback_tx(TPid, Txid),
-            {reply, Rep, State#state{txid=undefined, queryId = []}}
-    end;
-handle_call({exec_query, {create_table, TableName, ColumnList}}, _From, State)->
-    SPid = get_db_pid(State),
-    Rep = simple_db_server:create_table(SPid, TableName, ColumnList),
-    {reply, Rep, State};
-handle_call({exec_query, {drop_table, TableName}}, _From, State)->
-    SPid = get_db_pid(State),
-    Rep = simple_db_server:drop_table(SPid, TableName),
-    {reply, Rep, State};
-handle_call({exec_query, {insert, TableName, Val}}, _From, State)->
-    %% トランザクションが許可されている場合のみ次に進める
-    case ask_transaction(State) of
-        transaction_not_found ->
-            {reply, transaction_not_found, State};
-        ok -> 
-            QueryId = generate_query_id(),
-            ObjectId = generate_object_id(),
-            case check_table_exists(TableName, Val) of
-                true ->
-                    local_insert_data(State, QueryId, TableName, ObjectId, Val),
-                    {reply, QueryId, State#state{queryId = get_query_id_list(State) ++ [QueryId]}};
-                _ -> {reply, table_not_found, State}
-            end
-    end;
-handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State)->
-    %% トランザクションが許可されている場合のみ次に進める
-    case ask_transaction(State) of
-        transaction_not_found ->
-            {reply, transaction_not_found, State};
-        ok -> 
-            QueryIdList = get_query_id_list(State),
-            %% オブジェクトIDを取得する
-            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-            ok = acquire_lock(State, OidList, read),
-            %% オブジェクトIDから値を取得する
-            {reply, select_data(State, TableName, OidList, QueryIdList), State}
-    end;
-handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State)->
-    %% トランザクションが許可されている場合のみ次に進める
-    case ask_transaction(State) of
-        transaction_not_found ->
-            {reply, transaction_not_found, State};
-        ok -> 
-            QueryId = generate_query_id(),
-            LKvstore = get_local_kvstore(State),
-            LColumnIndex = get_local_column_index(State),
-            QueryIdList = get_query_id_list(State),
-            {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-            SetQueryConverted = simple_db_server:convert_set_query(SetQuery, ColumnList),
-            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-            ok = acquire_lock(State, OidList, write),
-            F = fun(Oid) ->
-                %% OldVal -> [banana, 100]
-                %% NewVal -> [apple, 100]
-                OldVal = select_data(State, TableName, Oid, QueryIdList),
-                {ok, OldColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-                OldValWithCol = lists:zip(OldColumnList ,OldVal),
-                NewVal = simple_db_server:build_new_val(OldVal, SetQueryConverted),
-                %% 更新前値をローカルデータから削除
-                ets:insert(LKvstore, {QueryId, del, TableName, Oid, OldVal}),
-                %% 更新後値をローカルデータに挿入
-                ets:insert(LKvstore, {QueryId, ins, TableName, Oid, NewVal}),
-                %% 更新対象のカラムごとにカラムインデックスを更新する
-                %% ex. {name, apple}
-                FF = fun({ColumnN, NewColVal}) ->
-                    {_Key, OldColVal} = lists:keyfind(ColumnN, 1, OldValWithCol),
-                    ets:insert(LColumnIndex, {QueryId, del, TableName, ColumnN, OldColVal, Oid}),
-                    ets:insert(LColumnIndex, {QueryId, ins, TableName, ColumnN, NewColVal, Oid})
-                end,
-                lists:map(FF, SetQuery)
-            end,
-            lists:map(F, OidList),
-            {reply, ok, State#state{queryId = QueryIdList ++ [QueryId]}}
-    end;
-handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State)->
-    %% トランザクションが許可されている場合のみ次に進める
-    case ask_transaction(State) of
-        transaction_not_found ->
-            {reply, transaction_not_found, State};
-        ok -> 
-            QueryId = generate_query_id(),
-            QueryIdList = get_query_id_list(State),
-            %% オブジェクトIDを取得する
-            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-            ok = acquire_lock(State, OidList, write),
-            lists:map(fun(Oid) -> local_delete_data(State, QueryId, TableName, Oid, select_data(State, TableName, Oid, QueryIdList)) end,
-            OidList),
-            {reply, ok, State#state{queryId = QueryIdList ++ [QueryId]}}
-    end;
-handle_call(terminate, _From, _State) ->
-    {stop, normal, ok, []}.
+handle_call({exec_query, {begin_tx}}, _From, #state{txid = undefined} = State) ->
+    Txid = tx_mng:begin_tx(get_tx_mng_pid(State)),
+    {reply, Txid, State#state{txid = Txid, queryId = []}};
+handle_call({exec_query, {begin_tx}}, _From, State) ->
+    %% ネストしたトランザクションは扱わない
+    {reply, {error, transaction_already_started}, State};
 
-handle_cast({get_config}, []) ->
-    {noreply, []}.
+handle_call({exec_query, {commit_tx}}, _From, State) ->
+    with_transaction(State, fun() -> do_commit(State) end);
 
-handle_info(Msg, _State) ->
-    io:format("Unexpected message: ~p~n", [Msg]),
-    {noreply, _State}.
+handle_call({exec_query, {rollback_tx}}, _From, State) ->
+    with_transaction(State, fun() -> do_rollback(State) end);
 
-terminate(normal, _State) ->
-    io:format("Server teminated.~n"),
+%% DDLはトランザクションの対象外。即座に共有データへ反映する。
+handle_call({exec_query, {create_table, TableName, ColumnList}}, _From, State) ->
+    {reply, simple_db_server:create_table(get_db_pid(State), TableName, ColumnList), State};
+
+handle_call({exec_query, {drop_table, TableName}}, _From, State) ->
+    {reply, simple_db_server:drop_table(get_db_pid(State), TableName), State};
+
+handle_call({exec_query, {insert, TableName, Val}}, _From, State) ->
+    with_transaction(State, fun() -> do_insert(State, TableName, Val) end);
+
+handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State) ->
+    with_transaction(State, fun() -> do_select(State, TableName, ColName, Val) end);
+
+handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State) ->
+    with_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
+
+handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State) ->
+    with_transaction(State, fun() -> do_delete(State, TableName, ColName, Val) end);
+
+handle_call({exec_query, Query}, _From, State) ->
+    {reply, {error, {unsupported_query, Query}}, State};
+
+handle_call(terminate, _From, State) ->
+    {stop, normal, ok, State};
+
+handle_call(Request, _From, State) ->
+    {reply, {error, {unknown_request, Request}}, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+%% 未コミットのまま接続が切れた場合はロールバックしてロックを解放する。
+%% これを怠るとトランザクションの順番を握ったままDBが止まる。
+terminate(_Reason, #state{txid = undefined}) ->
+    ok;
+terminate(_Reason, State) ->
+    _ = do_rollback(State),
     ok.
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% State Mng funcs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-get_db_pid(State) ->
-    State#state.sdsPid.
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
-get_tx_mng_pid(State) ->
-    State#state.txMngPid.
+%%%===================================================================
+%%% クエリ本体
+%%%===================================================================
 
-get_lock_mng_pid(State) ->
-    State#state.lockMngPid.
+%% トランザクションが開始済みで、かつ自分の順番が来ていることを確かめてから
+%% Funを実行する。順番待ちの間はここでブロックする。
+with_transaction(State, Fun) ->
+    case ask_transaction(State) of
+        transaction_not_found ->
+            {reply, transaction_not_found, State};
+        ok ->
+            Fun()
+    end.
 
-get_txid(State) ->
-    State#state.txid.
+do_insert(State, TableName, Val) ->
+    case check_table(State, TableName, Val) of
+        ok ->
+            QueryId = db_id:new(),
+            Oid = db_id:new(),
+            ok = local_insert_data(State, QueryId, TableName, Oid, Val),
+            {reply, {ok, Oid}, add_query_id(State, QueryId)};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end.
 
-get_local_kvstore(State) ->
-    State#state.lKvstore.
+do_select(State, TableName, ColName, Val) ->
+    case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
+        false ->
+            {reply, {error, table_not_found}, State};
+        true ->
+            QueryIdList = get_query_id_list(State),
+            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+            ok = acquire_lock(State, OidList, read),
+            Rows = [R || R <- select_data(State, TableName, OidList, QueryIdList),
+                         R =/= not_found],
+            {reply, Rows, State}
+    end.
 
-get_local_column_index(State) ->
-    State#state.lColumnIndex.
+do_update(State, TableName, SetQuery, ColName, Val) ->
+    case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+        {error, table_not_found} ->
+            {reply, {error, table_not_found}, State};
+        {ok, ColumnList} ->
+            case [C || {C, _V} <- SetQuery, not lists:member(C, ColumnList)] of
+                [] ->
+                    do_update_1(State, TableName, SetQuery, ColName, Val, ColumnList);
+                Unknown ->
+                    {reply, {error, {unknown_columns, Unknown}}, State}
+            end
+    end.
 
-get_query_id_list(State) ->
-    State#state.queryId.
+do_update_1(State, TableName, SetQuery, ColName, Val, ColumnList) ->
+    QueryId = db_id:new(),
+    LKvstore = get_local_kvstore(State),
+    LColumnIndex = get_local_column_index(State),
+    QueryIdList = get_query_id_list(State),
+    SetQueryConverted = simple_db_server:convert_set_query(SetQuery, ColumnList),
+    OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+    ok = acquire_lock(State, OidList, write),
+    Updated =
+        lists:foldl(
+          fun(Oid, Count) ->
+                  case select_data(State, TableName, Oid, QueryIdList) of
+                      not_found ->
+                          Count;
+                      OldVal ->
+                          NewVal = simple_db_server:build_new_val(OldVal, SetQueryConverted),
+                          %% 更新前値を消して更新後値を入れる、をローカル領域に記録する
+                          ets:insert(LKvstore, {QueryId, del, TableName, Oid, OldVal}),
+                          ets:insert(LKvstore, {QueryId, ins, TableName, Oid, NewVal}),
+                          %% 値が変わったカラムだけインデックスを張り替える
+                          lists:foreach(
+                            fun({_ColumnN, Same, Same}) ->
+                                    ok;
+                               ({ColumnN, OldColVal, NewColVal}) ->
+                                    ets:insert(LColumnIndex,
+                                               {QueryId, del, TableName, ColumnN, OldColVal, Oid}),
+                                    ets:insert(LColumnIndex,
+                                               {QueryId, ins, TableName, ColumnN, NewColVal, Oid})
+                            end, lists:zip3(ColumnList, OldVal, NewVal)),
+                          Count + 1
+                  end
+          end, 0, OidList),
+    {reply, {ok, Updated}, add_query_id(State, QueryId)}.
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Local Table mng funcs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% ローカルデータ領域にinsタグのついたデータを挿入する
+do_delete(State, TableName, ColName, Val) ->
+    QueryId = db_id:new(),
+    QueryIdList = get_query_id_list(State),
+    OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
+    ok = acquire_lock(State, OidList, write),
+    Deleted =
+        lists:foldl(
+          fun(Oid, Count) ->
+                  case select_data(State, TableName, Oid, QueryIdList) of
+                      not_found ->
+                          Count;
+                      RowVal ->
+                          ok = local_delete_data(State, QueryId, TableName, Oid, RowVal),
+                          Count + 1
+                  end
+          end, 0, OidList),
+    {reply, {ok, Deleted}, add_query_id(State, QueryId)}.
+
+%%%===================================================================
+%%% Commit / Rollback
+%%%===================================================================
+
+%% コミットは以下の順に進む。
+%%   1. このトランザクションの全更新をREDOログに書いて同期する
+%%   2. 共有データへ反映する
+%%   3. checkpointを書く(ここまで来ればリカバリ不要)
+%%   4. ロックを解放してトランザクションを終了する
+%% 2の途中で落ちても、1が済んでいるのでリカバリで再実行できる。
+do_commit(State) ->
+    TPid = get_tx_mng_pid(State),
+    Txid = get_txid(State),
+    QueryIdList = get_query_id_list(State),
+    Changes = collect_changes(State, QueryIdList),
+    ok = write_redo_log(Txid, Changes),
+    ok = apply_changes(Changes),
+    ok = log_util:redo_log_put_checkpoint(),
+    clear_local(State, QueryIdList),
+    Rep = tx_mng:commit_tx(TPid, Txid),
+    {reply, Rep, State#state{txid = undefined, queryId = []}}.
+
+%% ロールバックはローカル領域を捨てるだけでよい。
+%% 共有データにはまだ何も書いていない。
+do_rollback(State) ->
+    TPid = get_tx_mng_pid(State),
+    Txid = get_txid(State),
+    clear_local(State, get_query_id_list(State)),
+    Rep = tx_mng:rollback_tx(TPid, Txid),
+    {reply, Rep, State#state{txid = undefined, queryId = []}}.
+
+%% ローカル領域の変更をクエリの実行順に並べる。
+%% 同じOidに対するdel→insの順序が保たれている必要がある。
+collect_changes(State, QueryIdList) ->
+    LKvstore = get_local_kvstore(State),
+    lists:append(
+      [begin
+           Entries = ets:lookup(LKvstore, QueryId),
+           Dels = [E || {_Q, del, _T, _O, _V} = E <- Entries],
+           Ins = [E || {_Q, ins, _T, _O, _V} = E <- Entries],
+           Dels ++ Ins
+       end || QueryId <- QueryIdList]).
+
+write_redo_log(Txid, Changes) ->
+    Now = erlang:system_time(nanosecond),
+    Logs = [#redo_log{timestamp = Now, txid = Txid, query_id = QId, action = Action,
+                      table_name = TableName, oid = Oid, val = Val}
+            || {QId, Action, TableName, Oid, Val} <- Changes],
+    ok = log_util:redo_log_write_many(Logs),
+    %% 共有データへ反映する前に必ず同期する(WAL)
+    ok = log_util:sync(),
+    ok.
+
+apply_changes([]) ->
+    ok;
+apply_changes([{_QId, del, TableName, Oid, _Val} | T]) ->
+    ok = ensure_ok(simple_db_server:delete_data(simple_db_server, TableName, Oid)),
+    apply_changes(T);
+apply_changes([{_QId, ins, TableName, Oid, Val} | T]) ->
+    ok = ensure_ok(simple_db_server:insert_data(simple_db_server, TableName, Oid, Val)),
+    apply_changes(T).
+
+%% コミット中にテーブルが消えているなど、反映できない変更は
+%% 落とさずに読み飛ばす。REDOログにも同じ判断が入る。
+ensure_ok(ok) -> ok;
+ensure_ok({error, table_not_found}) -> ok;
+ensure_ok({error, Reason}) -> error({commit_failed, Reason}).
+
+clear_local(State, QueryIdList) ->
+    LKvstore = get_local_kvstore(State),
+    LColumnIndex = get_local_column_index(State),
+    lists:foreach(fun(QueryId) ->
+                          ets:delete(LKvstore, QueryId),
+                          ets:delete(LColumnIndex, QueryId)
+                  end, QueryIdList),
+    ok.
+
+%%%===================================================================
+%%% State Mng funcs
+%%%===================================================================
+
+get_db_pid(State) -> State#state.sdsPid.
+get_tx_mng_pid(State) -> State#state.txMngPid.
+get_lock_mng_pid(State) -> State#state.lockMngPid.
+get_txid(State) -> State#state.txid.
+get_local_kvstore(State) -> State#state.lKvstore.
+get_local_column_index(State) -> State#state.lColumnIndex.
+get_query_id_list(State) -> State#state.queryId.
+
+%% クエリIDは実行順に並べる必要がある。ローカルデータの重ね方が
+%% この順序に依存しているため。
+add_query_id(State, QueryId) ->
+    State#state{queryId = State#state.queryId ++ [QueryId]}.
+
+%%%===================================================================
+%%% Local Table mng funcs
+%%%===================================================================
+
+%% ローカル領域にinsタグのついたデータを入れる。
 local_insert_data(State, QueryId, TableName, Oid, Val) ->
-    LKvstore = get_local_kvstore(State),
-    LColumnIndex = get_local_column_index(State),
-    {ok, ColList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-    if
-        ColList =:= not_found -> not_found;
-        true ->
-            lists:map(fun({ColName, ColVal}) ->
-                ets:insert(LColumnIndex, {QueryId, ins, TableName, ColName, ColVal, Oid}) end,
-                lists:zip(ColList, Val)),
-            ets:insert(LKvstore, {QueryId, ins, TableName, Oid, Val})
-    end.
-%% ローカルデータ領域にdelタグのついたデータを挿入する
-local_delete_data(State, QueryId, TableName, Oid, Val) ->
-    LKvstore = get_local_kvstore(State),
-    LColumnIndex = get_local_column_index(State),
-    {ok, ColList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-    if
-        ColList =:= not_found -> not_found;
-        true ->
-            lists:map(fun({ColName, ColVal}) ->
-                ets:insert(LColumnIndex, {QueryId, del, TableName, ColName, ColVal, Oid}) end,
-                lists:zip(ColList, Val)),
-            ets:insert(LKvstore, {QueryId, del, TableName, Oid, Val})
-    end.
+    local_data(State, QueryId, ins, TableName, Oid, Val).
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Util funcs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% トランザクションが実行可能かチェックする
-ask_transaction(#state{txid=undefined}) ->
+%% ローカル領域にdelタグのついたデータを入れる。
+local_delete_data(State, QueryId, TableName, Oid, Val) ->
+    local_data(State, QueryId, del, TableName, Oid, Val).
+
+local_data(State, QueryId, Action, TableName, Oid, Val) ->
+    LKvstore = get_local_kvstore(State),
+    LColumnIndex = get_local_column_index(State),
+    {ok, ColList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
+    lists:foreach(fun({ColName, ColVal}) ->
+                          ets:insert(LColumnIndex,
+                                     {QueryId, Action, TableName, ColName, ColVal, Oid})
+                  end, lists:zip(ColList, Val)),
+    ets:insert(LKvstore, {QueryId, Action, TableName, Oid, Val}),
+    ok.
+
+%%%===================================================================
+%%% Util funcs
+%%%===================================================================
+
+%% トランザクションが開始済みか確かめ、自分の順番が来るまで待つ。
+ask_transaction(#state{txid = undefined}) ->
     transaction_not_found;
-ask_transaction(#state{txMngPid=TPid, txid=Txid}) ->
+ask_transaction(#state{txMngPid = TPid, txid = Txid}) ->
     tx_mng:allow_tx(TPid, Txid).
-    
-%% 各トランザクションがローカルで保持するデータを持つためのテーブル作成
+
+%% 各トランザクションがローカルで保持するデータを持つためのテーブル作成。
+%% このプロセスが所有するので、プロセスの終了と同時に消える。
 create_local_tables() ->
     LKvstore = ets:new(local_kvstore, [bag]),
     LColumnIndex = ets:new(local_column_index, [bag]),
     {LKvstore, LColumnIndex}.
 
-%% オブジェクトID生成する
-generate_object_id() ->
-    erlang:system_time(nanosecond).
-
-%% クエリIDを生成する
-generate_query_id() ->
-    erlang:system_time(nanosecond).
-
-%% 共有領域にテーブルとカラムが存在するかチェックする
-check_table_exists(_TableName, _Val) ->
-    %% TODO: 実装
-    true.
-
-%% オブジェクトIDのリストを取得する
-%% 共有データを検索し、さらにローカルデータを検索する
-select_object_id_list(State, TableName, ColName, Val, QueryIdList) ->
-    %% 共有データを検索
-    ShareData = simple_index:select_index(TableName, ColName, Val),
-    %% QueryIdListの順にローカルデータを検索してマージする
-    lists:foldl(fun(QueryId, SData) -> merge_local_index(State, TableName, ColName, Val, SData, QueryId) end,
-    ShareData, QueryIdList).
-
-%% 共有データから取得した値に対して、ローカルデータをマージしていく
-merge_local_index(State, TableName, ColName, Val, ShareData, QueryId) ->
-    LColumnIndex = get_local_column_index(State),
-    case ets:match_object(LColumnIndex, {QueryId, '_', TableName, ColName, Val, '_'}) of 
-        [] -> ShareData;
-        LocalDataList ->
-            lists:foldl(fun(LocalData, SData) -> merge_local_index_local(SData, LocalData) end,
-            ShareData, LocalDataList)
+%% テーブルが存在し、カラム数が合っているかを確かめる。
+check_table(_State, TableName, Val) ->
+    case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+        {error, table_not_found} ->
+            {error, table_not_found};
+        {ok, ColumnList} when length(ColumnList) =/= length(Val) ->
+            {error, column_count_mismatch};
+        {ok, _ColumnList} ->
+            ok
     end.
 
-merge_local_index_local(ShareData, {_QueryId, ins, _TableName, _ColName, _Val, Oid}) ->
-    [Oid | ShareData];
-merge_local_index_local(ShareData, {_QueryId, del, _TableName, _ColName, _Val, Oid}) ->
+%% 条件に一致するオブジェクトIDのリストを返す。
+%% 共有インデックスを引いた結果に、自分のローカルの変更を実行順に重ねる。
+select_object_id_list(State, TableName, ColName, Val, QueryIdList) ->
+    ShareData = (simple_db_server:index_module()):select_index(TableName, ColName, Val),
+    lists:foldl(fun(QueryId, SData) ->
+                        merge_local_index(State, TableName, ColName, Val, SData, QueryId)
+                end, ShareData, QueryIdList).
+
+merge_local_index(State, TableName, ColName, Val, ShareData, QueryId) ->
+    LColumnIndex = get_local_column_index(State),
+    case ets:match_object(LColumnIndex, {QueryId, '_', TableName, ColName, Val, '_'}) of
+        [] ->
+            ShareData;
+        LocalDataList ->
+            %% 同じクエリ内ではdelを先に適用してからinsを適用する。
+            %% bagの取り出し順に依存しないよう明示的に並べ替える。
+            Dels = [E || {_Q, del, _T, _C, _V, _O} = E <- LocalDataList],
+            Ins = [E || {_Q, ins, _T, _C, _V, _O} = E <- LocalDataList],
+            lists:foldl(fun apply_local_index/2, ShareData, Dels ++ Ins)
+    end.
+
+apply_local_index({_QueryId, ins, _TableName, _ColName, _Val, Oid}, ShareData) ->
+    case lists:member(Oid, ShareData) of
+        true -> ShareData;
+        false -> ShareData ++ [Oid]
+    end;
+apply_local_index({_QueryId, del, _TableName, _ColName, _Val, Oid}, ShareData) ->
     lists:filter(fun(X) -> X =/= Oid end, ShareData).
 
-%% オブジェクトIDを使ってデータを取得する
-%% 共有データとローカルデータからデータを取得し、マージして返却する
-select_data(State, TableName, OidList, QueryIdList) when is_list(OidList)->
-    lists:map(fun(Oid) -> select_data(State, TableName, Oid, QueryIdList) end, OidList);
+%% オブジェクトIDから行を読む。
+%% 共有データを読んだ上に、自分のローカルの変更を実行順に重ねる。
+select_data(State, TableName, OidList, QueryIdList) when is_list(OidList) ->
+    [select_data(State, TableName, Oid, QueryIdList) || Oid <- OidList];
 select_data(State, TableName, Oid, QueryIdList) ->
-    ShareData = simple_db_server:read_data_oid(TableName, Oid),
+    ShareData = case simple_db_server:read_data_oid(TableName, Oid) of
+                    {error, _} -> not_found;
+                    Val -> Val
+                end,
     lists:foldl(fun(QueryId, SData) -> merge_local_data(State, SData, Oid, QueryId) end,
-    ShareData, QueryIdList).
+                ShareData, QueryIdList).
 
-%% ローカルデータの値で上書きしていく
 merge_local_data(State, ShareData, Oid, QueryId) ->
     LKvstore = get_local_kvstore(State),
     case ets:match_object(LKvstore, {QueryId, '_', '_', Oid, '_'}) of
-        [] -> ShareData;
-        LocalData -> merge_local_index_local(LocalData)
+        [] ->
+            ShareData;
+        LocalData ->
+            %% insがあればその値、delだけならnot_found
+            case [V || {_Q, ins, _T, _O, V} <- LocalData] of
+                [Val | _] -> Val;
+                [] -> not_found
+            end
     end.
 
-%% insタグのついたローカルデータがある場合は値を上書きする
-%% delタグのついたローカルデータの場合は値は上書きしない
-merge_local_index_local([]) ->
-    [];
-merge_local_index_local([{_QueryId, ins, _TableName, _Oid, Val} | _LocalData])->
-    Val;
-merge_local_index_local([{_QueryId, del, _TableName, _Oid, _Val} | LocalData]) -> 
-    merge_local_index_local(LocalData).
+%%%===================================================================
+%%% Lock funcs
+%%%===================================================================
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Commit funcs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-commit_local_index(#state{lColumnIndex=LColumnIndex}, QueryId) ->
-    ets:delete(LColumnIndex, QueryId).
-
-commit_kvstore(#state{txid=Txid}=State, QueryId) ->
-    LKvstore = get_local_kvstore(State),
-    LocalDataList = ets:lookup(LKvstore, QueryId),
-    DelList = lists:filter(fun({_QueryId, Act, _TableName, _Oid, _Val}) -> Act =:= del end, LocalDataList),
-    InsList = lists:filter(fun({_QueryId, Act, _TableName, _Oid, _Val}) -> Act =:= ins end, LocalDataList),
-    
-    %% コミット前にREDOログに書き込む
-    lists:map(fun({QId, del, TableName, Oid, Val}) ->
-        log_util:redo_log_write(#redo_log{timestamp=erlang:system_time(), txid=Txid, query_id=QId, action=del, table_name=TableName, oid=Oid, val=Val})
-    end, DelList),
-    lists:map(fun({QId, ins, TableName, Oid, Val}) ->
-        log_util:redo_log_write(#redo_log{timestamp=erlang:system_time(), txid=Txid, query_id=QId, action=ins, table_name=TableName, oid=Oid, val=Val})
-    end, InsList),
-
-    %% ディスクに書き込む
-    FDel = fun({_QueryId, del, TableName, Oid, _Val}) ->
-        simple_db_server:delete_data(simple_db_server, TableName, Oid)
-    end,
-    FIns = fun({_QueryId, ins, TableName, Oid, Val}) ->
-        ok = simple_db_server:insert_data(simple_db_server, TableName, Oid, Val)
-    end,
-    lists:map(FDel, DelList),
-    lists:map(FIns, InsList),
-    ets:delete(LKvstore, QueryId).
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Rollback funcs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-rollback_local_index(State, QueryId) ->
-    LColumnIndex = get_local_column_index(State),
-    ets:delete(LColumnIndex, QueryId).
-
-rollback_kvstore(State, QueryId) ->
-    LKvstore = get_local_kvstore(State),
-    ets:delete(LKvstore, QueryId).
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Lock funcs.
-%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-acquire_lock(State, ObjectId, RW) when is_list(ObjectId) ->
-    LockMngPid = get_lock_mng_pid(State),
-    Txid = get_txid(State),
-    lock_mng:acquire_lock(LockMngPid, Txid, ObjectId, RW);
+acquire_lock(_State, [], _RW) ->
+    ok;
 acquire_lock(State, ObjectId, RW) ->
-    acquire_lock(State, [ObjectId], RW).
-
-release_lock(State) ->
-    LockMngPid = get_lock_mng_pid(State),
-    Txid = get_txid(State),
-    lock_mng:release_lock(LockMngPid, Txid).
+    lock_mng:acquire_lock(get_lock_mng_pid(State), get_txid(State), ObjectId, RW).
