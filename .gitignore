@@ -21,3 +21,7 @@ ebin/
 *.siz
 *.idx
 query.log
+
+# leex/yecc が .xrl/.yrl から生成するソース
+src/sql_lexer.erl
+src/sql_parser.erl
