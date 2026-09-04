@@ -28,6 +28,13 @@
 
 -record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex, queryId = []}).
 
+%% トランザクションから見えるテーブル走査の状態。
+%% base   : 共有ページの走査カーソル
+%% delta  : このトランザクションの最終的な差分 #{Oid => deleted | {row, Row}}
+%% pending: 共有側にまだ存在しない、このトランザクションの挿入行
+%% stage  : base を出し切ってから pending を出す
+-record(tx_scan, {base, delta = #{}, pending = [], stage = base}).
+
 -include("../include/simple_db_server.hrl").
 
 %%%===================================================================
@@ -95,6 +102,9 @@ handle_call({exec_query, {insert, TableName, Val}}, _From, State) ->
 
 handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State) ->
     with_transaction(State, fun() -> do_select(State, TableName, ColName, Val) end);
+
+handle_call({exec_query, {scan, TableName}}, _From, State) ->
+    with_transaction(State, fun() -> do_scan(State, TableName) end);
 
 handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State) ->
     with_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
@@ -166,6 +176,18 @@ do_select(State, TableName, ColName, Val) ->
             {reply, Rows, State}
     end.
 
+%% テーブル全体を走査する。索引を使わないので任意のカラムの条件に使える。
+%% 将来の実行器のSeqScan演算子はこの上に載る。
+do_scan(State, TableName) ->
+    case tx_scan_open(State, TableName) of
+        {error, Reason} ->
+            {reply, {error, Reason}, State};
+        {ok, Scan} ->
+            Rows = tx_scan_all(Scan, []),
+            ok = acquire_lock(State, [Oid || {Oid, _} <- Rows], read),
+            {reply, [Row || {_Oid, Row} <- Rows], State}
+    end.
+
 do_update(State, TableName, SetQuery, ColName, Val) ->
     case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
         {error, table_not_found} ->
@@ -230,6 +252,87 @@ do_delete(State, TableName, ColName, Val) ->
                   end
           end, 0, OidList),
     {reply, {ok, Deleted}, add_query_id(State, QueryId)}.
+
+%%%===================================================================
+%%% トランザクションから見える走査
+%%%===================================================================
+
+%% 共有データの走査に、このトランザクションのローカル差分を重ねる。
+%%
+%% 既存の重ね合わせ(merge_local_index/6)は「特定カラムが特定の値」という
+%% 述語を前提にしており、述語の無い走査には使えない。merge_local_data/4 は
+%% Oid単位なので、共有側にOidが存在しないローカル挿入行を取りこぼす。
+%%
+%% そこで走査の開始時に、このトランザクションの最終的な差分を1つのマップに
+%% 畳んでおき、2相で返す。
+tx_scan_open(State, TableName) ->
+    case simple_db_server:scan_open(TableName) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Base} ->
+            Delta = build_delta(State, TableName),
+            {ok, #tx_scan{base = Base, delta = Delta,
+                          pending = local_only_rows(TableName, Delta)}}
+    end.
+
+tx_scan_next(#tx_scan{stage = base, base = Base, delta = Delta} = S) ->
+    case simple_db_server:scan_next(Base) of
+        {rows, Rows, Base2} ->
+            case visible_rows(Rows, Delta) of
+                %% このページの行が全部自分には見えない場合、空のバッチを
+                %% 返さずに次のページへ進む
+                [] -> tx_scan_next(S#tx_scan{base = Base2});
+                Visible -> {rows, Visible, S#tx_scan{base = Base2}}
+            end;
+        eof ->
+            tx_scan_next(S#tx_scan{stage = local})
+    end;
+tx_scan_next(#tx_scan{stage = local, pending = []}) ->
+    eof;
+tx_scan_next(#tx_scan{stage = local, pending = Rows} = S) ->
+    {rows, Rows, S#tx_scan{pending = []}}.
+
+tx_scan_all(Scan, Acc) ->
+    case tx_scan_next(Scan) of
+        eof -> lists:append(lists:reverse(Acc));
+        {rows, Rows, Scan2} -> tx_scan_all(Scan2, [Rows | Acc])
+    end.
+
+%% 共有側から読んだ行に差分を当てる。
+visible_rows(Rows, Delta) ->
+    lists:filtermap(
+      fun({Oid, ShareRow}) ->
+              case maps:get(Oid, Delta, none) of
+                  none -> {true, {Oid, ShareRow}};
+                  deleted -> false;
+                  {row, Row} -> {true, {Oid, Row}}
+              end
+      end, Rows).
+
+%% ローカル領域をクエリの実行順に畳んで、Oidごとの最終状態を求める。
+%% 更新は同一Oidに対する del と ins として入るので、順に畳めば最終状態になる。
+build_delta(State, TableName) ->
+    LKvstore = get_local_kvstore(State),
+    lists:foldl(
+      fun(QueryId, Acc) ->
+              Entries = [E || {_Q, _A, T, _O, _V} = E <- ets:lookup(LKvstore, QueryId),
+                              T =:= TableName],
+              %% 同一クエリ内では del を先に適用してから ins を適用する。
+              %% bagの取り出し順に依存しないよう明示的に並べ替える。
+              Dels = [E || {_Q, del, _T, _O, _V} = E <- Entries],
+              Ins = [E || {_Q, ins, _T, _O, _V} = E <- Entries],
+              lists:foldl(fun({_Q, del, _T, Oid, _V}, A) -> A#{Oid => deleted};
+                             ({_Q, ins, _T, Oid, V}, A) -> A#{Oid => {row, V}}
+                          end, Acc, Dels ++ Ins)
+      end, #{}, get_query_id_list(State)).
+
+%% このトランザクションが挿入し、共有側にまだ存在しない行。
+%% 共有側にあるOidはベースの走査から出るのでここでは除く。
+%% 走査するのは自分の書き込み集合だけなので、テーブルの大きさには依存しない。
+local_only_rows(TableName, Delta) ->
+    [{Oid, Row}
+     || {Oid, {row, Row}} <- maps:to_list(Delta),
+        simple_db_server:read_data_oid(TableName, Oid) =:= not_found].
 
 %%%===================================================================
 %%% Commit / Rollback
