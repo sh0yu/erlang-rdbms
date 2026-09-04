@@ -17,8 +17,9 @@ WS   = [\s\t\r\n]
 
 Rules.
 
-{D}+                : {token, {integer, TokenLine, list_to_integer(TokenChars)}}.
-'([^']|'')*'        : {token, {string, TokenLine, unquote(TokenChars)}}.
+{D}+\.{D}+          : {token, {float_lit, TokenLine, list_to_float(TokenChars)}}.
+{D}+                : {token, {int_lit, TokenLine, list_to_integer(TokenChars)}}.
+'([^']|'')*'        : {token, {string_lit, TokenLine, unquote(TokenChars)}}.
 {L}{A}*             : {token, keyword_or_identifier(TokenChars, TokenLine)}.
 ,                   : {token, {',', TokenLine}}.
 \*                  : {token, {'*', TokenLine}}.
@@ -26,6 +27,7 @@ Rules.
 \(                  : {token, {'(', TokenLine}}.
 \)                  : {token, {')', TokenLine}}.
 \.                  : {token, {'.', TokenLine}}.
+\-                  : {token, {'-', TokenLine}}.
 ;                   : {token, {';', TokenLine}}.
 {WS}+               : skip_token.
 
@@ -38,7 +40,13 @@ Erlang code.
 %% 文字列で持つのが要点。アトムで比較すると、比較のために識別子を
 %% list_to_atom/1することになり、この字句解析器で避けたいことと矛盾する。
 keywords() ->
-    ["select", "from", "where"].
+    ["select", "from", "where",
+     "create", "table", "drop",
+     "insert", "into", "values",
+     "update", "set", "delete",
+     "begin", "commit", "rollback",
+     "integer", "float", "varchar", "boolean",
+     "true", "false", "null"].
 
 keyword_or_identifier(Chars, Line) ->
     Lower = string:lowercase(Chars),

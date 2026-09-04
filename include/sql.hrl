@@ -16,6 +16,37 @@
     where               % 式 | undefined
 }).
 
+-record(create_table_stmt, {
+    table,              % string() -> アナライザ後は atom()
+    columns             % [{string(), sql_type()}]
+}).
+
+-record(drop_table_stmt, {
+    table
+}).
+
+-record(insert_stmt, {
+    table,
+    columns = undefined, % [string()] | undefined(全カラム)
+    values               % [式]
+}).
+
+-record(update_stmt, {
+    table,
+    set,                % [{string(), 式}]
+    where
+}).
+
+-record(delete_stmt, {
+    table,
+    where
+}).
+
+%% BEGIN / COMMIT / ROLLBACK
+-record(tx_stmt, {
+    op                  % 'begin' | commit | rollback
+}).
+
 %%%===================================================================
 %%% FROM句
 %%%===================================================================

@@ -1,13 +1,14 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% 意味解析(binder)。ASTとカタログを突き合わせて実行プランを組み立てる。
+%%% 意味解析(binder)。ASTとカタログを突き合わせて実行可能な形にする。
 %%%
 %%% パーサは構文だけを見るのでカタログを知らない。ここが担うのは:
 %%%   - テーブル名・カラム名の解決(存在チェック)
 %%%   - `*` の展開
 %%%   - **カラム参照を行タプル内の位置に変換する**
+%%%   - 値の型検査
 %%%
-%%% 最後が要点。ここで位置に落としておくと、実行器は行ごとに
+%%% 3番目が要点。ここで位置に落としておくと、実行器は行ごとに
 %%% 名前を引かずに element/2 で済む。実エンジンと同じやり方。
 %%%
 %%% 識別子は字句解析の時点では文字列のままで、ここで初めてアトムになる。
@@ -21,20 +22,49 @@
 
 -include("../include/sql.hrl").
 -include("../include/plan.hrl").
+-include("../include/catalog.hrl").
 
 %%----------------------------------------------------------------------
-%% @doc AST を実行プランに変換する。
-%% Returns: {ok, Plan} | {error, Reason}
+%% @doc AST を実行可能な形に変換する。
+%%
+%% SELECT はプラン木に、それ以外は実行器を経由しない操作記述になる。
+%% Returns: {ok, Op} | {error, Reason}
 %%----------------------------------------------------------------------
-analyze(#select_stmt{from = #table_ref{name = TableName}} = Stmt) ->
-    case resolve_table(TableName) of
-        {error, Reason} ->
-            {error, Reason};
-        {ok, Table, Columns} ->
-            build_select(Stmt, Table, Columns)
-    end.
+analyze(#tx_stmt{op = Op}) ->
+    {ok, {tx, Op}};
 
-build_select(#select_stmt{columns = Cols, where = Where}, Table, Columns) ->
+analyze(#create_table_stmt{table = TableStr, columns = Defs}) ->
+    case duplicate_names([N || {N, _T} <- Defs]) of
+        [] -> {ok, {create_table, to_atom(TableStr), [{to_atom(N), T} || {N, T} <- Defs]}};
+        Dups -> {error, {duplicate_columns, Dups}}
+    end;
+
+analyze(#drop_table_stmt{table = TableStr}) ->
+    with_table(TableStr, fun(Table, _Columns) -> {ok, {drop_table, Table}} end);
+
+analyze(#insert_stmt{table = TableStr, columns = ColStrs, values = Values}) ->
+    with_table(TableStr, fun(Table, Columns) -> bind_insert(Table, Columns, ColStrs, Values) end);
+
+analyze(#update_stmt{table = TableStr, set = Set, where = Where}) ->
+    with_table(TableStr, fun(Table, Columns) -> bind_update(Table, Columns, Set, Where) end);
+
+analyze(#delete_stmt{table = TableStr, where = Where}) ->
+    with_table(TableStr,
+               fun(Table, Columns) ->
+                       case bind_where(Where, Columns) of
+                           {error, Reason} -> {error, Reason};
+                           {ok, Pred} -> {ok, {delete, Table, Pred}}
+                       end
+               end);
+
+analyze(#select_stmt{from = #table_ref{name = TableStr}} = Stmt) ->
+    with_table(TableStr, fun(Table, Columns) -> bind_select(Stmt, Table, Columns) end).
+
+%%%===================================================================
+%%% SELECT
+%%%===================================================================
+
+bind_select(#select_stmt{columns = Cols, where = Where}, Table, Columns) ->
     case bind_where(Where, Columns) of
         {error, Reason} ->
             {error, Reason};
@@ -43,61 +73,17 @@ build_select(#select_stmt{columns = Cols, where = Where}, Table, Columns) ->
                 {error, Reason} ->
                     {error, Reason};
                 {ok, Exprs, Names} ->
-                    Scan = #p_seq_scan{table = Table, schema = Columns},
+                    Scan = #p_seq_scan{table = Table, schema = names(Columns)},
                     Filtered = case Pred of
                                    undefined -> Scan;
                                    _ -> #p_filter{pred = Pred, input = Scan}
                                end,
-                    {ok, #p_project{exprs = Exprs, names = Names, input = Filtered}}
+                    {ok, {select, #p_project{exprs = Exprs, names = Names, input = Filtered}}}
             end
     end.
-
-%%%===================================================================
-%%% 名前の解決
-%%%===================================================================
-
-%% テーブル名(文字列)をカタログと突き合わせてアトムにする。
-resolve_table(NameStr) ->
-    case to_existing_atom(NameStr) of
-        error ->
-            {error, {table_not_found, NameStr}};
-        {ok, Table} ->
-            case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), Table) of
-                {error, table_not_found} -> {error, {table_not_found, NameStr}};
-                {ok, Columns} -> {ok, Table, Columns}
-            end
-    end.
-
-%% カラム名(文字列)を、行タプル内の位置に解決する。
-resolve_column(NameStr, Columns) ->
-    case to_existing_atom(NameStr) of
-        error ->
-            {error, {column_not_found, NameStr}};
-        {ok, Col} ->
-            case index_of(Col, Columns, 1) of
-                not_found -> {error, {column_not_found, NameStr}};
-                Pos -> {ok, Col, Pos}
-            end
-    end.
-
-index_of(_Col, [], _N) -> not_found;
-index_of(Col, [Col | _], N) -> N;
-index_of(Col, [_ | T], N) -> index_of(Col, T, N + 1).
-
-%% カタログに存在する名前だけをアトムにする。
-%% 任意の入力を list_to_atom/1 に通すとアトム表を際限なく増やせてしまう。
-to_existing_atom(Str) ->
-    try {ok, list_to_existing_atom(Str)}
-    catch error:badarg -> error
-    end.
-
-%%%===================================================================
-%%% 射影
-%%%===================================================================
 
 bind_projection([#star{}], Columns) ->
-    Exprs = [{ref, N} || N <- lists:seq(1, length(Columns))],
-    {ok, Exprs, Columns};
+    {ok, [{ref, N} || N <- lists:seq(1, length(Columns))], names(Columns)};
 bind_projection(Items, Columns) ->
     bind_projection_1(Items, Columns, [], []).
 
@@ -106,11 +92,93 @@ bind_projection_1([], _Columns, Exprs, Names) ->
 bind_projection_1([#col_ref{name = NameStr} | T], Columns, Exprs, Names) ->
     case resolve_column(NameStr, Columns) of
         {error, Reason} -> {error, Reason};
-        {ok, Col, Pos} -> bind_projection_1(T, Columns, [{ref, Pos} | Exprs], [Col | Names])
+        {ok, Col} -> bind_projection_1(T, Columns, [{ref, Col#column.position} | Exprs],
+                                       [Col#column.name | Names])
     end;
 bind_projection_1([#star{} | _T], _Columns, _Exprs, _Names) ->
     %% SELECT a, * のような形は今は扱わない
     {error, star_must_be_alone}.
+
+%%%===================================================================
+%%% INSERT
+%%%===================================================================
+
+%% VALUES をテーブルのカラム順に並べ替え、型を検査する。
+%% カラム名を省略した場合は宣言順とみなす。
+bind_insert(Table, Columns, undefined, Values) ->
+    case length(Values) =:= length(Columns) of
+        false -> {error, column_count_mismatch};
+        true -> typed_row(Table, Columns, lists:zip(names(Columns), Values))
+    end;
+bind_insert(Table, Columns, ColStrs, Values) ->
+    case length(ColStrs) =:= length(Values) of
+        false ->
+            {error, column_count_mismatch};
+        true ->
+            case resolve_columns(ColStrs, Columns) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Named} ->
+                    case duplicate_names([C#column.name || C <- Named]) of
+                        [] ->
+                            Pairs = lists:zip([C#column.name || C <- Named], Values),
+                            typed_row(Table, Columns, Pairs);
+                        Dups ->
+                            {error, {duplicate_columns, Dups}}
+                    end
+            end
+    end.
+
+%% 指定のなかったカラムは NULL で埋める。
+typed_row(Table, Columns, Pairs) ->
+    Row = [value_for(C, Pairs) || C <- Columns],
+    case check_types(Columns, Row) of
+        ok -> {ok, {insert, Table, Row}};
+        {error, Reason} -> {error, Reason}
+    end.
+
+value_for(#column{name = Name}, Pairs) ->
+    case lists:keyfind(Name, 1, Pairs) of
+        {Name, #const{value = V}} -> V;
+        false -> null
+    end.
+
+check_types([], []) ->
+    ok;
+check_types([#column{name = Name, type = Type} | CT], [V | VT]) ->
+    case sql_type:check(Type, V) of
+        ok -> check_types(CT, VT);
+        {error, Reason} -> {error, {Reason, Name, Type, V}}
+    end.
+
+%%%===================================================================
+%%% UPDATE
+%%%===================================================================
+
+bind_update(Table, Columns, Set, Where) ->
+    case bind_where(Where, Columns) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Pred} ->
+            case bind_assignments(Set, Columns, []) of
+                {error, Reason} -> {error, Reason};
+                {ok, Assigns} -> {ok, {update, Table, Assigns, Pred}}
+            end
+    end.
+
+%% 代入は {カラム位置, 新しい値} に落とす。
+bind_assignments([], _Columns, Acc) ->
+    {ok, lists:reverse(Acc)};
+bind_assignments([{NameStr, #const{value = V}} | T], Columns, Acc) ->
+    case resolve_column(NameStr, Columns) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, #column{name = Name, type = Type, position = Pos}} ->
+            case sql_type:check(Type, V) of
+                ok -> bind_assignments(T, Columns, [{Pos, V} | Acc]);
+                {error, Reason} -> {error, {Reason, Name, Type, V}}
+            end
+    end.
 
 %%%===================================================================
 %%% WHERE
@@ -126,7 +194,7 @@ bind_expr(#const{value = Value}, _Columns) ->
 bind_expr(#col_ref{name = NameStr}, Columns) ->
     case resolve_column(NameStr, Columns) of
         {error, Reason} -> {error, Reason};
-        {ok, _Col, Pos} -> {ok, {ref, Pos}}
+        {ok, #column{position = Pos}} -> {ok, {ref, Pos}}
     end;
 bind_expr(#binop{op = Op, left = L, right = R}, Columns) ->
     case bind_expr(L, Columns) of
@@ -138,3 +206,63 @@ bind_expr(#binop{op = Op, left = L, right = R}, Columns) ->
                 {ok, BR} -> {ok, {comp, Op, BL, BR}}
             end
     end.
+
+%%%===================================================================
+%%% 名前の解決
+%%%===================================================================
+
+with_table(TableStr, Fun) ->
+    case resolve_table(TableStr) of
+        {error, Reason} -> {error, Reason};
+        {ok, Table, Columns} -> Fun(Table, Columns)
+    end.
+
+resolve_table(NameStr) ->
+    case to_existing_atom(NameStr) of
+        error ->
+            {error, {table_not_found, NameStr}};
+        {ok, Table} ->
+            case sys_tbl_mng:get_columns(whereis(sys_tbl_mng), Table) of
+                {error, table_not_found} -> {error, {table_not_found, NameStr}};
+                {ok, Columns} -> {ok, Table, Columns}
+            end
+    end.
+
+resolve_column(NameStr, Columns) ->
+    case to_existing_atom(NameStr) of
+        error ->
+            {error, {column_not_found, NameStr}};
+        {ok, Name} ->
+            case lists:keyfind(Name, #column.name, Columns) of
+                false -> {error, {column_not_found, NameStr}};
+                #column{} = C -> {ok, C}
+            end
+    end.
+
+resolve_columns(NameStrs, Columns) ->
+    resolve_columns(NameStrs, Columns, []).
+
+resolve_columns([], _Columns, Acc) ->
+    {ok, lists:reverse(Acc)};
+resolve_columns([NameStr | T], Columns, Acc) ->
+    case resolve_column(NameStr, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, C} -> resolve_columns(T, Columns, [C | Acc])
+    end.
+
+names(Columns) ->
+    [C#column.name || C <- Columns].
+
+duplicate_names(Names) ->
+    lists:usort(Names -- lists:usort(Names)).
+
+%% カタログに存在する名前だけをアトムにする。
+%% 任意の入力を list_to_atom/1 に通すとアトム表を際限なく増やせてしまう。
+to_existing_atom(Str) ->
+    try {ok, list_to_existing_atom(Str)}
+    catch error:badarg -> error
+    end.
+
+%% CREATE TABLE だけは、まだ存在しない名前をアトムにする必要がある。
+to_atom(Str) ->
+    list_to_atom(Str).

@@ -107,8 +107,11 @@ handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State) ->
 handle_call({exec_query, {scan, TableName}}, _From, State) ->
     with_transaction(State, fun() -> do_scan(State, TableName) end);
 
+%% SQL文はここでトランザクションを要求しない。
+%% do_sql/2 が文の種類ごとに、DDLなら with_ddl、DMLなら with_transaction、
+%% BEGIN/COMMIT/ROLLBACK ならそのまま、と振り分ける。
 handle_call({exec_query, {sql, Sql}}, _From, State) ->
-    with_transaction(State, fun() -> do_sql(State, Sql) end);
+    do_sql(State, Sql);
 
 handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State) ->
     with_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
@@ -217,17 +220,107 @@ do_sql(State, Sql) ->
             {reply, {error, Reason}, State};
         {ok, Ast} ->
             case sql_analyzer:analyze(Ast) of
-                {error, Reason} ->
-                    {reply, {error, Reason}, State};
-                {ok, Plan} ->
-                    %% 実行器にはストレージへの入口を関数で渡す。
-                    %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
-                    %% かつ走査がこのトランザクションの未コミット変更を見られる。
-                    Ctx = {fun(T) -> tx_scan_open(State, T) end,
-                           fun(C) -> tx_scan_next(C) end},
-                    {reply, sql_exec:run(Plan, Ctx), State}
+                {error, Reason} -> {reply, {error, Reason}, State};
+                {ok, Op} -> run_sql(State, Op)
             end
     end.
+
+%% トランザクション制御。
+%% SQLの BEGIN は ok を返す。内部のトランザクションIDを外に出さない
+%% (タプルAPIの {begin_tx} はIDを返すが、それは内部向けの口)。
+run_sql(State, {tx, 'begin'}) ->
+    case handle_call({exec_query, {begin_tx}}, undefined, State) of
+        {reply, {error, Reason}, S} -> {reply, {error, Reason}, S};
+        {reply, _Txid, S} -> {reply, ok, S}
+    end;
+run_sql(State, {tx, commit}) ->
+    handle_call({exec_query, {commit_tx}}, undefined, State);
+run_sql(State, {tx, rollback}) ->
+    handle_call({exec_query, {rollback_tx}}, undefined, State);
+
+%% DDL。既存のDDL経路(暗黙のトランザクション)に載せる
+run_sql(State, {create_table, Table, Columns}) ->
+    with_ddl(State, fun() -> simple_db_server:create_table(get_db_pid(State), Table, Columns) end);
+run_sql(State, {drop_table, Table}) ->
+    with_ddl(State, fun() -> simple_db_server:drop_table(get_db_pid(State), Table) end);
+
+%% DML。トランザクションが要る
+run_sql(State, {select, Plan}) ->
+    with_transaction(State, fun() -> do_sql_select(State, Plan) end);
+run_sql(State, {insert, Table, Row}) ->
+    with_transaction(State, fun() -> do_insert(State, Table, Row) end);
+run_sql(State, {update, Table, Assigns, Pred}) ->
+    with_transaction(State, fun() -> do_sql_update(State, Table, Assigns, Pred) end);
+run_sql(State, {delete, Table, Pred}) ->
+    with_transaction(State, fun() -> do_sql_delete(State, Table, Pred) end).
+
+do_sql_select(State, Plan) ->
+    %% 実行器にはストレージへの入口を関数で渡す。
+    %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
+    %% かつ走査がこのトランザクションの未コミット変更を見られる。
+    Ctx = {fun(T) -> tx_scan_open(State, T) end, fun(C) -> tx_scan_next(C) end},
+    {reply, sql_exec:run(Plan, Ctx), State}.
+
+%% SQLのUPDATE / DELETE は、対象のOidを**先に確定させてから**適用する。
+%%
+%% これがHalloween problemへの対処になっている。走査と更新をパイプラインで
+%% つなぐと、更新した行を走査が拾い直し、条件を外れるまで同じ行を何度も
+%% 更新してしまう。対象を先に materialize すればその輪が切れる。
+%% 実行器に更新演算子を載せるときは、文レベルスナップショットが要る。
+do_sql_update(State, Table, Assigns, Pred) ->
+    case matching_rows(State, Table, Pred) of
+        {error, Reason} ->
+            {reply, {error, Reason}, State};
+        {ok, Rows} ->
+            QueryId = db_id:new(),
+            LKvstore = get_local_kvstore(State),
+            {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), Table),
+            ok = acquire_lock(State, [Oid || {Oid, _} <- Rows], write),
+            LColumnIndex = get_local_column_index(State),
+            lists:foreach(
+              fun({Oid, OldVal}) ->
+                      NewVal = apply_assigns(OldVal, Assigns),
+                      ets:insert(LKvstore, {QueryId, del, Table, Oid, OldVal}),
+                      ets:insert(LKvstore, {QueryId, ins, Table, Oid, NewVal}),
+                      lists:foreach(
+                        fun({_Col, Same, Same}) -> ok;
+                           ({Col, Old, New}) ->
+                                ets:insert(LColumnIndex, {QueryId, del, Table, Col, Old, Oid}),
+                                ets:insert(LColumnIndex, {QueryId, ins, Table, Col, New, Oid})
+                        end, lists:zip3(ColumnList, OldVal, NewVal))
+              end, Rows),
+            {reply, {ok, length(Rows)}, add_query_id(State, QueryId)}
+    end.
+
+do_sql_delete(State, Table, Pred) ->
+    case matching_rows(State, Table, Pred) of
+        {error, Reason} ->
+            {reply, {error, Reason}, State};
+        {ok, Rows} ->
+            QueryId = db_id:new(),
+            ok = acquire_lock(State, [Oid || {Oid, _} <- Rows], write),
+            lists:foreach(fun({Oid, Val}) ->
+                                  ok = local_delete_data(State, QueryId, Table, Oid, Val)
+                          end, Rows),
+            {reply, {ok, length(Rows)}, add_query_id(State, QueryId)}
+    end.
+
+%% 述語に一致する行を {Oid, Val} で集める。走査なので任意のカラムを見られる。
+matching_rows(State, Table, Pred) ->
+    case tx_scan_open(State, Table) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Scan} ->
+            All = tx_scan_all(Scan, []),
+            {ok, [{Oid, Val} || {Oid, Val} <- All,
+                                sql_expr:eval_pred(Pred, list_to_tuple(Val))]}
+    end.
+
+apply_assigns(Val, Assigns) ->
+    lists:foldl(fun({Pos, New}, Acc) -> setnth(Pos, Acc, New) end, Val, Assigns).
+
+setnth(1, [_ | T], V) -> [V | T];
+setnth(N, [H | T], V) -> [H | setnth(N - 1, T, V)].
 
 %% テーブル全体を走査する。索引を使わないので任意のカラムの条件に使える。
 %% 将来の実行器のSeqScan演算子はこの上に載る。

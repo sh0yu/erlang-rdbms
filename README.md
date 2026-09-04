@@ -33,13 +33,14 @@ make shell
 %% 接続を作る。1接続が1トランザクションを実行する
 {ok, C} = gen_connection:connect(),
 
-ok = query_exec:exec_query(C, {create_table, fruit, [name, price]}),
+Q = fun(Sql) -> query_exec:exec_query(C, {sql, Sql}) end,
 
-_Txid    = query_exec:exec_query(C, {begin_tx}),
-{ok, Oid} = query_exec:exec_query(C, {insert, fruit, [apple, 100]}),
-[[apple, 100]] = query_exec:exec_query(C, {select, fruit, name, apple}),
-{ok, 1}  = query_exec:exec_query(C, {update, fruit, [{price, 120}], name, apple}),
-ok       = query_exec:exec_query(C, {commit_tx}),
+ok = Q("CREATE TABLE fruit (name VARCHAR, price INTEGER)"),
+ok = Q("BEGIN"),
+{ok, _}  = Q("INSERT INTO fruit VALUES ('apple', 100)"),
+{ok, [[<<"apple">>, 100]]} = Q("SELECT * FROM fruit WHERE name = 'apple'"),
+{ok, 1}  = Q("UPDATE fruit SET price = 120 WHERE name = 'apple'"),
+ok = Q("COMMIT"),
 
 ok = gen_connection:disconnect(C).
 ```
@@ -56,6 +57,23 @@ ok = gen_connection:disconnect(C).
 ## クエリ
 
 `query_exec:exec_query/2` に渡すタプル。
+
+SQL:
+
+```sql
+CREATE TABLE t (a VARCHAR, b INTEGER, c BOOLEAN);
+DROP TABLE t;
+INSERT INTO t [(c, ...)] VALUES (v, ...);
+UPDATE t SET c = v, ... [WHERE c = v];
+DELETE FROM t [WHERE c = v];
+SELECT * | c, ... FROM t [WHERE c = v];
+BEGIN;  COMMIT;  ROLLBACK;
+```
+
+型は `INTEGER` / `FLOAT` / `VARCHAR` / `BOOLEAN`。暗黙変換はしない
+(整数からFLOATへの格上げだけ許す)。指定しなかったカラムはNULLになる。
+
+タプルAPI(内部向け):
 
 | クエリ | 戻り値 |
 | --- | --- |
@@ -292,8 +310,11 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
 - `CREATE TABLE` / `DROP TABLE` は暗黙のトランザクションとして実行される。
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
-- 検索条件は単一カラムの等値比較のみ。JOIN・集約は未実装
-  (SQLは `SELECT ... FROM ... WHERE col = value` まで)
+- 検索条件は単一カラムの等値比較のみ。比較演算子(`<` `>` など)・
+  `AND`/`OR`・JOIN・集約・`ORDER BY`・`LIMIT` は未実装
+- `SELECT` は常に全表走査。索引を使うアクセスパス選択はプランナ未実装のため
+- 型宣言のないテーブル(タプルAPIで作ったもの)は全カラムが `any` 型になり、
+  アトムをそのまま格納する。SQLの文字列リテラル(binary)とは一致しない
 - トランザクションは1つずつ直列に実行されるため、書き込みの並行度は上がらない
 - 分離レベルは直列実行によるもので、MVCCではない
 - REDOログのみでUNDOログはない。ロールバックは共有データに書く前に行われる前提

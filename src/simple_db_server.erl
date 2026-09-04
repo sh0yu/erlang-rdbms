@@ -102,7 +102,11 @@ init([]) ->
 handle_call({create_table, {TableName, ColumnList}}, _From, State) ->
     Reply = case sys_tbl_mng:create_table(whereis(sys_tbl_mng), TableName, ColumnList) of
                 ok ->
-                    ok = (index_module()):create_table(TableName, ColumnList),
+                    %% ColumnList は型つき([{name, varchar}, ...])のこともある。
+                    %% 索引が要るのはカラム名だけなので、カタログが正規化した
+                    %% 名前を引き直して渡す。
+                    {ok, Names} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
+                    ok = (index_module()):create_table(TableName, Names),
                     ok;
                 {error, Reason} ->
                     {error, Reason}
