@@ -20,6 +20,7 @@
 -export([create_table/3, drop_table/2, insert_data/4, delete_data/3,
          select_data/4, update_data/5, vacuum/2, list_tables/1]).
 -export([read_data_oid/2, read_data_oid_with_column/2]).
+-export([scan_open/1, scan_next/1, scan_fold/3]).
 -export([convert_set_query/2, build_new_val/2, get_tab_column_key/2]).
 -export([index_module/0]).
 
@@ -192,6 +193,42 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%%===================================================================
+%%% 順次走査
+%%%===================================================================
+
+%%----------------------------------------------------------------------
+%% @doc テーブルの順次走査。read_data_oid/2と同じく、呼び出し元の
+%% プロセスから直接呼ぶ(simple_db_serverのgen_serverを経由しない)。
+%% 走査の間じゅうエンジンを占有させないため。
+%%----------------------------------------------------------------------
+scan_open(TableName) ->
+    case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
+        false -> {error, table_not_found};
+        true -> data_buffer:scan_open(whereis(data_buffer), TableName)
+    end.
+
+scan_next(Cursor) ->
+    data_buffer:scan_next(whereis(data_buffer), Cursor).
+
+%%----------------------------------------------------------------------
+%% @doc テーブルの全行をページ順に畳み込む。
+%% Fun は {Oid, Val} を受け取る。
+%%----------------------------------------------------------------------
+scan_fold(TableName, Fun, Acc0) ->
+    case scan_open(TableName) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Cursor} ->
+            scan_fold_1(Cursor, Fun, Acc0)
+    end.
+
+scan_fold_1(Cursor, Fun, Acc) ->
+    case scan_next(Cursor) of
+        eof -> Acc;
+        {rows, Rows, Cursor2} -> scan_fold_1(Cursor2, Fun, lists:foldl(Fun, Acc, Rows))
+    end.
+
+%%%===================================================================
 %%% Datastore mng functions
 %%%===================================================================
 
@@ -304,14 +341,17 @@ rebuild_indexes() ->
 rebuild_table_index(TableName) ->
     {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
     ok = (index_module()):create_table(TableName, ColumnList),
-    Rows = data_buffer:all_rows(whereis(data_buffer), TableName),
-    lists:foreach(
-      fun({Oid, Val}) when length(Val) =:= length(ColumnList) ->
-              ok = (index_module()):insert_index(TableName, lists:zip(ColumnList, Val), Oid);
-         ({_Oid, _Val}) ->
-              %% カラム数が合わない行はカタログと整合しないので飛ばす
-              ok
-      end, Rows).
+    %% 新しい順次走査を使う。起動のたびに走るので、これが走査の
+    %% 実利用者となり、既存の再起動テストがそのまま回帰検出器になる。
+    scan_fold(TableName,
+              fun({Oid, Val}, Acc) when length(Val) =:= length(ColumnList) ->
+                      ok = (index_module()):insert_index(
+                             TableName, lists:zip(ColumnList, Val), Oid),
+                      Acc;
+                 ({_Oid, _Val}, Acc) ->
+                      %% カラム数が合わない行はカタログと整合しないので飛ばす
+                      Acc
+              end, ok).
 
 %%%===================================================================
 %%% util functions

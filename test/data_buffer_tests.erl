@@ -19,7 +19,88 @@ data_buffer_test_() ->
       fun oversized_row_is_rejected/1,
       fun update_to_larger_value_relocates/1,
       fun drop_table_discards_data/1,
-      fun vacuum_reclaims_pages/1]}.
+      fun vacuum_reclaims_pages/1,
+      fun scan_empty_table/1,
+      fun scan_returns_every_row/1,
+      fun scan_is_deterministic/1,
+      fun scan_skips_deleted_rows/1,
+      fun scan_spans_many_pages/1,
+      fun scan_yields_page_at_a_time/1,
+      fun scan_isolates_tables/1]}.
+
+%%%===================================================================
+%%% 順次走査
+%%%===================================================================
+
+scan_empty_table(Pid) ->
+    fun() ->
+        %% 一度も書いていないテーブルはページが無いので即eof
+        {ok, C} = data_buffer:scan_open(Pid, fruit),
+        ?assertEqual(eof, data_buffer:scan_next(Pid, C))
+    end.
+
+scan_returns_every_row(Pid) ->
+    fun() ->
+        Rows = [{I, [apple, I]} || I <- lists:seq(1, 20)],
+        [ok = data_buffer:write_data(Pid, fruit, Oid, V) || {Oid, V} <- Rows],
+        ?assertEqual(lists:sort(Rows), lists:sort(scan_all(Pid, fruit)))
+    end.
+
+%% 2回走査して同じ順序で返ること。
+%% ets:tab2list/1 の順に任せると、ここが安定しない。
+scan_is_deterministic(Pid) ->
+    fun() ->
+        [ok = data_buffer:write_data(Pid, fruit, I, [apple, I]) || I <- lists:seq(1, 30)],
+        ?assertEqual(scan_all(Pid, fruit), scan_all(Pid, fruit))
+    end.
+
+scan_skips_deleted_rows(Pid) ->
+    fun() ->
+        [ok = data_buffer:write_data(Pid, fruit, I, [apple, I]) || I <- lists:seq(1, 10)],
+        ok = data_buffer:delete_data(Pid, 3),
+        ok = data_buffer:delete_data(Pid, 7),
+        Oids = [Oid || {Oid, _} <- scan_all(Pid, fruit)],
+        ?assertEqual([1,2,4,5,6,8,9,10], lists:sort(Oids))
+    end.
+
+scan_spans_many_pages(Pid) ->
+    fun() ->
+        N = 500,
+        [ok = data_buffer:write_data(Pid, fruit, I, [apple, I]) || I <- lists:seq(1, N)],
+        Got = scan_all(Pid, fruit),
+        ?assertEqual(N, length(Got)),
+        ?assertEqual(lists:seq(1, N), lists:sort([Oid || {Oid, _} <- Got]))
+    end.
+
+%% 一度に全件ではなく1ページずつ返ること。
+%% 全件をメモリに載せないことと、LIMITの早期終了が効くことの前提。
+scan_yields_page_at_a_time(Pid) ->
+    fun() ->
+        N = 300,
+        [ok = data_buffer:write_data(Pid, fruit, I, [apple, I]) || I <- lists:seq(1, N)],
+        {ok, C0} = data_buffer:scan_open(Pid, fruit),
+        {rows, First, _C1} = data_buffer:scan_next(Pid, C0),
+        ?assert(length(First) > 0),
+        ?assert(length(First) < N)
+    end.
+
+scan_isolates_tables(Pid) ->
+    fun() ->
+        ok = data_buffer:write_data(Pid, fruit, 1, [apple, 100]),
+        ok = data_buffer:write_data(Pid, veggie, 2, [carrot, 80]),
+        ?assertEqual([{1, [apple, 100]}], scan_all(Pid, fruit)),
+        ?assertEqual([{2, [carrot, 80]}], scan_all(Pid, veggie))
+    end.
+
+scan_all(Pid, TableName) ->
+    {ok, C} = data_buffer:scan_open(Pid, TableName),
+    scan_all_1(Pid, C, []).
+
+scan_all_1(Pid, C, Acc) ->
+    case data_buffer:scan_next(Pid, C) of
+        eof -> lists:append(lists:reverse(Acc));
+        {rows, Rows, C2} -> scan_all_1(Pid, C2, [Rows | Acc])
+    end.
 
 %%%===================================================================
 %%% 基本操作

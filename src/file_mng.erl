@@ -41,7 +41,9 @@
 -define(PAGE_SIZE, 4096).
 -define(HEADER_SIZE, 12).       % <<Magic:32, EmptySize:32, SlotCount:32>>
 -define(SLOT_ENTRY_SIZE, 8).    % <<Offset:32, Length:32>>
--define(PAGE_MAGIC, 16#5044424D). % "PDBM"
+%% "PDB2"。スロットのペイロードを {Oid, Val} にした際に上げた。
+%% 旧 "PDBM" (16#5044424D) のファイルは decode_page/1 が明示的に弾く。
+-define(PAGE_MAGIC, 16#50444232).
 
 -record(file, {
     fd,
@@ -282,8 +284,13 @@ decode_page(<<?PAGE_MAGIC:32, EmptySize:32, SlotCount:32, _/binary>> = Page) ->
 decode_page(<<0:32, _/binary>>) ->
     %% 未初期化(ゼロ埋め)のページは空ページとみなす
     empty_disk_data();
-decode_page(_) ->
-    empty_disk_data().
+decode_page(<<Other:32, _/binary>>) ->
+    %% 見覚えのないページを空ページとして返してはいけない。
+    %% 形式を変えたときに、それが「起動しない」ではなく
+    %% 「全件が静かに消える」として現れてしまう。
+    error({unsupported_page_format, Other});
+decode_page(Bin) ->
+    error({truncated_page, byte_size(Bin)}).
 
 read_slots(_Page, N, SlotCount) when N > SlotCount ->
     [];

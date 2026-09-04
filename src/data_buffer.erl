@@ -24,6 +24,8 @@
 -export([start_link/0, stop/1]).
 -export([read_data/2, write_data/4, update_data/4, delete_data/2,
          drop_table/2, vacuum/2, flush/1, all_rows/2]).
+-export([scan_open/2, scan_next/2]).
+-export_type([scan_cursor/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -45,6 +47,17 @@
 -record(st, {
     data_dir
 }).
+
+%% 順次走査のカーソル。data_buffer側では状態を持たず、呼び出し側が持ち回る。
+%% こうしておくと1つのクエリが複数のカーソルを同時に開ける
+%% (nested loop joinで内側を何度も走査する場合に要る)。
+%% クローズ漏れによるリソース漏れも原理的に起きない。
+-record(scan_cursor, {
+    table_name,
+    page_id = 0,
+    page_count
+}).
+-opaque scan_cursor() :: #scan_cursor{}.
 
 %%%===================================================================
 %%% Public API
@@ -112,6 +125,27 @@ flush(Pid) ->
 all_rows(Pid, TableName) ->
     gen_server:call(Pid, {all_rows, TableName}, infinity).
 
+%%----------------------------------------------------------------------
+%% @doc 順次走査を始める。
+%%
+%% all_rows/2 との違い: all_rows/2 はOid順に1行ずつ読むため
+%% ページアクセスがランダムになり、しかも全件をメモリに載せる。
+%% こちらはページを先頭から順に読み、1ページ分ずつ返すので、
+%% メモリは1ページ分で一定に保たれ、LIMITでの早期終了も効く。
+%%----------------------------------------------------------------------
+-spec scan_open(pid(), atom()) -> {ok, scan_cursor()}.
+scan_open(Pid, TableName) ->
+    gen_server:call(Pid, {scan_open, TableName}, infinity).
+
+%%----------------------------------------------------------------------
+%% @doc 次の1ページ分の行を返す。
+%% Returns: {rows, [{Oid, Val}], scan_cursor()} | eof
+%%----------------------------------------------------------------------
+-spec scan_next(pid(), scan_cursor()) ->
+          {rows, [{term(), term()}], scan_cursor()} | eof.
+scan_next(Pid, Cursor) ->
+    gen_server:call(Pid, {scan_next, Cursor}, infinity).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -157,6 +191,17 @@ handle_call({drop_table, TableName}, _From, State) ->
 handle_call({vacuum, TableName}, _From, State) ->
     {reply, do_vacuum(TableName), State};
 
+handle_call({scan_open, TableName}, _From, State) ->
+    %% トランザクションは直列に実行されるので、走査中に他のトランザクションが
+    %% ページを増やすことはない。自分のINSERTはローカル領域に入るため
+    %% ファイルには現れない。よってここでページ数を固定してよい。
+    PageCount = file_mng:page_count(get_fd(TableName)),
+    {reply, {ok, #scan_cursor{table_name = TableName, page_id = 0,
+                              page_count = PageCount}}, State};
+
+handle_call({scan_next, Cursor}, _From, State) ->
+    {reply, do_scan_next(Cursor), State};
+
 handle_call({all_rows, TableName}, _From, State) ->
     Rows = [{Oid, read_row(TableName, Oid)} || Oid <- lists:sort(table_oids(TableName))],
     {reply, [{Oid, V} || {Oid, V} <- Rows, V =/= {error, oid_not_found}], State};
@@ -188,13 +233,37 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%%===================================================================
+%%% 順次走査
+%%%===================================================================
+
+do_scan_next(#scan_cursor{page_id = P, page_count = N}) when P >= N ->
+    eof;
+do_scan_next(#scan_cursor{table_name = T, page_id = P} = C) ->
+    Buf = load_page(T, P),
+    %% スロット番号順に整える。ets:tab2list/1 はsetの内部順で返るので、
+    %% これが無いと同じテーブルを2回走査したときに行順が変わる。
+    Rows = lists:sort([{Slot, Stored}
+                       || {#phys_loc{page_id = PId, slot = Slot}, Stored}
+                              <- ets:tab2list(Buf),
+                          PId =:= P]),
+    case Rows of
+        %% 全スロットが削除済みのページは飛ばす。呼び出し側に空の
+        %% バッチを見せないほうが、上位の演算子の実装が単純になる。
+        [] ->
+            do_scan_next(C#scan_cursor{page_id = P + 1});
+        _ ->
+            {rows, [{Oid, Val} || {_Slot, {Oid, Val}} <- Rows],
+             C#scan_cursor{page_id = P + 1}}
+    end.
+
+%%%===================================================================
 %%% 読み書きの実体
 %%%===================================================================
 
 %% 新規挿入と上書きの両方を扱う。
 %% 既存Oidの場合は同じPhysLocに書き戻し、収まらなければ別ページへ移す。
 do_write(TableName, Oid, Data) ->
-    case file_mng:payload_size(Data) > file_mng:max_payload_size() of
+    case file_mng:payload_size(wrap(Oid, Data)) > file_mng:max_payload_size() of
         true ->
             {error, row_too_large};
         false ->
@@ -210,13 +279,13 @@ do_write(TableName, Oid, Data) ->
 
 %% 空きのあるページを探して新しいスロットに書き込む。
 insert_new(TableName, Oid, Data) ->
-    Need = file_mng:required_size(Data),
+    Need = file_mng:required_size(wrap(Oid, Data)),
     Buf = acquire_page_with_space(TableName, Need),
     [{Buf, #buf_info{page_id = PageId, slot_count = SlotCount}}] =
         ets:lookup(buf_info_list, Buf),
     Slot = next_free_slot(Buf, TableName, PageId, SlotCount),
     PhysLoc = #phys_loc{table_name = TableName, page_id = PageId, slot = Slot},
-    case store(TableName, Buf, PageId, PhysLoc, Data) of
+    case store(TableName, Buf, PageId, PhysLoc, Oid, Data) of
         ok ->
             ok = dets:insert(oid_phys_loc, {Oid, PhysLoc}),
             ok;
@@ -230,14 +299,14 @@ insert_new(TableName, Oid, Data) ->
     end.
 
 insert_new_from(TableName, Oid, Data, FromPageId) ->
-    Need = file_mng:required_size(Data),
+    Need = file_mng:required_size(wrap(Oid, Data)),
     Fd = get_fd(TableName),
     PageId = find_page_with_space(Fd, Need, FromPageId),
     Buf = load_page(TableName, PageId),
     [{Buf, #buf_info{slot_count = SlotCount}}] = ets:lookup(buf_info_list, Buf),
     Slot = next_free_slot(Buf, TableName, PageId, SlotCount),
     PhysLoc = #phys_loc{table_name = TableName, page_id = PageId, slot = Slot},
-    case store(TableName, Buf, PageId, PhysLoc, Data) of
+    case store(TableName, Buf, PageId, PhysLoc, Oid, Data) of
         ok ->
             ok = dets:insert(oid_phys_loc, {Oid, PhysLoc}),
             ok;
@@ -252,7 +321,7 @@ insert_new_from(TableName, Oid, Data, FromPageId) ->
 overwrite(TableName, Oid, #phys_loc{page_id = PageId} = PhysLoc, Data) ->
     Buf = load_page(TableName, PageId),
     Old = ets:lookup(Buf, PhysLoc),
-    case store(TableName, Buf, PageId, PhysLoc, Data) of
+    case store(TableName, Buf, PageId, PhysLoc, Oid, Data) of
         ok ->
             ok;
         {error, page_overflow} ->
@@ -284,9 +353,22 @@ do_delete(Oid) ->
     end.
 
 %% バッファに値を入れてページごとディスクに書き戻す。
-store(TableName, Buf, PageId, PhysLoc, Data) ->
-    ets:insert(Buf, {PhysLoc, Data}),
+store(TableName, Buf, PageId, PhysLoc, Oid, Data) ->
+    ets:insert(Buf, {PhysLoc, wrap(Oid, Data)}),
     flush_page(TableName, Buf, PageId).
+
+%% スロットに書くペイロードは {Oid, Val}。
+%%
+%% Oidを一緒に格納するのが要点。これが無いとページを順に読んでも
+%% その行のOidが分からず、順次走査の結果を上位で使えない
+%% (可視性の重ね合わせ・ロック・UPDATE/DELETEの対象特定はすべてOidが要る)。
+%% oid_phys_loc のDETSは Oid -> PhysLoc の片方向なので逆は引けない。
+%%
+%% file_mngはterm_to_binary/1で任意の項を格納するため、
+%% ページ形式の定義自体は変わらない。
+wrap(Oid, Val) -> {Oid, Val}.
+
+unwrap({_Oid, Val}) -> Val.
 
 restore(Buf, PhysLoc, []) ->
     ets:delete(Buf, PhysLoc);
@@ -295,8 +377,9 @@ restore(Buf, _PhysLoc, [Entry]) ->
 
 %% バッファの内容をページとしてディスクに書き出し、buf_infoを更新する。
 flush_page(TableName, Buf, PageId) ->
-    SlotDataList = [#slot{slot_n = SlotN, data = Data}
-                    || {#phys_loc{slot = SlotN}, Data} <- ets:tab2list(Buf)],
+    %% バッファ上の値はすでに {Oid, Val} なのでそのまま書く
+    SlotDataList = [#slot{slot_n = SlotN, data = Stored}
+                    || {#phys_loc{slot = SlotN}, Stored} <- ets:tab2list(Buf)],
     Fd = get_fd(TableName),
     case file_mng:write_page(Fd, PageId, #disk_data{data_list = SlotDataList}) of
         {ok, #disk_data{empty_size = EmptySize, slot_count = SlotCount}} ->
@@ -412,7 +495,7 @@ touch_buf(BufName) ->
 get_data_buf(BufName, PhysLoc) ->
     case ets:lookup(BufName, PhysLoc) of
         [] -> {error, oid_not_found};
-        [{_PhysLoc, Val}] -> Val
+        [{_PhysLoc, Stored}] -> unwrap(Stored)
     end.
 
 %% ディスクのページをフレームに読み込む。
