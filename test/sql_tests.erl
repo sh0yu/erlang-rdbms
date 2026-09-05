@@ -64,7 +64,7 @@ sql_test_() ->
       fun error_cases/1,
       fun sees_uncommitted_changes/1,
       fun string_literal_does_not_match_atom/1,
-      fun limit_is_not_supported_yet/1]}.
+      fun unsupported_syntax_is_reported/1]}.
 
 %% 表駆動。{SQL, 期待する行(順不同)}
 select_cases(_) ->
@@ -123,14 +123,19 @@ string_literal_does_not_match_atom(_) ->
     end.
 
 %% まだ受理しない構文が、黙って無視されるのではなく構文エラーになること
-limit_is_not_supported_yet(_) ->
+unsupported_syntax_is_reported(_) ->
     fun() ->
         C = fixture(),
-        ?assertMatch({error, {syntax_error, _, _}}, q(C, "SELECT * FROM fruit LIMIT 1")),
+        %% 集約
+        ?assertMatch({error, {syntax_error, _, _}}, q(C, "SELECT count(*) FROM fruit")),
         ?assertMatch({error, {syntax_error, _, _}},
-                     q(C, "SELECT * FROM fruit ORDER BY price")),
+                     q(C, "SELECT name FROM fruit GROUP BY name")),
+        %% JOIN と修飾カラム名
+        ?assertMatch({error, _},
+                     q(C, "SELECT a.name FROM fruit a JOIN fruit b ON a.name = b.name")),
+        %% 副問い合わせ
         ?assertMatch({error, {syntax_error, _, _}},
-                     q(C, "SELECT count(*) FROM fruit"))
+                     q(C, "SELECT * FROM fruit WHERE price = (SELECT price FROM fruit)"))
     end.
 
 %%%===================================================================

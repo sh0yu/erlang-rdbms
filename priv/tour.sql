@@ -94,11 +94,27 @@ UPDATE fruit SET price = price + 10;
 SELECT * FROM fruit;
 COMMIT;
 
--- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
+-- ============ 並べ替えと件数制限 ============
 BEGIN;
 SELECT * FROM fruit ORDER BY price;
-SELECT * FROM fruit LIMIT 1;
+SELECT * FROM fruit ORDER BY price DESC;
+
+-- NULLの位置は既定でASCならlast、DESCならfirst。明示もできる
+SELECT * FROM fruit ORDER BY ripe ASC NULLS FIRST;
+
+SELECT * FROM fruit ORDER BY price LIMIT 2;
+SELECT * FROM fruit ORDER BY price LIMIT 2 OFFSET 1;
+
+-- 並べ替えは射影の前なので、出力に無い列でも並べ替えられる
+SELECT name FROM fruit ORDER BY price DESC;
+
+SELECT DISTINCT price FROM fruit ORDER BY price;
+COMMIT;
+
+-- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
+BEGIN;
 SELECT count(*) FROM fruit;
+SELECT * FROM fruit a JOIN fruit b ON a.name = b.name;
 COMMIT;
 
 -- ============ DDLはトランザクションの中では実行できない ============

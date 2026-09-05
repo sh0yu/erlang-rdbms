@@ -27,7 +27,7 @@ Nonterminals
     stmt
     select_stmt create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
     select_list select_item table_ref opt_where expr literal
-    neg
+    neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
     column_defs column_def type_name
     opt_column_names column_names
     value_list
@@ -43,6 +43,8 @@ Terminals
     'integer' 'float' 'varchar' 'boolean'
     true false null
     'and' 'or' 'not' 'is'
+    'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
+    'nulls' 'first' 'last'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
 
@@ -153,8 +155,35 @@ delete_stmt -> delete from identifier opt_where :
 %%% SELECT
 %%%===================================================================
 
-select_stmt -> select select_list from table_ref opt_where :
-    #select_stmt{columns = '$2', from = '$4', where = '$5'}.
+select_stmt -> select opt_distinct select_list from table_ref opt_where opt_order opt_limit :
+    {Limit, Offset} = '$8',
+    #select_stmt{distinct = '$2', columns = '$3', from = '$5', where = '$6',
+                 order_by = '$7', limit = Limit, offset = Offset}.
+
+opt_distinct -> '$empty'   : false.
+opt_distinct -> 'distinct' : true.
+
+opt_order -> '$empty'            : [].
+opt_order -> 'order' 'by' sort_list : '$3'.
+
+sort_list -> sort_item                : ['$1'].
+sort_list -> sort_item ',' sort_list  : ['$1' | '$3'].
+
+sort_item -> expr opt_dir opt_nulls :
+    #sort_item{expr = '$1', dir = '$2', nulls = '$3'}.
+
+opt_dir -> '$empty' : asc.
+opt_dir -> 'asc'    : asc.
+opt_dir -> 'desc'   : desc.
+
+opt_nulls -> '$empty'          : default.
+opt_nulls -> 'nulls' 'first'   : nulls_first.
+opt_nulls -> 'nulls' 'last'    : nulls_last.
+
+opt_limit -> '$empty'                            : {undefined, undefined}.
+opt_limit -> 'limit' int_lit                     : {value_of('$2'), undefined}.
+opt_limit -> 'limit' int_lit 'offset' int_lit    : {value_of('$2'), value_of('$4')}.
+opt_limit -> 'offset' int_lit                    : {undefined, value_of('$2')}.
 
 select_list -> '*'                         : [#star{}].
 select_list -> select_item                 : ['$1'].

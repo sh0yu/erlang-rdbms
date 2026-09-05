@@ -161,7 +161,9 @@ DROP TABLE t;
 INSERT INTO t [(c, ...)] VALUES (v, ...);
 UPDATE t SET c = expr, ... [WHERE expr];
 DELETE FROM t [WHERE expr];
-SELECT * | expr, ... FROM t [WHERE expr];
+SELECT [DISTINCT] * | expr, ... FROM t [WHERE expr]
+  [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
+  [LIMIT n] [OFFSET n];
 BEGIN;  COMMIT;  ROLLBACK;
 ```
 
@@ -417,7 +419,7 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
 - `CREATE TABLE` / `DROP TABLE` は暗黙のトランザクションとして実行される。
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
-- JOIN・集約・`ORDER BY`・`LIMIT`・副問い合わせは未実装
+- JOIN・集約(`COUNT` `SUM` など)・`GROUP BY`・副問い合わせは未実装
 - `SELECT` は常に全表走査。索引を使うアクセスパス選択はプランナ未実装のため
 - 型宣言のないテーブル(タプルAPIで作ったもの)は全カラムが `any` 型になり、
   アトムをそのまま格納する。SQLの文字列リテラル(binary)とは一致しない

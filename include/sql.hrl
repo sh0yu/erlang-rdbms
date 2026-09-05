@@ -11,9 +11,21 @@
 %%%===================================================================
 
 -record(select_stmt, {
-    columns,            % [#col_ref{} | #star{}]
+    distinct = false :: boolean(),
+    columns,            % [式 | #star{}]
     from,               % #table_ref{}
-    where               % 式 | undefined
+    where,              % 式 | undefined
+    order_by = [],      % [#sort_item{}]
+    limit = undefined,  % 非負整数 | undefined
+    offset = undefined  % 非負整数 | undefined
+}).
+
+%% ORDER BY の1項目。
+%% nulls の既定はASCならlast、DESCならfirst(NULLを最大値として扱う)。
+-record(sort_item, {
+    expr,
+    dir = asc :: asc | desc,
+    nulls = default :: default | nulls_first | nulls_last
 }).
 
 -record(create_table_stmt, {

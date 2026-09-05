@@ -64,7 +64,9 @@ analyze(#select_stmt{from = #table_ref{name = TableStr}} = Stmt) ->
 %%% SELECT
 %%%===================================================================
 
-bind_select(#select_stmt{columns = Cols, where = Where}, Table, Columns) ->
+bind_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
+                        distinct = Distinct, limit = Limit, offset = Offset},
+            Table, Columns) ->
     case bind_where(Where, Columns) of
         {error, Reason} ->
             {error, Reason};
@@ -73,14 +75,65 @@ bind_select(#select_stmt{columns = Cols, where = Where}, Table, Columns) ->
                 {error, Reason} ->
                     {error, Reason};
                 {ok, Exprs, Names} ->
-                    Scan = #p_seq_scan{table = Table, schema = names(Columns)},
-                    Filtered = case Pred of
-                                   undefined -> Scan;
-                                   _ -> #p_filter{pred = Pred, input = Scan}
-                               end,
-                    {ok, {select, #p_project{exprs = Exprs, names = Names, input = Filtered}}}
+                    %% 並べ替えは射影の**前**に置く。ORDER BY のキーは
+                    %% 出力に含まれないカラムでもよい(SELECT name ... ORDER BY price)。
+                    case bind_order(Order, Columns) of
+                        {error, Reason} ->
+                            {error, Reason};
+                        {ok, Keys} ->
+                            Scan = #p_seq_scan{table = Table, schema = names(Columns)},
+                            Filtered = wrap_filter(Pred, Scan),
+                            Sorted = wrap_sort(Keys, Limit, Offset, Filtered),
+                            Projected = #p_project{exprs = Exprs, names = Names,
+                                                   input = Sorted},
+                            %% DISTINCT は射影の後(出力する列で重複を見る)
+                            Distincted = wrap_distinct(Distinct, Projected),
+                            {ok, {select, wrap_limit(Limit, Offset, Keys, Distincted)}}
+                    end
             end
     end.
+
+wrap_filter(undefined, Node) -> Node;
+wrap_filter(Pred, Node) -> #p_filter{pred = Pred, input = Node}.
+
+wrap_sort([], _Limit, _Offset, Node) ->
+    Node;
+wrap_sort(Keys, Limit, Offset, Node) ->
+    %% LIMIT があるなら、全件並べずに上位 (offset + count) 件だけ保てばよい。
+    %% DISTINCT があると件数が変わるので、その場合は上限を渡さない。
+    #p_sort{keys = Keys, limit = topn_limit(Limit, Offset), input = Node}.
+
+topn_limit(undefined, _Offset) -> undefined;
+topn_limit(Count, undefined) -> Count;
+topn_limit(Count, Offset) -> Count + Offset.
+
+wrap_distinct(false, Node) -> Node;
+wrap_distinct(true, Node) -> #p_distinct{input = Node}.
+
+wrap_limit(undefined, undefined, _Keys, Node) ->
+    Node;
+wrap_limit(Count, Offset, _Keys, Node) ->
+    #p_limit{count = Count, offset = default_offset(Offset), input = Node}.
+
+default_offset(undefined) -> 0;
+default_offset(N) -> N.
+
+%% ORDER BY のキーを束縛する。
+%% NULLの位置の既定はPostgreSQLに合わせ、ASCならlast、DESCならfirst。
+bind_order(Items, Columns) ->
+    bind_order(Items, Columns, []).
+
+bind_order([], _Columns, Acc) ->
+    {ok, lists:reverse(Acc)};
+bind_order([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Columns, Acc) ->
+    case bind_expr(E, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, Bound} -> bind_order(T, Columns, [{Bound, Dir, nulls_for(Dir, Nulls)} | Acc])
+    end.
+
+nulls_for(asc, default) -> nulls_last;
+nulls_for(desc, default) -> nulls_first;
+nulls_for(_Dir, Explicit) -> Explicit.
 
 bind_projection([#star{}], Columns) ->
     {ok, [{ref, N} || N <- lists:seq(1, length(Columns))], names(Columns)};

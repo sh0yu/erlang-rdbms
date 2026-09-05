@@ -19,6 +19,26 @@
     input
 }).
 
+%% 並べ替え(τ)。keys は [{式, asc|desc, nulls_first|nulls_last}]。
+%% limit を持つときは全件を並べずに上位N件だけ保つ(Top-N)。
+-record(p_sort, {
+    keys = [],
+    limit = undefined,
+    input
+}).
+
+%% 先頭 offset 件を捨てて count 件返す。
+-record(p_limit, {
+    count = undefined,
+    offset = 0,
+    input
+}).
+
+%% 重複を落とす(δ)。
+-record(p_distinct, {
+    input
+}).
+
 %% 式を評価して出力行を組み立てる(π)。
 %% names は結果のカラム名。
 -record(p_project, {

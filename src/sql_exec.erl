@@ -64,6 +64,9 @@ run(Plan, {ScanOpen, ScanNext}) ->
 %% プランの最上位が出力するカラム名。
 column_names(#p_project{names = Names}) -> Names;
 column_names(#p_filter{input = In}) -> column_names(In);
+column_names(#p_sort{input = In}) -> column_names(In);
+column_names(#p_limit{input = In}) -> column_names(In);
+column_names(#p_distinct{input = In}) -> column_names(In);
 column_names(#p_seq_scan{schema = Schema}) -> Schema.
 
 drain(Op, Acc) ->
@@ -92,6 +95,53 @@ open(#p_project{exprs = Exprs, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = project, st = {Exprs, Child}}
+    end;
+%% 並べ替えはブロッキング演算子。open の時点で入力を読み切る。
+open(#p_sort{keys = Keys, limit = Limit, input = Input}, Ctx) ->
+    case open(Input, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        Child ->
+            case collect(Child, []) of
+                {error, Reason} -> {error, Reason};
+                {ok, Rows} -> #op{kind = sorted, st = sort_rows(Keys, Limit, Rows)}
+            end
+    end;
+open(#p_limit{count = Count, offset = Offset, input = Input}, Ctx) ->
+    case open(Input, Ctx) of
+        {error, Reason} -> {error, Reason};
+        Child -> #op{kind = limit, st = {Count, Offset, Child}}
+    end;
+open(#p_distinct{input = Input}, Ctx) ->
+    case open(Input, Ctx) of
+        {error, Reason} -> {error, Reason};
+        Child -> #op{kind = distinct, st = {sets:new([{version, 2}]), Child}}
+    end.
+
+%% 入力を読み切る。並べ替えのようなブロッキング演算子で使う。
+collect(Op, Acc) ->
+    case next(Op) of
+        {row, Row, Op2} -> collect(Op2, [Row | Acc]);
+        {eof, _Op2} -> {ok, lists:reverse(Acc)}
+    end.
+
+%% 並べ替え。Erlangの項順序ではなく sql_value:order_compare/4 を使う。
+%% 素の `<` だと 100 < null が真になり、NULLを含む列で順序が壊れる。
+sort_rows(Keys, Limit, Rows) ->
+    Sorted = lists:sort(fun(A, B) -> compare_rows(Keys, A, B) =/= gt end, Rows),
+    case Limit of
+        undefined -> Sorted;
+        N -> lists:sublist(Sorted, N)
+    end.
+
+compare_rows([], _A, _B) ->
+    eq;
+compare_rows([{Expr, Dir, Nulls} | T], A, B) ->
+    Va = sql_expr:eval(Expr, A),
+    Vb = sql_expr:eval(Expr, B),
+    case sql_value:order_compare(Va, Vb, Dir, Nulls) of
+        eq -> compare_rows(T, A, B);
+        Other -> Other
     end.
 
 %%%===================================================================
@@ -125,6 +175,31 @@ next(#op{kind = filter, st = {Pred, Child}} = Op) ->
             end
     end;
 
+%% 並べ替え済みの行を1件ずつ返す
+next(#op{kind = sorted, st = []} = Op) ->
+    {eof, Op};
+next(#op{kind = sorted, st = [Row | Rest]} = Op) ->
+    {row, Row, Op#op{st = Rest}};
+
+%% OFFSET 件を読み飛ばしてから COUNT 件返す。
+%% 打ち切ったら下位の走査は最後まで読まない。
+next(#op{kind = limit, st = {_Count, _Offset, _Child}} = Op) ->
+    limit_next(Op);
+
+next(#op{kind = distinct, st = {Seen, Child}} = Op) ->
+    case next(Child) of
+        {eof, Child2} ->
+            {eof, Op#op{st = {Seen, Child2}}};
+        {row, Row, Child2} ->
+            %% 重複判定は sql_value:group_key/1 を通す。NULL同士は同じとみなし、
+            %% 100 と 100.0 も同じ扱いにする(`=` の意味論とは別)。
+            Key = [sql_value:group_key(V) || V <- Row],
+            case sets:is_element(Key, Seen) of
+                true -> next(Op#op{st = {Seen, Child2}});
+                false -> {row, Row, Op#op{st = {sets:add_element(Key, Seen), Child2}}}
+            end
+    end;
+
 next(#op{kind = project, st = {Exprs, Child}} = Op) ->
     case next(Child) of
         {eof, Child2} ->
@@ -135,6 +210,22 @@ next(#op{kind = project, st = {Exprs, Child}} = Op) ->
             {row, Out, Op#op{st = {Exprs, Child2}}}
     end.
 
+limit_next(#op{st = {0, _Offset, _Child}} = Op) ->
+    {eof, Op};
+limit_next(#op{st = {Count, Offset, Child}} = Op) when Offset > 0 ->
+    case next(Child) of
+        {eof, Child2} -> {eof, Op#op{st = {Count, Offset, Child2}}};
+        {row, _Row, Child2} -> limit_next(Op#op{st = {Count, Offset - 1, Child2}})
+    end;
+limit_next(#op{st = {Count, 0, Child}} = Op) ->
+    case next(Child) of
+        {eof, Child2} -> {eof, Op#op{st = {Count, 0, Child2}}};
+        {row, Row, Child2} -> {row, Row, Op#op{st = {decr(Count), 0, Child2}}}
+    end.
+
+decr(undefined) -> undefined;
+decr(N) -> N - 1.
+
 %%%===================================================================
 %%% close
 %%%===================================================================
@@ -144,6 +235,12 @@ close(#op{kind = seq_scan}) ->
 close(#op{kind = filter, st = {_Pred, Child}}) ->
     close(Child);
 close(#op{kind = project, st = {_Exprs, Child}}) ->
+    close(Child);
+close(#op{kind = sorted}) ->
+    ok;
+close(#op{kind = limit, st = {_C, _O, Child}}) ->
+    close(Child);
+close(#op{kind = distinct, st = {_Seen, Child}}) ->
     close(Child);
 close({error, _}) ->
     ok.

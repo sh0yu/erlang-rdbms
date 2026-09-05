@@ -55,7 +55,9 @@ keywords() ->
      "begin", "commit", "rollback",
      "integer", "float", "varchar", "boolean",
      "true", "false", "null",
-     "and", "or", "not", "is"].
+     "and", "or", "not", "is",
+     "order", "by", "asc", "desc", "limit", "offset", "distinct",
+     "nulls", "first", "last"].
 
 keyword_or_identifier(Chars, Line) ->
     Lower = string:lowercase(Chars),
