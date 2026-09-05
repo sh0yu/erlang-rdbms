@@ -10,15 +10,17 @@ OTPアプリケーション名は `transaction_db`。
 
 ```sh
 cd erlang-rdbms
-bin/sqlsh
+bin/sqlweb      # ブラウザUI  http://127.0.0.1:8080
+bin/sqlsh       # 端末クライアント
 ```
 
-これだけ。初回は自動でビルドする。終了は `\q`。
+初回は自動でビルドする。
 
-必要なものは Erlang/OTP 25 以降。`bin/sqlsh` は `erl` を
-PATH → `~/.local/erlang/bin` → `/usr/local/lib/erlang/bin` →
-`/usr/lib/erlang/bin` の順に探すので、これらのどこかにあれば
-PATHを通していなくても動く。見つからなければその旨を表示して終わる。
+必要なものは Erlang/OTP 25 以降。Debian/Ubuntu なら:
+
+```sh
+sudo apt install erlang-nox erlang-dev erlang-parsetools erlang-dialyzer
+```
 
 開発時のコマンド:
 
@@ -36,6 +38,23 @@ make        # ebin/ にビルド
 make test   # EUnitを実行
 make shell
 ```
+
+### ブラウザUI
+
+```sh
+bin/sqlweb           # http://127.0.0.1:8080
+bin/sqlweb 9000      # ポートを指定
+```
+
+左に表とカラム定義、上にSQL入力欄、下に実行結果が出る。`Ctrl+Enter` で実行、
+複数文は `;` 区切りでまとめて流せる。`BEGIN` / `COMMIT` / `ROLLBACK` はボタンでも押せる。
+いまトランザクションを開いているかが常に表示される。
+
+外部依存は無い(OTP同梱の `inets` httpd を使う)。127.0.0.1 のみで待ち受ける。
+
+接続はブラウザのセッションごとに1本持つ。**タブを2つ開いて片方でBEGINしたまま
+にすると、もう片方のクエリが順番待ちで止まる。** トランザクションが直列に
+実行される様子がそのまま観察できる(この直列化の是非は「今後の課題」を参照)。
 
 ### SQLシェル
 

@@ -20,7 +20,7 @@
 -behaviour(gen_server).
 
 %% Public API
--export([start_link/0, stop/1, exec_query/2]).
+-export([start_link/0, stop/1, exec_query/2, status/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -63,6 +63,15 @@ stop(Pid) ->
 %%----------------------------------------------------------------------
 exec_query(Pid, Query) ->
     gen_server:call(Pid, {exec_query, Query}, infinity).
+
+%%----------------------------------------------------------------------
+%% @doc この接続の状態。
+%% グローバルなトランザクションの有無ではなく、**この接続が**
+%% トランザクションを開いているかを返す。
+%% Returns: #{in_transaction => boolean(), txid => term()}
+%%----------------------------------------------------------------------
+status(Pid) ->
+    gen_server:call(Pid, status).
 
 %%%===================================================================
 %%% Callback functions of gen_server
@@ -121,6 +130,9 @@ handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State) ->
 
 handle_call({exec_query, Query}, _From, State) ->
     {reply, {error, {unsupported_query, Query}}, State};
+
+handle_call(status, _From, #state{txid = Txid} = State) ->
+    {reply, #{in_transaction => Txid =/= undefined, txid => Txid}, State};
 
 handle_call(terminate, _From, State) ->
     {stop, normal, ok, State};

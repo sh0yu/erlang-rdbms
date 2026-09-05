@@ -9,24 +9,14 @@
 set -e
 cd "$(dirname "$0")/.."
 
-# Erlangを探す。PATHに無ければ、よくある置き場所を見に行く。
-# このマシンにはシステムのErlangが無く、~/.local/erlang に置いてあるため。
-if ! command -v erl >/dev/null 2>&1; then
-    for d in "$HOME/.local/erlang/bin" /usr/local/lib/erlang/bin /usr/lib/erlang/bin; do
-        if [ -x "$d/erl" ]; then
-            PATH="$d:$PATH"
-            break
-        fi
-    done
-fi
-if [ -x "$HOME/.local/bin/rebar3" ]; then
-    PATH="$HOME/.local/bin:$PATH"
-fi
+# Erlang は /usr/bin/erl にある想定。rebar3 は apt に無いので
+# ~/.local/bin に置いてあることがある。
+if [ -x "$HOME/.local/bin/rebar3" ]; then PATH="$HOME/.local/bin:$PATH"; fi
 export PATH
 
 if ! command -v erl >/dev/null 2>&1; then
-    echo "erl が見つかりません。Erlang/OTP 25 以降を入れるか、" >&2
-    echo "PATH に erl を通してから実行してください。" >&2
+    echo "erl が見つかりません。Erlang/OTP 25 以降を入れてください:" >&2
+    echo "  sudo apt install erlang-nox erlang-dev erlang-parsetools erlang-dialyzer" >&2
     exit 1
 fi
 
