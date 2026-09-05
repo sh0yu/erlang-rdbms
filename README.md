@@ -159,14 +159,26 @@ SQL:
 CREATE TABLE t (a VARCHAR, b INTEGER, c BOOLEAN);
 DROP TABLE t;
 INSERT INTO t [(c, ...)] VALUES (v, ...);
-UPDATE t SET c = v, ... [WHERE c = v];
-DELETE FROM t [WHERE c = v];
-SELECT * | c, ... FROM t [WHERE c = v];
+UPDATE t SET c = expr, ... [WHERE expr];
+DELETE FROM t [WHERE expr];
+SELECT * | expr, ... FROM t [WHERE expr];
 BEGIN;  COMMIT;  ROLLBACK;
 ```
 
 型は `INTEGER` / `FLOAT` / `VARCHAR` / `BOOLEAN`。暗黙変換はしない
 (整数からFLOATへの格上げだけ許す)。指定しなかったカラムはNULLになる。
+
+式に書けるもの:
+
+| | |
+| --- | --- |
+| 比較 | `=` `<>`(`!=`) `<` `<=` `>` `>=` |
+| 論理 | `AND` `OR` `NOT` `( )` |
+| 算術 | `+` `-` `*` `/`(ゼロ除算はNULL) |
+| NULL | `IS NULL` `IS NOT NULL` |
+
+比較の一方がNULLなら結果はNULLになり、`WHERE` は通らない。
+`NOT` をつけても通らない(3値論理)。
 
 タプルAPI(内部向け):
 
@@ -405,8 +417,7 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
 - `CREATE TABLE` / `DROP TABLE` は暗黙のトランザクションとして実行される。
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
-- 検索条件は単一カラムの等値比較のみ。比較演算子(`<` `>` など)・
-  `AND`/`OR`・JOIN・集約・`ORDER BY`・`LIMIT` は未実装
+- JOIN・集約・`ORDER BY`・`LIMIT`・副問い合わせは未実装
 - `SELECT` は常に全表走査。索引を使うアクセスパス選択はプランナ未実装のため
 - 型宣言のないテーブル(タプルAPIで作ったもの)は全カラムが `any` 型になり、
   アトムをそのまま格納する。SQLの文字列リテラル(binary)とは一致しない

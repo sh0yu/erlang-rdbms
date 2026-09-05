@@ -77,9 +77,22 @@
     value
 }).
 
-%% 二項演算。op は '=' など。
+%% 二項演算。op は比較('=' '<>' '<' '<=' '>' '>=')、
+%% 論理('and' 'or')、算術('+' '-' '*' '/')。
 -record(binop, {
     op,
     left,
     right
+}).
+
+%% 単項演算。op は 'not' または '-'。
+-record(unop, {
+    op,
+    arg
+}).
+
+%% IS NULL / IS NOT NULL
+-record(is_null, {
+    arg,
+    negated = false
 }).

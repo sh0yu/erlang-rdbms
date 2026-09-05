@@ -18,7 +18,7 @@
 
 -export([compare/2, order_compare/4]).
 -export([truth_and/2, truth_or/2, truth_not/1, keep/1]).
--export([is_null/1, group_key/1]).
+-export([is_null/1, group_key/1, arith/3]).
 
 -type value() :: term().
 -type truth() :: true | false | null.
@@ -112,6 +112,23 @@ keep(_) -> false.
 
 is_null(null) -> true;
 is_null(_) -> false.
+
+%%----------------------------------------------------------------------
+%% @doc 算術。片方でもNULLなら結果はNULL。
+%% 数値でないものの演算もNULLにする(暗黙変換しない)。
+%% ゼロ除算はエラーではなくNULLを返す(SQLite寄り。SQL標準はエラー)。
+%%----------------------------------------------------------------------
+arith(_Op, null, _) -> null;
+arith(_Op, _, null) -> null;
+arith(Op, A, B) when is_number(A), is_number(B) -> arith_1(Op, A, B);
+arith(_Op, _, _) -> null.
+
+arith_1('+', A, B) -> A + B;
+arith_1('-', A, B) -> A - B;
+arith_1('*', A, B) -> A * B;
+arith_1('/', _A, B) when B == 0 -> null;
+arith_1('/', A, B) when is_integer(A), is_integer(B), A rem B =:= 0 -> A div B;
+arith_1('/', A, B) -> A / B.
 
 %%----------------------------------------------------------------------
 %% @doc GROUP BY / DISTINCT 用のキー。

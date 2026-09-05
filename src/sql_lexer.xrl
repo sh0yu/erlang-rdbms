@@ -23,7 +23,15 @@ Rules.
 {L}{A}*             : {token, keyword_or_identifier(TokenChars, TokenLine)}.
 ,                   : {token, {',', TokenLine}}.
 \*                  : {token, {'*', TokenLine}}.
+<>                  : {token, {'<>', TokenLine}}.
+!=                  : {token, {'<>', TokenLine}}.
+<=                  : {token, {'<=', TokenLine}}.
+>=                  : {token, {'>=', TokenLine}}.
+<                   : {token, {'<', TokenLine}}.
+>                   : {token, {'>', TokenLine}}.
 =                   : {token, {'=', TokenLine}}.
+\+                  : {token, {'+', TokenLine}}.
+/                   : {token, {'/', TokenLine}}.
 \(                  : {token, {'(', TokenLine}}.
 \)                  : {token, {')', TokenLine}}.
 \.                  : {token, {'.', TokenLine}}.
@@ -46,7 +54,8 @@ keywords() ->
      "update", "set", "delete",
      "begin", "commit", "rollback",
      "integer", "float", "varchar", "boolean",
-     "true", "false", "null"].
+     "true", "false", "null",
+     "and", "or", "not", "is"].
 
 keyword_or_identifier(Chars, Line) ->
     Lower = string:lowercase(Chars),

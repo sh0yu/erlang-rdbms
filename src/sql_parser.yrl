@@ -26,7 +26,8 @@
 Nonterminals
     stmt
     select_stmt create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
-    select_list select_item table_ref opt_where expr literal signed_literal
+    select_list select_item table_ref opt_where expr literal
+    neg
     column_defs column_def type_name
     opt_column_names column_names
     value_list
@@ -41,11 +42,35 @@ Terminals
     'begin' commit rollback
     'integer' 'float' 'varchar' 'boolean'
     true false null
-    ',' '*' '=' '(' ')' ';' '-'.
+    'and' 'or' 'not' 'is'
+    ',' '*' '(' ')' ';'
+    '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
 
 Rootsymbol stmt.
 
 Expect 0.
+
+%%%===================================================================
+%%% 演算子の優先順位
+%%%
+%%% 真偽式と値式を1つの expr にまとめ、優先順位宣言で解決している。
+%%% 階層(or_expr -> and_expr -> ...)で書く手もあるが、括弧が
+%%% 真偽の括弧か値の括弧かで曖昧になる。1つにまとめれば `(` の扱いが
+%%% 1箇所で済む(PostgreSQLの a_expr と同じ考え方)。
+%%%
+%%% yeccには規則ごとの %prec が無く、規則の優先順位は
+%%% 「規則中の最後の終端記号」から決まる。単項マイナスは
+%%% 非終端記号 neg に優先順位を宣言して解決している。
+%%%===================================================================
+
+Left  100 'or'.
+Left  200 'and'.
+Unary 300 'not'.
+Nonassoc 400 'is'.
+Nonassoc 500 '=' '<>' '<' '<=' '>' '>='.
+Left  600 '+' '-'.
+Left  700 '*' '/'.
+Unary 800 neg.
 
 %%%===================================================================
 %%% 文
@@ -106,8 +131,8 @@ opt_column_names -> '(' column_names ')'    : '$2'.
 column_names -> identifier                  : [value_of('$1')].
 column_names -> identifier ',' column_names : [value_of('$1') | '$3'].
 
-value_list -> signed_literal                : ['$1'].
-value_list -> signed_literal ',' value_list : ['$1' | '$3'].
+value_list -> expr                : ['$1'].
+value_list -> expr ',' value_list : ['$1' | '$3'].
 
 %%%===================================================================
 %%% UPDATE / DELETE
@@ -119,7 +144,7 @@ update_stmt -> update identifier set assignments opt_where :
 assignments -> assignment                 : ['$1'].
 assignments -> assignment ',' assignments : ['$1' | '$3'].
 
-assignment -> identifier '=' signed_literal : {value_of('$1'), '$3'}.
+assignment -> identifier '=' expr : {value_of('$1'), '$3'}.
 
 delete_stmt -> delete from identifier opt_where :
     #delete_stmt{table = value_of('$3'), where = '$4'}.
@@ -135,7 +160,7 @@ select_list -> '*'                         : [#star{}].
 select_list -> select_item                 : ['$1'].
 select_list -> select_item ',' select_list : ['$1' | '$3'].
 
-select_item -> identifier : #col_ref{name = value_of('$1')}.
+select_item -> expr : '$1'.
 
 table_ref -> identifier : #table_ref{name = value_of('$1')}.
 
@@ -146,15 +171,43 @@ table_ref -> identifier : #table_ref{name = value_of('$1')}.
 opt_where -> '$empty'    : undefined.
 opt_where -> where expr  : '$2'.
 
-expr -> identifier '=' signed_literal :
-    #binop{op = '=', left = #col_ref{name = value_of('$1')}, right = '$3'}.
+%%%===================================================================
+%%% 式
+%%%===================================================================
+
+expr -> expr 'or' expr   : #binop{op = 'or',  left = '$1', right = '$3'}.
+expr -> expr 'and' expr  : #binop{op = 'and', left = '$1', right = '$3'}.
+expr -> 'not' expr       : #unop{op = 'not', arg = '$2'}.
+
+%% 比較演算子は規則に直接書く。comp_op のような非終端記号にまとめると、
+%% 規則中に終端記号が無くなり優先順位が効かなくなる
+%% (yeccは規則の優先順位を「規則中の最後の終端記号」から決めるため)。
+%% まとめた場合 `a >= 1 AND a < 3` が `a >= (1 AND (a < 3))` と解釈される。
+expr -> expr '='  expr : #binop{op = '=',  left = '$1', right = '$3'}.
+expr -> expr '<>' expr : #binop{op = '<>', left = '$1', right = '$3'}.
+expr -> expr '<'  expr : #binop{op = '<',  left = '$1', right = '$3'}.
+expr -> expr '<=' expr : #binop{op = '<=', left = '$1', right = '$3'}.
+expr -> expr '>'  expr : #binop{op = '>',  left = '$1', right = '$3'}.
+expr -> expr '>=' expr : #binop{op = '>=', left = '$1', right = '$3'}.
+
+expr -> expr 'is' null       : #is_null{arg = '$1', negated = false}.
+expr -> expr 'is' 'not' null : #is_null{arg = '$1', negated = true}.
+
+expr -> expr '+' expr : #binop{op = '+', left = '$1', right = '$3'}.
+expr -> expr '-' expr : #binop{op = '-', left = '$1', right = '$3'}.
+expr -> expr '*' expr : #binop{op = '*', left = '$1', right = '$3'}.
+expr -> expr '/' expr : #binop{op = '/', left = '$1', right = '$3'}.
+
+expr -> neg expr      : #unop{op = '-', arg = '$2'}.
+expr -> '(' expr ')'  : '$2'.
+expr -> identifier    : #col_ref{name = value_of('$1')}.
+expr -> literal       : '$1'.
+
+neg -> '-' : '-'.
 
 %%%===================================================================
 %%% リテラル
 %%%===================================================================
-
-signed_literal -> literal     : '$1'.
-signed_literal -> '-' literal : negate('$2').
 
 literal -> int_lit    : #const{value = value_of('$1')}.
 literal -> float_lit  : #const{value = value_of('$1')}.
@@ -170,5 +223,4 @@ Erlang code.
 %% leexのトークンは {Type, Line, Value} または {Type, Line}
 value_of({_Type, _Line, Value}) -> Value.
 
-negate(#const{value = V}) when is_number(V) -> #const{value = -V};
-negate(#const{} = C) -> C.
+

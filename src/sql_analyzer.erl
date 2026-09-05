@@ -89,15 +89,23 @@ bind_projection(Items, Columns) ->
 
 bind_projection_1([], _Columns, Exprs, Names) ->
     {ok, lists:reverse(Exprs), lists:reverse(Names)};
-bind_projection_1([#col_ref{name = NameStr} | T], Columns, Exprs, Names) ->
-    case resolve_column(NameStr, Columns) of
-        {error, Reason} -> {error, Reason};
-        {ok, Col} -> bind_projection_1(T, Columns, [{ref, Col#column.position} | Exprs],
-                                       [Col#column.name | Names])
-    end;
 bind_projection_1([#star{} | _T], _Columns, _Exprs, _Names) ->
     %% SELECT a, * のような形は今は扱わない
-    {error, star_must_be_alone}.
+    {error, star_must_be_alone};
+bind_projection_1([Item | T], Columns, Exprs, Names) ->
+    case bind_expr(Item, Columns) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Bound} ->
+            bind_projection_1(T, Columns, [Bound | Exprs],
+                              [projection_name(Item, length(Exprs) + 1) | Names])
+    end.
+
+%% 出力カラムの名前。カラム参照ならその名前、式なら位置から作る。
+projection_name(#col_ref{name = NameStr}, _N) ->
+    list_to_existing_atom(NameStr);
+projection_name(_Expr, N) ->
+    list_to_atom("column" ++ integer_to_list(N)).
 
 %%%===================================================================
 %%% INSERT
@@ -131,16 +139,28 @@ bind_insert(Table, Columns, ColStrs, Values) ->
 
 %% 指定のなかったカラムは NULL で埋める。
 typed_row(Table, Columns, Pairs) ->
-    Row = [value_for(C, Pairs) || C <- Columns],
-    case check_types(Columns, Row) of
-        ok -> {ok, {insert, Table, Row}};
-        {error, Reason} -> {error, Reason}
+    try [value_for(C, Pairs) || C <- Columns] of
+        Row ->
+            case check_types(Columns, Row) of
+                ok -> {ok, {insert, Table, Row}};
+                {error, Reason} -> {error, Reason}
+            end
+    catch
+        throw:{invalid_value_expression, _} -> {error, only_constants_in_values}
     end.
 
 value_for(#column{name = Name}, Pairs) ->
     case lists:keyfind(Name, 1, Pairs) of
-        {Name, #const{value = V}} -> V;
+        {Name, Expr} -> const_value(Expr);
         false -> null
+    end.
+
+%% VALUES に書けるのは定数式だけ。カラム参照は入れられない
+%% (挿入する行がまだ存在しないため)。
+const_value(Expr) ->
+    case bind_expr(Expr, []) of
+        {ok, Bound} -> sql_expr:eval(Bound, {});
+        {error, _} -> throw({invalid_value_expression, Expr})
     end.
 
 check_types([], []) ->
@@ -169,14 +189,23 @@ bind_update(Table, Columns, Set, Where) ->
 %% 代入は {カラム位置, 新しい値} に落とす。
 bind_assignments([], _Columns, Acc) ->
     {ok, lists:reverse(Acc)};
-bind_assignments([{NameStr, #const{value = V}} | T], Columns, Acc) ->
+bind_assignments([{NameStr, Expr} | T], Columns, Acc) ->
     case resolve_column(NameStr, Columns) of
         {error, Reason} ->
             {error, Reason};
         {ok, #column{name = Name, type = Type, position = Pos}} ->
-            case sql_type:check(Type, V) of
-                ok -> bind_assignments(T, Columns, [{Pos, V} | Acc]);
-                {error, Reason} -> {error, {Reason, Name, Type, V}}
+            case bind_expr(Expr, Columns) of
+                {error, Reason} ->
+                    {error, Reason};
+                %% 定数ならこの場で型を検査できる
+                {ok, {const, V}} ->
+                    case sql_type:check(Type, V) of
+                        ok -> bind_assignments(T, Columns, [{Pos, {const, V}} | Acc]);
+                        {error, Reason} -> {error, {Reason, Name, Type, V}}
+                    end;
+                %% 式は行ごとに値が決まるので、検査は実行時
+                {ok, Bound} ->
+                    bind_assignments(T, Columns, [{Pos, Bound} | Acc])
             end
     end.
 
@@ -197,15 +226,55 @@ bind_expr(#col_ref{name = NameStr}, Columns) ->
         {ok, #column{position = Pos}} -> {ok, {ref, Pos}}
     end;
 bind_expr(#binop{op = Op, left = L, right = R}, Columns) ->
+    case bind_pair(L, R, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, BL, BR} -> {ok, binop(Op, BL, BR)}
+    end;
+bind_expr(#unop{op = 'not', arg = A}, Columns) ->
+    case bind_expr(A, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, BA} -> {ok, {'not', BA}}
+    end;
+bind_expr(#unop{op = '-', arg = A}, Columns) ->
+    case bind_expr(A, Columns) of
+        {error, Reason} -> {error, Reason};
+        %% 定数なら畳んでおく。-1 が {neg,{const,1}} のままだと
+        %% 型検査で「integerでない」と誤判定してしまう。
+        {ok, {const, V}} when is_number(V) -> {ok, {const, -V}};
+        {ok, BA} -> {ok, {neg, BA}}
+    end;
+bind_expr(#is_null{arg = A, negated = Neg}, Columns) ->
+    case bind_expr(A, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, BA} when Neg -> {ok, {is_not_null, BA}};
+        {ok, BA} -> {ok, {is_null, BA}}
+    end.
+
+bind_pair(L, R, Columns) ->
     case bind_expr(L, Columns) of
         {error, Reason} ->
             {error, Reason};
         {ok, BL} ->
             case bind_expr(R, Columns) of
                 {error, Reason} -> {error, Reason};
-                {ok, BR} -> {ok, {comp, Op, BL, BR}}
+                {ok, BR} -> {ok, BL, BR}
             end
     end.
+
+%% 論理・算術・比較を、評価器が受ける形に振り分ける。
+%% AND / OR は n項に平坦化しておく。述語のプッシュダウン(将来)で
+%% 連言を分解するとき、2項木のままだと平坦化を何度も書くことになる。
+binop('and', L, R) -> {'and', conjuncts(L) ++ conjuncts(R)};
+binop('or', L, R) -> {'or', disjuncts(L) ++ disjuncts(R)};
+binop(Op, L, R) when Op =:= '+'; Op =:= '-'; Op =:= '*'; Op =:= '/' ->
+    {arith, Op, L, R};
+binop(Op, L, R) -> {comp, Op, L, R}.
+
+conjuncts({'and', Es}) -> Es;
+conjuncts(E) -> [E].
+
+disjuncts({'or', Es}) -> Es;
+disjuncts(E) -> [E].
 
 %%%===================================================================
 %%% 名前の解決

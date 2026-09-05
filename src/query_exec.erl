@@ -36,6 +36,7 @@
 -record(tx_scan, {base, delta = #{}, pending = [], stage = base}).
 
 -include("../include/simple_db_server.hrl").
+-include("../include/catalog.hrl").
 
 %%%===================================================================
 %%% Public APIs. Client program call these APIs.
@@ -284,24 +285,53 @@ do_sql_update(State, Table, Assigns, Pred) ->
         {error, Reason} ->
             {reply, {error, Reason}, State};
         {ok, Rows} ->
-            QueryId = db_id:new(),
-            LKvstore = get_local_kvstore(State),
-            {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), Table),
-            ok = acquire_lock(State, [Oid || {Oid, _} <- Rows], write),
-            LColumnIndex = get_local_column_index(State),
-            lists:foreach(
-              fun({Oid, OldVal}) ->
-                      NewVal = apply_assigns(OldVal, Assigns),
-                      ets:insert(LKvstore, {QueryId, del, Table, Oid, OldVal}),
-                      ets:insert(LKvstore, {QueryId, ins, Table, Oid, NewVal}),
-                      lists:foreach(
-                        fun({_Col, Same, Same}) -> ok;
-                           ({Col, Old, New}) ->
-                                ets:insert(LColumnIndex, {QueryId, del, Table, Col, Old, Oid}),
-                                ets:insert(LColumnIndex, {QueryId, ins, Table, Col, New, Oid})
-                        end, lists:zip3(ColumnList, OldVal, NewVal))
-              end, Rows),
-            {reply, {ok, length(Rows)}, add_query_id(State, QueryId)}
+            {ok, Columns} = sys_tbl_mng:get_columns(whereis(sys_tbl_mng), Table),
+            %% 新しい値を先に全部作って型を確かめる。1行でも通らなければ
+            %% 何も書かない(コミット時の検証と同じ考え方)。
+            Updated = [{Oid, OldVal, apply_assigns(OldVal, Assigns)} || {Oid, OldVal} <- Rows],
+            case check_update_types(Columns, Updated) of
+                {error, Reason} ->
+                    {reply, {error, Reason}, State};
+                ok ->
+                    {reply, {ok, length(Updated)},
+                     record_update(State, Table, Columns, Updated)}
+            end
+    end.
+
+record_update(State, Table, Columns, Updated) ->
+    QueryId = db_id:new(),
+    LKvstore = get_local_kvstore(State),
+    LColumnIndex = get_local_column_index(State),
+    ColumnList = [C#column.name || C <- Columns],
+    ok = acquire_lock(State, [Oid || {Oid, _, _} <- Updated], write),
+    lists:foreach(
+      fun({Oid, OldVal, NewVal}) ->
+              ets:insert(LKvstore, {QueryId, del, Table, Oid, OldVal}),
+              ets:insert(LKvstore, {QueryId, ins, Table, Oid, NewVal}),
+              lists:foreach(
+                fun({_Col, Same, Same}) -> ok;
+                   ({Col, Old, New}) ->
+                        ets:insert(LColumnIndex, {QueryId, del, Table, Col, Old, Oid}),
+                        ets:insert(LColumnIndex, {QueryId, ins, Table, Col, New, Oid})
+                end, lists:zip3(ColumnList, OldVal, NewVal))
+      end, Updated),
+    add_query_id(State, QueryId).
+
+%% 代入が式の場合、値は行ごとに決まるので型検査は実行時になる。
+check_update_types(_Columns, []) ->
+    ok;
+check_update_types(Columns, [{_Oid, _Old, NewVal} | T]) ->
+    case check_row_types(Columns, NewVal) of
+        ok -> check_update_types(Columns, T);
+        {error, Reason} -> {error, Reason}
+    end.
+
+check_row_types([], []) ->
+    ok;
+check_row_types([#column{name = Name, type = Type} | CT], [V | VT]) ->
+    case sql_type:check(Type, V) of
+        ok -> check_row_types(CT, VT);
+        {error, Reason} -> {error, {Reason, Name, Type, V}}
     end.
 
 do_sql_delete(State, Table, Pred) ->
@@ -328,8 +358,13 @@ matching_rows(State, Table, Pred) ->
                                 sql_expr:eval_pred(Pred, list_to_tuple(Val))]}
     end.
 
+%% 代入の右辺は**更新前の行**に対して評価する。
+%% 途中の結果を使うと SET a = b, b = a が入れ替えにならない。
 apply_assigns(Val, Assigns) ->
-    lists:foldl(fun({Pos, New}, Acc) -> setnth(Pos, Acc, New) end, Val, Assigns).
+    Old = list_to_tuple(Val),
+    lists:foldl(fun({Pos, Expr}, Acc) ->
+                        setnth(Pos, Acc, sql_expr:eval(Expr, Old))
+                end, Val, Assigns).
 
 setnth(1, [_ | T], V) -> [V | T];
 setnth(N, [H | T], V) -> [H | setnth(N - 1, T, V)].

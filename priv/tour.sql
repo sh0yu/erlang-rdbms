@@ -74,11 +74,30 @@ SELECT nosuchcolumn FROM fruit;
 SELECT FROM;
 COMMIT;
 
+-- ============ 比較・論理・算術 ============
+BEGIN;
+SELECT * FROM fruit WHERE price > 100;
+SELECT * FROM fruit WHERE price >= 100 AND price < 300;
+SELECT * FROM fruit WHERE price < 100 OR price > 200;
+SELECT * FROM fruit WHERE NOT price = 100;
+SELECT * FROM fruit WHERE (price = 100 OR price = 150) AND ripe = true;
+
+-- NULLは比較でNULLになり、NOTをつけても通らない(3値論理)
+SELECT * FROM fruit WHERE ripe IS NULL;
+SELECT * FROM fruit WHERE ripe IS NOT NULL;
+
+-- 射影にも式が書ける
+SELECT name, price * 2 FROM fruit;
+
+-- 代入の右辺は更新前の行に対して評価する
+UPDATE fruit SET price = price + 10;
+SELECT * FROM fruit;
+COMMIT;
+
 -- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
 BEGIN;
 SELECT * FROM fruit ORDER BY price;
 SELECT * FROM fruit LIMIT 1;
-SELECT * FROM fruit WHERE price > 100;
 SELECT count(*) FROM fruit;
 COMMIT;
 

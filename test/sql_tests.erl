@@ -130,7 +130,7 @@ limit_is_not_supported_yet(_) ->
         ?assertMatch({error, {syntax_error, _, _}},
                      q(C, "SELECT * FROM fruit ORDER BY price")),
         ?assertMatch({error, {syntax_error, _, _}},
-                     q(C, "SELECT * FROM fruit WHERE price = 1 AND name = 'a'"))
+                     q(C, "SELECT count(*) FROM fruit"))
     end.
 
 %%%===================================================================

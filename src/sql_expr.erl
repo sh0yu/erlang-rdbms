@@ -10,6 +10,8 @@
 %%%   {ref, Position}
 %%%   {comp, Op, Left, Right}     Op :: '=' | '<>' | '<' | '<=' | '>' | '>='
 %%%   {'and', [Expr]} | {'or', [Expr]} | {'not', Expr}
+%%%   {arith, Op, Left, Right}    Op :: '+' | '-' | '*' | '/'
+%%%   {neg, Expr}
 %%%   {is_null, Expr} | {is_not_null, Expr}
 %%%
 %%% 比較と論理は必ず sql_value を経由する。Erlangの `<` や `andalso` を
@@ -35,6 +37,10 @@ eval({'or', Exprs}, Row) ->
     lists:foldl(fun(E, Acc) -> sql_value:truth_or(Acc, eval(E, Row)) end, false, Exprs);
 eval({'not', E}, Row) ->
     sql_value:truth_not(eval(E, Row));
+eval({neg, E}, Row) ->
+    sql_value:arith('-', 0, eval(E, Row));
+eval({arith, Op, L, R}, Row) ->
+    sql_value:arith(Op, eval(L, Row), eval(R, Row));
 eval({is_null, E}, Row) ->
     sql_value:is_null(eval(E, Row));
 eval({is_not_null, E}, Row) ->
