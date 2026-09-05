@@ -70,6 +70,15 @@
     alias = undefined   % string() | undefined
 }).
 
+%% FROM句の結合。
+%% type は inner | left | cross。cross は ON を持たない。
+-record(join, {
+    type,
+    left,
+    right,
+    on = undefined
+}).
+
 %%%===================================================================
 %%% 式
 %%%===================================================================
@@ -80,7 +89,7 @@
 %% カラム参照。
 %% slot はアナライザが埋める。実行時は名前ではなくこの位置で行を引く。
 -record(col_ref, {
-    table = undefined,  % 修飾子 t.c の t。無ければ undefined
+    table = undefined,  % 修飾子 t.c の t(string)。無ければ undefined
     name,               % string() -> アナライザ後は atom()
     slot = undefined    % 非負整数。アナライザが解決する
 }).

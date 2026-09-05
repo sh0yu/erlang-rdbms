@@ -58,7 +58,8 @@ keywords() ->
      "and", "or", "not", "is",
      "order", "by", "asc", "desc", "limit", "offset", "distinct",
      "nulls", "first", "last",
-     "group", "having"].
+     "group", "having",
+     "join", "inner", "left", "outer", "cross", "on", "as"].
 
 keyword_or_identifier(Chars, Line) ->
     Lower = string:lowercase(Chars),

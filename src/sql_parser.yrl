@@ -29,6 +29,7 @@ Nonterminals
     select_list select_item table_ref opt_where expr literal
     neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
     opt_group opt_having expr_list func_call
+    from_item join_kw opt_alias
     column_defs column_def type_name
     opt_column_names column_names
     value_list
@@ -47,6 +48,7 @@ Terminals
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
     'group' 'having'
+    'join' 'inner' 'left' 'outer' 'cross' 'on' 'as' '.'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
 
@@ -157,7 +159,7 @@ delete_stmt -> delete from identifier opt_where :
 %%% SELECT
 %%%===================================================================
 
-select_stmt -> select opt_distinct select_list from table_ref opt_where
+select_stmt -> select opt_distinct select_list from from_item opt_where
                opt_group opt_having opt_order opt_limit :
     {Limit, Offset} = '$10',
     #select_stmt{distinct = '$2', columns = '$3', from = '$5', where = '$6',
@@ -204,7 +206,30 @@ select_list -> select_item ',' select_list : ['$1' | '$3'].
 
 select_item -> expr : '$1'.
 
-table_ref -> identifier : #table_ref{name = value_of('$1')}.
+%%%===================================================================
+%%% FROM句
+%%%===================================================================
+
+from_item -> table_ref : '$1'.
+%% カンマ区切りは直積(CROSS JOIN と同じ)
+from_item -> from_item ',' table_ref :
+    #join{type = cross, left = '$1', right = '$3'}.
+from_item -> from_item join_kw table_ref 'on' expr :
+    #join{type = '$2', left = '$1', right = '$3', on = '$5'}.
+from_item -> from_item 'cross' 'join' table_ref :
+    #join{type = cross, left = '$1', right = '$4'}.
+
+join_kw -> 'join'                   : inner.
+join_kw -> 'inner' 'join'           : inner.
+join_kw -> 'left' 'join'            : left.
+join_kw -> 'left' 'outer' 'join'    : left.
+
+table_ref -> identifier opt_alias :
+    #table_ref{name = value_of('$1'), alias = '$2'}.
+
+opt_alias -> '$empty'         : undefined.
+opt_alias -> identifier       : value_of('$1').
+opt_alias -> 'as' identifier  : value_of('$2').
 
 %%%===================================================================
 %%% WHERE
@@ -252,7 +277,9 @@ func_call -> identifier '(' expr ')' :
 func_call -> identifier '(' 'distinct' expr ')' :
     #func{name = value_of('$1'), args = ['$4'], distinct = true}.
 expr -> '(' expr ')'  : '$2'.
-expr -> identifier    : #col_ref{name = value_of('$1')}.
+expr -> identifier                  : #col_ref{name = value_of('$1')}.
+expr -> identifier '.' identifier   : #col_ref{table = value_of('$1'),
+                                               name = value_of('$3')}.
 expr -> literal       : '$1'.
 
 neg -> '-' : '-'.

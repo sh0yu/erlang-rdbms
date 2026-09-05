@@ -126,9 +126,6 @@ string_literal_does_not_match_atom(_) ->
 unsupported_syntax_is_reported(_) ->
     fun() ->
         C = fixture(),
-        %% JOIN と修飾カラム名
-        ?assertMatch({error, _},
-                     q(C, "SELECT a.name FROM fruit a JOIN fruit b ON a.name = b.name")),
         %% 副問い合わせ
         ?assertMatch({error, {syntax_error, _, _}},
                      q(C, "SELECT * FROM fruit WHERE price = (SELECT price FROM fruit)"))

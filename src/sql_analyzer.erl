@@ -24,6 +24,10 @@
 -include("../include/plan.hrl").
 -include("../include/catalog.hrl").
 
+%% 名前解決のスコープ。結合すると複数テーブルのカラムが1つの行に並ぶので、
+%% 別名とカラム名の組で引き、位置は連結後の行における位置になる。
+-record(sc, {alias, name, type, pos}).
+
 %%----------------------------------------------------------------------
 %% @doc AST を実行可能な形に変換する。
 %%
@@ -46,37 +50,91 @@ analyze(#insert_stmt{table = TableStr, columns = ColStrs, values = Values}) ->
     with_table(TableStr, fun(Table, Columns) -> bind_insert(Table, Columns, ColStrs, Values) end);
 
 analyze(#update_stmt{table = TableStr, set = Set, where = Where}) ->
-    with_table(TableStr, fun(Table, Columns) -> bind_update(Table, Columns, Set, Where) end);
+    with_table(TableStr,
+               fun(Table, Columns) ->
+                       bind_update(Table, Columns, scope_of(Table, Columns), Set, Where)
+               end);
 
 analyze(#delete_stmt{table = TableStr, where = Where}) ->
     with_table(TableStr,
                fun(Table, Columns) ->
-                       case bind_where(Where, Columns) of
+                       case bind_where(Where, scope_of(Table, Columns)) of
                            {error, Reason} -> {error, Reason};
                            {ok, Pred} -> {ok, {delete, Table, Pred}}
                        end
                end);
 
-analyze(#select_stmt{from = #table_ref{name = TableStr}} = Stmt) ->
-    with_table(TableStr, fun(Table, Columns) -> bind_select(Stmt, Table, Columns) end).
+analyze(#select_stmt{from = From} = Stmt) ->
+    case build_from(From) of
+        {error, Reason} -> {error, Reason};
+        {ok, Scope, Node} -> bind_select(Stmt, Scope, Node)
+    end.
+
+%%%===================================================================
+%%% FROM句からスコープと走査プランを組み立てる
+%%%===================================================================
+
+build_from(#table_ref{name = TableStr, alias = Alias}) ->
+    case resolve_table(TableStr) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Table, Columns} ->
+            Name = case Alias of undefined -> Table; _ -> list_to_atom(Alias) end,
+            Scope = [#sc{alias = Name, name = C#column.name, type = C#column.type,
+                         pos = C#column.position}
+                     || C <- Columns],
+            {ok, Scope, #p_seq_scan{table = Table, schema = [C#column.name || C <- Columns]}}
+    end;
+build_from(#join{type = Type, left = L, right = R, on = On}) ->
+    case build_from(L) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, LScope, LNode} ->
+            case build_from(R) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, RScope, RNode} ->
+                    %% 右側のカラムは左の幅だけずれる
+                    Width = length(LScope),
+                    Shifted = [S#sc{pos = S#sc.pos + Width} || S <- RScope],
+                    Scope = LScope ++ Shifted,
+                    case bind_on(On, Scope) of
+                        {error, Reason} ->
+                            {error, Reason};
+                        {ok, Pred} ->
+                            {ok, Scope, #p_nl_join{type = Type, pred = Pred,
+                                                   left = LNode, right = RNode,
+                                                   right_width = length(RScope)}}
+                    end
+            end
+    end.
+
+bind_on(undefined, _Scope) -> {ok, undefined};
+bind_on(Expr, Scope) -> bind_expr(Expr, Scope).
+
+%% 単一テーブルの操作(INSERT/UPDATE/DELETE)用のスコープ。
+scope_of(Table, Columns) ->
+    [#sc{alias = Table, name = C#column.name, type = C#column.type,
+         pos = C#column.position} || C <- Columns].
 
 %%%===================================================================
 %%% SELECT
 %%%===================================================================
 
-bind_select(#select_stmt{group_by = G, having = H} = Stmt, Table, Columns)
+bind_select(#select_stmt{group_by = G, having = H} = Stmt, Scope, Node)
   when G =/= []; H =/= undefined ->
-    bind_grouped_select(Stmt, Table, Columns);
-bind_select(#select_stmt{columns = Cols} = Stmt, Table, Columns) ->
+    bind_grouped_select(Stmt, Scope, Node);
+bind_select(#select_stmt{columns = Cols} = Stmt, Scope, Node) ->
     case has_aggregate(Cols) of
         %% GROUP BY が無くても集約があれば、全体を1グループとして集約する
-        true -> bind_grouped_select(Stmt, Table, Columns);
-        false -> bind_plain_select(Stmt, Table, Columns)
+        true -> bind_grouped_select(Stmt, Scope, Node);
+        false -> bind_plain_select(Stmt, Scope, Node)
     end.
 
 bind_plain_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
                               distinct = Distinct, limit = Limit, offset = Offset},
-                  Table, Columns) ->
+                  Scope, Node) ->
+    Columns = Scope,
     case bind_where(Where, Columns) of
         {error, Reason} ->
             {error, Reason};
@@ -91,8 +149,7 @@ bind_plain_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
                         {error, Reason} ->
                             {error, Reason};
                         {ok, Keys} ->
-                            Scan = #p_seq_scan{table = Table, schema = names(Columns)},
-                            Filtered = wrap_filter(Pred, Scan),
+                            Filtered = wrap_filter(Pred, Node),
                             Sorted = wrap_sort(Keys, Limit, Offset, Filtered),
                             Projected = #p_project{exprs = Exprs, names = Names,
                                                    input = Sorted},
@@ -113,7 +170,8 @@ bind_plain_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
 bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group,
                                  having = Having, order_by = Order,
                                  distinct = Distinct, limit = Limit, offset = Offset},
-                    Table, Columns) ->
+                    Scope, Node) ->
+    Columns = Scope,
     with_ok(
       [fun() -> bind_where(Where, Columns) end,
        fun() -> bind_all(Group, Columns) end],
@@ -128,10 +186,9 @@ bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group
                           {error, Reason} ->
                               {error, Reason};
                           {ok, BHaving, #{aggs := Aggs}} ->
-                              Scan = #p_seq_scan{table = Table, schema = names(Columns)},
                               Agg = #p_agg{group_by = Keys, aggs = lists:reverse(Aggs),
                                            having = BHaving,
-                                           input = wrap_filter(Pred, Scan)},
+                                           input = wrap_filter(Pred, Node)},
                               %% 並べ替えは集約と射影の**間**に置く。
                               %% ORDER BY のキーは集約後の行の位置を指しており、
                               %% 射影の後(出力行)ではその位置が変わる。
@@ -393,20 +450,21 @@ projection_name(_Expr, N) ->
 bind_insert(Table, Columns, undefined, Values) ->
     case length(Values) =:= length(Columns) of
         false -> {error, column_count_mismatch};
-        true -> typed_row(Table, Columns, lists:zip(names(Columns), Values))
+        true -> typed_row(Table, Columns,
+                          lists:zip([C#column.name || C <- Columns], Values))
     end;
 bind_insert(Table, Columns, ColStrs, Values) ->
     case length(ColStrs) =:= length(Values) of
         false ->
             {error, column_count_mismatch};
         true ->
-            case resolve_columns(ColStrs, Columns) of
+            case resolve_columns(ColStrs, scope_of(Table, Columns)) of
                 {error, Reason} ->
                     {error, Reason};
                 {ok, Named} ->
-                    case duplicate_names([C#column.name || C <- Named]) of
+                    case duplicate_names([C#sc.name || C <- Named]) of
                         [] ->
-                            Pairs = lists:zip([C#column.name || C <- Named], Values),
+                            Pairs = lists:zip([C#sc.name || C <- Named], Values),
                             typed_row(Table, Columns, Pairs);
                         Dups ->
                             {error, {duplicate_columns, Dups}}
@@ -452,37 +510,37 @@ check_types([#column{name = Name, type = Type} | CT], [V | VT]) ->
 %%% UPDATE
 %%%===================================================================
 
-bind_update(Table, Columns, Set, Where) ->
-    case bind_where(Where, Columns) of
+bind_update(Table, Columns, Scope, Set, Where) ->
+    case bind_where(Where, Scope) of
         {error, Reason} ->
             {error, Reason};
         {ok, Pred} ->
-            case bind_assignments(Set, Columns, []) of
+            case bind_assignments(Set, Columns, Scope, []) of
                 {error, Reason} -> {error, Reason};
                 {ok, Assigns} -> {ok, {update, Table, Assigns, Pred}}
             end
     end.
 
 %% 代入は {カラム位置, 新しい値} に落とす。
-bind_assignments([], _Columns, Acc) ->
+bind_assignments([], _Columns, _Scope, Acc) ->
     {ok, lists:reverse(Acc)};
-bind_assignments([{NameStr, Expr} | T], Columns, Acc) ->
-    case resolve_column(NameStr, Columns) of
+bind_assignments([{NameStr, Expr} | T], Columns, Scope, Acc) ->
+    case resolve_column(NameStr, Scope) of
         {error, Reason} ->
             {error, Reason};
-        {ok, #column{name = Name, type = Type, position = Pos}} ->
-            case bind_expr(Expr, Columns) of
+        {ok, #sc{name = Name, type = Type, pos = Pos}} ->
+            case bind_expr(Expr, Scope) of
                 {error, Reason} ->
                     {error, Reason};
                 %% 定数ならこの場で型を検査できる
                 {ok, {const, V}} ->
                     case sql_type:check(Type, V) of
-                        ok -> bind_assignments(T, Columns, [{Pos, {const, V}} | Acc]);
+                        ok -> bind_assignments(T, Columns, Scope, [{Pos, {const, V}} | Acc]);
                         {error, Reason} -> {error, {Reason, Name, Type, V}}
                     end;
                 %% 式は行ごとに値が決まるので、検査は実行時
                 {ok, Bound} ->
-                    bind_assignments(T, Columns, [{Pos, Bound} | Acc])
+                    bind_assignments(T, Columns, Scope, [{Pos, Bound} | Acc])
             end
     end.
 
@@ -497,10 +555,10 @@ bind_where(Expr, Columns) ->
 
 bind_expr(#const{value = Value}, _Columns) ->
     {ok, {const, Value}};
-bind_expr(#col_ref{name = NameStr}, Columns) ->
-    case resolve_column(NameStr, Columns) of
+bind_expr(#col_ref{table = Q, name = NameStr}, Columns) ->
+    case resolve_column(Q, NameStr, Columns) of
         {error, Reason} -> {error, Reason};
-        {ok, #column{position = Pos}} -> {ok, {ref, Pos}}
+        {ok, #sc{pos = Pos}} -> {ok, {ref, Pos}}
     end;
 bind_expr(#binop{op = Op, left = L, right = R}, Columns) ->
     case bind_pair(L, R, Columns) of
@@ -574,16 +632,34 @@ resolve_table(NameStr) ->
             end
     end.
 
-resolve_column(NameStr, Columns) ->
+%% 修飾なしの名前は、スコープ全体で1つに定まる必要がある。
+%% 複数のテーブルに同じ名前があれば ambiguous_column。
+resolve_column(NameStr, Scope) ->
+    resolve_column(undefined, NameStr, Scope).
+
+resolve_column(Qualifier, NameStr, Scope) ->
     case to_existing_atom(NameStr) of
         error ->
             {error, {column_not_found, NameStr}};
         {ok, Name} ->
-            case lists:keyfind(Name, #column.name, Columns) of
-                false -> {error, {column_not_found, NameStr}};
-                #column{} = C -> {ok, C}
+            Matches = [S || #sc{alias = A, name = N} = S <- Scope,
+                            N =:= Name,
+                            Qualifier =:= undefined orelse matches_alias(Qualifier, A)],
+            case Matches of
+                [C] -> {ok, C};
+                [] -> {error, {column_not_found, qualified(Qualifier, NameStr)}};
+                _ -> {error, {ambiguous_column, NameStr}}
             end
     end.
+
+matches_alias(Qualifier, Alias) ->
+    case to_existing_atom(Qualifier) of
+        {ok, A} -> A =:= Alias;
+        error -> false
+    end.
+
+qualified(undefined, Name) -> Name;
+qualified(Q, Name) -> Q ++ "." ++ Name.
 
 resolve_columns(NameStrs, Columns) ->
     resolve_columns(NameStrs, Columns, []).
@@ -596,8 +672,8 @@ resolve_columns([NameStr | T], Columns, Acc) ->
         {ok, C} -> resolve_columns(T, Columns, [C | Acc])
     end.
 
-names(Columns) ->
-    [C#column.name || C <- Columns].
+names(Scope) ->
+    [S#sc.name || S <- Scope].
 
 duplicate_names(Names) ->
     lists:usort(Names -- lists:usort(Names)).

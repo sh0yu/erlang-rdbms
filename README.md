@@ -161,7 +161,7 @@ DROP TABLE t;
 INSERT INTO t [(c, ...)] VALUES (v, ...);
 UPDATE t SET c = expr, ... [WHERE expr];
 DELETE FROM t [WHERE expr];
-SELECT [DISTINCT] * | expr, ... FROM t [WHERE expr]
+SELECT [DISTINCT] * | expr, ... FROM from_item [WHERE expr]
   [GROUP BY expr, ...] [HAVING expr]
   [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
   [LIMIT n] [OFFSET n];
@@ -421,7 +421,9 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
 - `CREATE TABLE` / `DROP TABLE` は暗黙のトランザクションとして実行される。
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
-- JOIN・副問い合わせ・`UNION`・ウィンドウ関数は未実装
+- 副問い合わせ・`UNION`・ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
+- 結合は入れ子ループのみ。右側は左の行ごとに読み直すため開始時にメモリへ載せる
+  (ハッシュ結合は未実装)
 - 集約は NULL を入力から外す(`COUNT(*)` だけが例外)。
   空集合では `COUNT` が 0、それ以外は NULL を返す
 - `SELECT` は常に全表走査。索引を使うアクセスパス選択はプランナ未実装のため

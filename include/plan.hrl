@@ -19,6 +19,17 @@
     input
 }).
 
+%% 入れ子ループ結合(⋈)。
+%% type は inner | left | cross。
+%% 右側は左の行ごとに読み直すので、開始時にメモリへ載せる。
+-record(p_nl_join, {
+    type = inner,
+    pred = undefined,
+    left,
+    right,
+    right_width = 0     % LEFT JOIN で埋めるNULLの個数
+}).
+
 %% 集約(γ)。
 %% 出力行は [グループキー..., 集約結果...] の順に並ぶ。
 %% having は集約後の行に対する述語。

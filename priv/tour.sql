@@ -127,9 +127,35 @@ SELECT COUNT(DISTINCT ripe) FROM fruit;
 SELECT name FROM fruit GROUP BY ripe;
 COMMIT;
 
+-- ============ JOIN ============
+-- DDLはトランザクションの外で
+CREATE TABLE box (fruit VARCHAR, qty INTEGER);
+
+BEGIN;
+INSERT INTO box VALUES ('apple', 5);
+INSERT INTO box VALUES ('banana', 3);
+INSERT INTO box VALUES ('durian', 1);
+
+SELECT f.name, b.qty FROM fruit f JOIN box b ON f.name = b.fruit;
+
+-- 一致しない左の行はNULLで埋めて残る
+SELECT f.name, b.qty FROM fruit f LEFT JOIN box b ON f.name = b.fruit;
+
+-- カンマ区切りは直積
+SELECT f.name, b.fruit FROM fruit f, box b;
+
+-- 結合の上に WHERE / GROUP BY / ORDER BY を重ねられる
+SELECT f.name, b.qty FROM fruit f JOIN box b ON f.name = b.fruit WHERE b.qty > 2;
+SELECT COUNT(*) FROM fruit f JOIN box b ON f.name = b.fruit;
+
+-- 修飾しないと決まらない名前は弾かれる
+SELECT name FROM fruit f JOIN box b ON f.name = b.fruit;
+COMMIT;
+
+DROP TABLE box;
+
 -- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
 BEGIN;
-SELECT * FROM fruit a JOIN fruit b ON a.name = b.name;
 SELECT * FROM fruit WHERE price = (SELECT price FROM fruit);
 COMMIT;
 

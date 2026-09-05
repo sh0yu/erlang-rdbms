@@ -268,6 +268,8 @@ format_error({duplicate_columns, Names}) ->
     io_lib:format("duplicate columns: ~ts", [lists:join(", ", Names)]);
 format_error(column_count_mismatch) ->
     "number of values does not match the number of columns";
+format_error({ambiguous_column, Name}) ->
+    io_lib:format("column reference ~ts is ambiguous (qualify it, e.g. t.~ts)", [Name, Name]);
 format_error({not_grouped, Name}) ->
     io_lib:format("column ~ts must appear in GROUP BY or be used in an aggregate", [Name]);
 format_error(not_grouped) ->

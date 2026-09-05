@@ -68,6 +68,7 @@ column_names(#p_sort{input = In}) -> column_names(In);
 column_names(#p_limit{input = In}) -> column_names(In);
 column_names(#p_distinct{input = In}) -> column_names(In);
 column_names(#p_agg{}) -> [];
+column_names(#p_nl_join{left = L, right = R}) -> column_names(L) ++ column_names(R);
 column_names(#p_seq_scan{schema = Schema}) -> Schema.
 
 drain(Op, Acc) ->
@@ -117,6 +118,30 @@ open(#p_distinct{input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = distinct, st = {sets:new([{version, 2}]), Child}}
+    end;
+%% 入れ子ループ結合。
+%% 右側は左の行ごとに読み直すので、開始時にメモリへ載せる
+%% (走査カーソルは一度しか流せないため)。
+open(#p_nl_join{type = Type, pred = Pred, left = L, right = R, right_width = W}, Ctx) ->
+    case open(L, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        Left ->
+            case open(R, Ctx) of
+                {error, Reason} ->
+                    {error, Reason};
+                Right ->
+                    case collect(Right, []) of
+                        {error, Reason} ->
+                            {error, Reason};
+                        {ok, Rows} ->
+                            close(Right),
+                            #op{kind = nl_join,
+                                st = #{type => Type, pred => Pred, left => Left,
+                                       rows => Rows, rest => [], cur => undefined,
+                                       matched => false, width => W}}
+                    end
+            end
     end;
 %% 集約もブロッキング演算子。入力を読み切ってグループごとにまとめる。
 open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) ->
@@ -193,6 +218,10 @@ next(#op{kind = filter, st = {Pred, Child}} = Op) ->
             end
     end;
 
+%% 左の行を1つ取り、右の行を順に当てる。
+next(#op{kind = nl_join, st = St} = Op) ->
+    nl_next(Op, St);
+
 %% 並べ替え済みの行を1件ずつ返す
 next(#op{kind = sorted, st = []} = Op) ->
     {eof, Op};
@@ -227,6 +256,33 @@ next(#op{kind = project, st = {Exprs, Child}} = Op) ->
             Out = [sql_expr:eval(E, Row) || E <- Exprs],
             {row, Out, Op#op{st = {Exprs, Child2}}}
     end.
+
+%% 右側を出し切ったら次の左の行へ。
+%% LEFT JOIN で1件も一致しなかった左の行は、右をNULLで埋めて返す。
+nl_next(Op, #{cur := undefined, left := Left} = St) ->
+    case next(Left) of
+        {eof, Left2} ->
+            {eof, Op#op{st = St#{left => Left2}}};
+        {row, Row, Left2} ->
+            nl_next(Op, St#{left => Left2, cur => Row,
+                            rest => maps:get(rows, St), matched => false})
+    end;
+nl_next(Op, #{rest := [], type := left, matched := false,
+              cur := Cur, width := W} = St) ->
+    %% 一致が無かったので NULL で埋めて1行返す
+    Padded = list_to_tuple(tuple_to_list(Cur) ++ lists:duplicate(W, null)),
+    {row, Padded, Op#op{st = St#{cur => undefined, matched => true}}};
+nl_next(Op, #{rest := []} = St) ->
+    nl_next(Op, St#{cur => undefined});
+nl_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
+    Joined = concat_rows(Cur, R),
+    case sql_expr:eval_pred(Pred, Joined) of
+        true -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true}}};
+        false -> nl_next(Op, St#{rest => Rest})
+    end.
+
+concat_rows(A, B) ->
+    list_to_tuple(tuple_to_list(A) ++ tuple_to_list(B)).
 
 limit_next(#op{st = {0, _Offset, _Child}} = Op) ->
     {eof, Op};
@@ -340,5 +396,7 @@ close(#op{kind = limit, st = {_C, _O, Child}}) ->
     close(Child);
 close(#op{kind = distinct, st = {_Seen, Child}}) ->
     close(Child);
+close(#op{kind = nl_join, st = #{left := Left}}) ->
+    close(Left);
 close({error, _}) ->
     ok.
