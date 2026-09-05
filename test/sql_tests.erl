@@ -84,7 +84,7 @@ select_cases(_) ->
              {"select * from FRUIT where PRICE = 300",
               [[grape,300]]}],
         [begin
-             {ok, Rows} = q(C, Sql),
+             {ok, _Cols, Rows} = q(C, Sql),
              ?assertEqual(lists:sort(Expected), lists:sort(Rows))
          end || {Sql, Expected} <- Cases],
         ok
@@ -105,10 +105,10 @@ sees_uncommitted_changes(_) ->
     fun() ->
         C = fixture(),
         {ok, _} = query_exec:exec_query(C, {insert, fruit, [melon, 400]}),
-        {ok, Rows} = q(C, "SELECT * FROM fruit WHERE price = 400"),
+        {ok, _Cols, Rows} = q(C, "SELECT * FROM fruit WHERE price = 400"),
         ?assertEqual([[melon, 400]], Rows),
         {ok, 1} = query_exec:exec_query(C, {delete, fruit, name, apple}),
-        {ok, Rows2} = q(C, "SELECT * FROM fruit WHERE price = 100"),
+        {ok, _Cols2, Rows2} = q(C, "SELECT * FROM fruit WHERE price = 100"),
         ?assertEqual([], Rows2)
     end.
 
@@ -118,7 +118,8 @@ sees_uncommitted_changes(_) ->
 string_literal_does_not_match_atom(_) ->
     fun() ->
         C = fixture(),
-        ?assertEqual({ok, []}, q(C, "SELECT * FROM fruit WHERE name = 'banana'"))
+        ?assertMatch({ok, _, []},
+                     q(C, "SELECT * FROM fruit WHERE name = 'banana'"))
     end.
 
 %% まだ受理しない構文が、黙って無視されるのではなく構文エラーになること

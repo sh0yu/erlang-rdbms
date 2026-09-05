@@ -24,6 +24,69 @@ make test   # EUnitを実行
 make shell
 ```
 
+### SQLシェル
+
+対話クライアントが付いている。
+
+```sh
+bin/sqlsh              # 対話シェルを開く
+bin/sqlsh --tour       # 同梱のツアー(priv/tour.sql)を流す
+bin/sqlsh FILE.sql     # ファイルの文を順に実行する
+```
+
+Erlangシェルからも起動できる。
+
+```erlang
+sql_shell:start().                      %% 対話
+sql_shell:run_file("priv/tour.sql").    %% ファイル
+sql_shell:start(#{data_dir => "/tmp/x"}).  %% データの置き場所を変える
+```
+
+```
+transaction_db SQL shell
+Type \? for help, \q to quit.  Statements end with ';'.
+
+sql> CREATE TABLE emp (id INTEGER, name VARCHAR, active BOOLEAN);
+OK
+sql> \d emp
+ column | type
+--------+---------
+ id     | INTEGER
+ name   | VARCHAR
+ active | BOOLEAN
+sql> BEGIN;
+OK
+sql> INSERT INTO emp VALUES (1, 'ada', true);
+OK (1 row inserted, oid={1788620056707150971,4})
+sql> INSERT INTO emp (id) VALUES (3);
+OK (1 row inserted, oid={1788620056707350428,8})
+sql> SELECT * FROM emp;
+ id | name | active
+----+------+-------
+ 1  | ada  | true
+ 3  | NULL | NULL
+(2 rows)
+sql> COMMIT;
+OK
+```
+
+メタコマンド:
+
+| | |
+| --- | --- |
+| `\?` `\h` | ヘルプ |
+| `\d` | テーブル一覧 |
+| `\d NAME` | テーブル定義 |
+| `\timing` | 実行時間の表示を切り替える |
+| `\q` | 終了 |
+
+文は `;` で区切る。空行でも溜まっている文を実行する。
+データは `./data` に置かれる(消すには `rm -rf data`)。
+
+`priv/tour.sql` は機能をひととおりなぞるスクリプトで、
+成功する例だけでなく、型の不一致・未対応構文・トランザクション外のDMLなど
+**エラーの出方も含めて**確認できるようにしてある。
+
 ### 使ってみる
 
 ```erlang

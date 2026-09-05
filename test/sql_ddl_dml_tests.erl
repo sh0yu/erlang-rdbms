@@ -57,7 +57,8 @@ insert_and_select(_) ->
     fun() ->
         C = fixture(),
         ?assertMatch({ok, _}, q(C, "INSERT INTO t VALUES ('x', 1, true)")),
-        ?assertEqual({ok, [[<<"x">>, 1, true]]}, q(C, "SELECT * FROM t"))
+        ?assertMatch({ok, _, [[<<"x">>, 1, true]]},
+                     q(C, "SELECT * FROM t"))
     end.
 
 insert_with_column_list(_) ->
@@ -65,14 +66,16 @@ insert_with_column_list(_) ->
         C = fixture(),
         %% 宣言順と違う順序でも、カラム名どおりに入ること
         ?assertMatch({ok, _}, q(C, "INSERT INTO t (b, a) VALUES (7, 'y')")),
-        ?assertEqual({ok, [[<<"y">>, 7, null]]}, q(C, "SELECT * FROM t"))
+        ?assertMatch({ok, _, [[<<"y">>, 7, null]]},
+                     q(C, "SELECT * FROM t"))
     end.
 
 omitted_columns_become_null(_) ->
     fun() ->
         C = fixture(),
         ?assertMatch({ok, _}, q(C, "INSERT INTO t (a) VALUES ('z')")),
-        ?assertEqual({ok, [[<<"z">>, null, null]]}, q(C, "SELECT * FROM t"))
+        ?assertMatch({ok, _, [[<<"z">>, null, null]]},
+                     q(C, "SELECT * FROM t"))
     end.
 
 insert_checks_types(_) ->
@@ -83,7 +86,8 @@ insert_checks_types(_) ->
         ?assertEqual({error, {type_mismatch, a, varchar, 1}},
                      q(C, "INSERT INTO t VALUES (1, 1, true)")),
         %% 何も入っていないこと
-        ?assertEqual({ok, []}, q(C, "SELECT * FROM t"))
+        ?assertMatch({ok, _, []},
+                     q(C, "SELECT * FROM t"))
     end.
 
 insert_rejects_wrong_arity(_) ->
@@ -109,7 +113,8 @@ negative_literals(_) ->
     fun() ->
         C = fixture(),
         ?assertMatch({ok, _}, q(C, "INSERT INTO t VALUES ('n', -42, false)")),
-        ?assertEqual({ok, [[<<"n">>, -42, false]]}, q(C, "SELECT * FROM t WHERE b = -42"))
+        ?assertMatch({ok, _, [[<<"n">>, -42, false]]},
+                     q(C, "SELECT * FROM t WHERE b = -42"))
     end.
 
 %%%===================================================================
@@ -120,14 +125,15 @@ update_all_and_filtered(_) ->
     fun() ->
         C = seeded(),
         ?assertEqual({ok, 1}, q(C, "UPDATE t SET b = 99 WHERE a = 'x'")),
-        ?assertEqual({ok, [[<<"x">>, 99, true]]}, q(C, "SELECT * FROM t WHERE a = 'x'")),
+        ?assertMatch({ok, _, [[<<"x">>, 99, true]]},
+                     q(C, "SELECT * FROM t WHERE a = 'x'")),
         %% WHERE なしは全件
         ?assertEqual({ok, 3}, q(C, "UPDATE t SET b = 0")),
-        {ok, Rows} = q(C, "SELECT * FROM t"),
+        {ok, _Cols, Rows} = q(C, "SELECT * FROM t"),
         ?assertEqual([0, 0, 0], [B || [_, B, _] <- Rows]),
         %% 複数カラムの代入
         ?assertEqual({ok, 3}, q(C, "UPDATE t SET b = 1, c = false")),
-        {ok, Rows2} = q(C, "SELECT * FROM t"),
+        {ok, _Cols2, Rows2} = q(C, "SELECT * FROM t"),
         ?assertEqual([{1, false}, {1, false}, {1, false}],
                      [{B, Cc} || [_, B, Cc] <- Rows2])
     end.
@@ -138,7 +144,7 @@ update_checks_types(_) ->
         ?assertEqual({error, {type_mismatch, b, integer, <<"no">>}},
                      q(C, "UPDATE t SET b = 'no'")),
         %% 何も変わっていないこと
-        {ok, Rows} = q(C, "SELECT * FROM t"),
+        {ok, _Cols, Rows} = q(C, "SELECT * FROM t"),
         ?assertEqual(3, length(Rows))
     end.
 
@@ -163,7 +169,8 @@ transaction_control_via_sql(_) ->
         {ok, _} = q(C, "INSERT INTO t VALUES (1)"),
         ok = q(C, "COMMIT"),
         ok = q(C, "BEGIN"),
-        ?assertEqual({ok, [[1]]}, q(C, "SELECT * FROM t")),
+        ?assertMatch({ok, _, [[1]]},
+                     q(C, "SELECT * FROM t")),
         ok = q(C, "COMMIT")
     end.
 
@@ -175,7 +182,8 @@ rollback_via_sql(_) ->
         {ok, _} = q(C, "INSERT INTO t VALUES (1)"),
         ok = q(C, "ROLLBACK"),
         ok = q(C, "BEGIN"),
-        ?assertEqual({ok, []}, q(C, "SELECT * FROM t")),
+        ?assertMatch({ok, _, []},
+                     q(C, "SELECT * FROM t")),
         ok = q(C, "COMMIT")
     end.
 
@@ -188,7 +196,8 @@ rollback_via_sql(_) ->
 varchar_column_matches_string_literal(_) ->
     fun() ->
         C = seeded(),
-        ?assertEqual({ok, [[<<"x">>, 1, true]]}, q(C, "SELECT * FROM t WHERE a = 'x'"))
+        ?assertMatch({ok, _, [[<<"x">>, 1, true]]},
+                     q(C, "SELECT * FROM t WHERE a = 'x'"))
     end.
 
 %% 型宣言のない古いタプルAPIのテーブルは any 型になり、
@@ -199,8 +208,10 @@ untyped_table_still_works(_) ->
         ok = query_exec:exec_query(C, {create_table, old, [name, price]}),
         ok = q(C, "BEGIN"),
         {ok, _} = query_exec:exec_query(C, {insert, old, [apple, 100]}),
-        ?assertEqual({ok, [[apple, 100]]}, q(C, "SELECT * FROM old WHERE price = 100")),
-        ?assertEqual({ok, []}, q(C, "SELECT * FROM old WHERE name = 'apple'"))
+        ?assertMatch({ok, _, [[apple, 100]]},
+                     q(C, "SELECT * FROM old WHERE price = 100")),
+        ?assertMatch({ok, _, []},
+                     q(C, "SELECT * FROM old WHERE name = 'apple'"))
     end.
 
 %% Halloween problem: 更新した行を走査が拾い直して延々と更新し続けないこと。
@@ -214,7 +225,7 @@ update_does_not_loop_on_its_own_writes(_) ->
         %% 1 -> 2 に更新する。パイプライン実行だと 2 を拾い直して
         %% 条件を外れるまで加算し続ける形の典型
         ?assertEqual({ok, 3}, q(C, "UPDATE n SET v = 2 WHERE v = 1")),
-        {ok, Rows} = q(C, "SELECT * FROM n"),
+        {ok, _Cols, Rows} = q(C, "SELECT * FROM n"),
         ?assertEqual([[2], [2], [2]], Rows)
     end.
 
@@ -236,7 +247,7 @@ seeded() ->
     C.
 
 count(C) ->
-    {ok, Rows} = q(C, "SELECT * FROM t"),
+    {ok, _Cols, Rows} = q(C, "SELECT * FROM t"),
     {ok, length(Rows)}.
 
 connect() ->

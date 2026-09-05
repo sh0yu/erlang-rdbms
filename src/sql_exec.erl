@@ -37,8 +37,13 @@
 -opaque ctx() :: #ctx{}.
 
 %%----------------------------------------------------------------------
-%% @doc プランを最後まで走らせて結果の行(リスト)を返す。
+%% @doc プランを最後まで走らせて結果セットを返す。
+%%
 %% Ctx は {ScanOpenFun, ScanNextFun}。
+%% Returns: {ok, ColumnNames, Rows} | {error, Reason}
+%%
+%% カラム名を一緒に返すのは、結果セットが「名前つきの列の並び」だから。
+%% クライアントが見出しを出すのに要る。
 %%----------------------------------------------------------------------
 run(Plan, {ScanOpen, ScanNext}) ->
     Ctx = #ctx{scan_open = ScanOpen, scan_next = ScanNext},
@@ -47,11 +52,19 @@ run(Plan, {ScanOpen, ScanNext}) ->
             {error, Reason};
         Op ->
             try
-                drain(Op, [])
+                case drain(Op, []) of
+                    {ok, Rows} -> {ok, column_names(Plan), Rows};
+                    {error, Reason} -> {error, Reason}
+                end
             after
                 close(Op)
             end
     end.
+
+%% プランの最上位が出力するカラム名。
+column_names(#p_project{names = Names}) -> Names;
+column_names(#p_filter{input = In}) -> column_names(In);
+column_names(#p_seq_scan{schema = Schema}) -> Schema.
 
 drain(Op, Acc) ->
     case next(Op) of
