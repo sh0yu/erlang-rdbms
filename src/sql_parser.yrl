@@ -28,6 +28,7 @@ Nonterminals
     select_stmt create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
     select_list select_item table_ref opt_where expr literal
     neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
+    opt_group opt_having expr_list func_call
     column_defs column_def type_name
     opt_column_names column_names
     value_list
@@ -45,6 +46,7 @@ Terminals
     'and' 'or' 'not' 'is'
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
+    'group' 'having'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
 
@@ -155,10 +157,21 @@ delete_stmt -> delete from identifier opt_where :
 %%% SELECT
 %%%===================================================================
 
-select_stmt -> select opt_distinct select_list from table_ref opt_where opt_order opt_limit :
-    {Limit, Offset} = '$8',
+select_stmt -> select opt_distinct select_list from table_ref opt_where
+               opt_group opt_having opt_order opt_limit :
+    {Limit, Offset} = '$10',
     #select_stmt{distinct = '$2', columns = '$3', from = '$5', where = '$6',
-                 order_by = '$7', limit = Limit, offset = Offset}.
+                 group_by = '$7', having = '$8', order_by = '$9',
+                 limit = Limit, offset = Offset}.
+
+opt_group -> '$empty'                : [].
+opt_group -> 'group' 'by' expr_list  : '$3'.
+
+opt_having -> '$empty'      : undefined.
+opt_having -> 'having' expr : '$2'.
+
+expr_list -> expr               : ['$1'].
+expr_list -> expr ',' expr_list : ['$1' | '$3'].
 
 opt_distinct -> '$empty'   : false.
 opt_distinct -> 'distinct' : true.
@@ -227,7 +240,17 @@ expr -> expr '-' expr : #binop{op = '-', left = '$1', right = '$3'}.
 expr -> expr '*' expr : #binop{op = '*', left = '$1', right = '$3'}.
 expr -> expr '/' expr : #binop{op = '/', left = '$1', right = '$3'}.
 
+expr -> func_call     : '$1'.
 expr -> neg expr      : #unop{op = '-', arg = '$2'}.
+
+%% 関数名は予約語にしていない。未知の関数は意味解析で弾く。
+%% 予約語を減らすほど、count や order という名前のカラムが作れる。
+func_call -> identifier '(' '*' ')' :
+    #func{name = value_of('$1'), args = star}.
+func_call -> identifier '(' expr ')' :
+    #func{name = value_of('$1'), args = ['$3']}.
+func_call -> identifier '(' 'distinct' expr ')' :
+    #func{name = value_of('$1'), args = ['$4'], distinct = true}.
 expr -> '(' expr ')'  : '$2'.
 expr -> identifier    : #col_ref{name = value_of('$1')}.
 expr -> literal       : '$1'.

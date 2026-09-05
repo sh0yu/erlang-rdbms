@@ -19,6 +19,23 @@
     input
 }).
 
+%% 集約(γ)。
+%% 出力行は [グループキー..., 集約結果...] の順に並ぶ。
+%% having は集約後の行に対する述語。
+-record(p_agg, {
+    group_by = [],
+    aggs = [],
+    having = undefined,
+    input
+}).
+
+%% 集約1つ分。func は count_star|count|sum|avg|min|max。
+-record(agg, {
+    func,
+    arg = undefined,
+    distinct = false
+}).
+
 %% 並べ替え(τ)。keys は [{式, asc|desc, nulls_first|nulls_last}]。
 %% limit を持つときは全件を並べずに上位N件だけ保つ(Top-N)。
 -record(p_sort, {

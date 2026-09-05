@@ -67,6 +67,7 @@ column_names(#p_filter{input = In}) -> column_names(In);
 column_names(#p_sort{input = In}) -> column_names(In);
 column_names(#p_limit{input = In}) -> column_names(In);
 column_names(#p_distinct{input = In}) -> column_names(In);
+column_names(#p_agg{}) -> [];
 column_names(#p_seq_scan{schema = Schema}) -> Schema.
 
 drain(Op, Acc) ->
@@ -116,6 +117,23 @@ open(#p_distinct{input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = distinct, st = {sets:new([{version, 2}]), Child}}
+    end;
+%% 集約もブロッキング演算子。入力を読み切ってグループごとにまとめる。
+open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) ->
+    case open(Input, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        Child ->
+            case collect(Child, []) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Rows} ->
+                    %% 上位の演算子(並べ替え・射影)は行をタプルとして扱う。
+                    %% 束縛済みの式が位置参照で、element/2 で引くため。
+                    Out = [list_to_tuple(R) || R <- aggregate(Keys, Aggs, Rows)],
+                    #op{kind = sorted,
+                        st = [R || R <- Out, sql_expr:eval_pred(Having, R)]}
+            end
     end.
 
 %% 入力を読み切る。並べ替えのようなブロッキング演算子で使う。
@@ -225,6 +243,86 @@ limit_next(#op{st = {Count, 0, Child}} = Op) ->
 
 decr(undefined) -> undefined;
 decr(N) -> N - 1.
+
+%%%===================================================================
+%%% 集約
+%%%===================================================================
+
+%% グループごとにまとめて [キー..., 集約結果...] の行を返す。
+%%
+%% グループの出現順を保つ。SQLに順序の保証は無いが、決まっていないと
+%% テストが書けないため。
+aggregate([], Aggs, Rows) ->
+    %% GROUP BY が無い場合は全体で1グループ。
+    %% 入力が空でも1行返る(COUNT(*) が 0 を返すため)。
+    [[finish(A, acc_rows(A, Rows)) || A <- Aggs]];
+aggregate(Keys, Aggs, Rows) ->
+    Grouped = group_rows(Keys, Rows),
+    [KeyVals ++ [finish(A, acc_rows(A, GroupRows)) || A <- Aggs]
+     || {KeyVals, GroupRows} <- Grouped].
+
+group_rows(Keys, Rows) ->
+    {Order, Map} =
+        lists:foldl(
+          fun(Row, {Ord, M}) ->
+                  Vals = [sql_expr:eval(K, Row) || K <- Keys],
+                  %% グルーピングのキーは group_key/1 を通す。
+                  %% NULL同士は同じ組、100 と 100.0 も同じ組にする。
+                  GKey = [sql_value:group_key(V) || V <- Vals],
+                  case maps:is_key(GKey, M) of
+                      true -> {Ord, maps:update_with(GKey, fun({V, Rs}) -> {V, [Row | Rs]} end, M)};
+                      false -> {[GKey | Ord], M#{GKey => {Vals, [Row]}}}
+                  end
+          end, {[], #{}}, Rows),
+    [begin {Vals, Rs} = maps:get(K, Map), {Vals, lists:reverse(Rs)} end
+     || K <- lists:reverse(Order)].
+
+%% そのグループの行から、集約に使う値を取り出す。
+acc_rows(#agg{func = count_star}, Rows) ->
+    length(Rows);
+acc_rows(#agg{arg = Arg, distinct = Dist}, Rows) ->
+    %% NULLは集約の対象から外す(COUNT(*) 以外はすべてこの規則)
+    Vals = [V || Row <- Rows, (V = sql_expr:eval(Arg, Row)) =/= null],
+    case Dist of
+        false -> Vals;
+        true -> distinct_values(Vals)
+    end.
+
+distinct_values(Vals) ->
+    {_, Out} = lists:foldl(fun(V, {Seen, Acc}) ->
+                                   K = sql_value:group_key(V),
+                                   case sets:is_element(K, Seen) of
+                                       true -> {Seen, Acc};
+                                       false -> {sets:add_element(K, Seen), [V | Acc]}
+                                   end
+                           end, {sets:new([{version, 2}]), []}, Vals),
+    lists:reverse(Out).
+
+%% 空集合の扱い: COUNT は 0、それ以外は NULL。
+%% 「グループが空でないのに SUM が NULL」という非対称はSQLの規則。
+finish(#agg{func = count_star}, N) -> N;
+finish(#agg{func = count}, Vals) -> length(Vals);
+finish(#agg{func = sum}, []) -> null;
+finish(#agg{func = sum}, Vals) -> lists:foldl(fun(V, A) -> sql_value:arith('+', A, V) end,
+                                              hd(Vals), tl(Vals));
+finish(#agg{func = avg}, []) -> null;
+finish(#agg{func = avg}, Vals) ->
+    Sum = lists:foldl(fun(V, A) -> sql_value:arith('+', A, V) end, hd(Vals), tl(Vals)),
+    sql_value:arith('/', Sum, length(Vals));
+finish(#agg{func = min}, []) -> null;
+finish(#agg{func = min}, Vals) -> extreme(lt, Vals);
+finish(#agg{func = max}, []) -> null;
+finish(#agg{func = max}, Vals) -> extreme(gt, Vals).
+
+%% 比較は sql_value:compare/2 を通す。Erlangの項順序では型をまたぐと
+%% SQLの順序と食い違う。
+extreme(Want, [H | T]) ->
+    lists:foldl(fun(V, Best) ->
+                        case sql_value:compare(V, Best) of
+                            Want -> V;
+                            _ -> Best
+                        end
+                end, H, T).
 
 %%%===================================================================
 %%% close

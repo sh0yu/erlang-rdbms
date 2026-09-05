@@ -64,9 +64,19 @@ analyze(#select_stmt{from = #table_ref{name = TableStr}} = Stmt) ->
 %%% SELECT
 %%%===================================================================
 
-bind_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
-                        distinct = Distinct, limit = Limit, offset = Offset},
-            Table, Columns) ->
+bind_select(#select_stmt{group_by = G, having = H} = Stmt, Table, Columns)
+  when G =/= []; H =/= undefined ->
+    bind_grouped_select(Stmt, Table, Columns);
+bind_select(#select_stmt{columns = Cols} = Stmt, Table, Columns) ->
+    case has_aggregate(Cols) of
+        %% GROUP BY が無くても集約があれば、全体を1グループとして集約する
+        true -> bind_grouped_select(Stmt, Table, Columns);
+        false -> bind_plain_select(Stmt, Table, Columns)
+    end.
+
+bind_plain_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
+                              distinct = Distinct, limit = Limit, offset = Offset},
+                  Table, Columns) ->
     case bind_where(Where, Columns) of
         {error, Reason} ->
             {error, Reason};
@@ -92,6 +102,220 @@ bind_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
                     end
             end
     end.
+
+%%%===================================================================
+%%% 集約つきSELECT
+%%%
+%%% 集約の出力行は [グループキー..., 集約結果...] の順に並ぶ。
+%%% 射影・HAVING・ORDER BY はこの位置を参照する形に書き換える。
+%%%===================================================================
+
+bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group,
+                                 having = Having, order_by = Order,
+                                 distinct = Distinct, limit = Limit, offset = Offset},
+                    Table, Columns) ->
+    with_ok(
+      [fun() -> bind_where(Where, Columns) end,
+       fun() -> bind_all(Group, Columns) end],
+      fun([Pred, Keys]) ->
+              %% 射影とHAVINGの中の集約を集めて、参照に置き換える
+              Ctx0 = #{keys => Keys, aggs => [], columns => Columns},
+              case rewrite_items(Cols, Ctx0) of
+                  {error, Reason} ->
+                      {error, Reason};
+                  {ok, Exprs, Names, Ctx1} ->
+                      case rewrite_having(Having, Ctx1) of
+                          {error, Reason} ->
+                              {error, Reason};
+                          {ok, BHaving, #{aggs := Aggs}} ->
+                              Scan = #p_seq_scan{table = Table, schema = names(Columns)},
+                              Agg = #p_agg{group_by = Keys, aggs = lists:reverse(Aggs),
+                                           having = BHaving,
+                                           input = wrap_filter(Pred, Scan)},
+                              %% 並べ替えは集約と射影の**間**に置く。
+                              %% ORDER BY のキーは集約後の行の位置を指しており、
+                              %% 射影の後(出力行)ではその位置が変わる。
+                              case bind_order_after_agg(Order, Ctx1) of
+                                  {error, Reason} ->
+                                      {error, Reason};
+                                  {ok, SortKeys} ->
+                                      Sorted = wrap_sort_after(SortKeys, Agg),
+                                      Proj = #p_project{exprs = Exprs, names = Names,
+                                                        input = Sorted},
+                                      D = wrap_distinct(Distinct, Proj),
+                                      {ok, {select, wrap_limit(Limit, Offset, SortKeys, D)}}
+                              end
+                      end
+              end
+      end).
+
+%% 集約の後ろに置く並べ替えは、射影済みの行に対して働く。
+wrap_sort_after([], Node) -> Node;
+wrap_sort_after(Keys, Node) -> #p_sort{keys = Keys, input = Node}.
+
+%% 射影の各項目を、集約後の行を指す形に書き換える。
+rewrite_items(Items, Ctx) ->
+    rewrite_items(Items, Ctx, [], []).
+
+rewrite_items([], Ctx, Exprs, Names) ->
+    {ok, lists:reverse(Exprs), lists:reverse(Names), Ctx};
+rewrite_items([#star{} | _], _Ctx, _E, _N) ->
+    {error, star_with_group_by};
+rewrite_items([Item | T], Ctx, Exprs, Names) ->
+    case rewrite(Item, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Bound, Ctx2} ->
+            rewrite_items(T, Ctx2, [Bound | Exprs],
+                          [projection_name(Item, length(Exprs) + 1) | Names])
+    end.
+
+rewrite_having(undefined, Ctx) ->
+    {ok, undefined, Ctx};
+rewrite_having(Expr, Ctx) ->
+    case rewrite(Expr, Ctx) of
+        {error, Reason} -> {error, Reason};
+        {ok, Bound, Ctx2} -> {ok, Bound, Ctx2}
+    end.
+
+%% 式を集約後の行を指す形に書き換える。
+%%   集約呼び出し  -> 集約結果の位置への参照
+%%   GROUP BY のキーと一致する式 -> キーの位置への参照
+%%   それ以外のカラム参照 -> エラー(どの行の値か決まらない)
+rewrite(#func{} = F, Ctx) ->
+    add_aggregate(F, Ctx);
+rewrite(#const{value = V}, Ctx) ->
+    {ok, {const, V}, Ctx};
+rewrite(Expr, Ctx) ->
+    case contains_func(Expr) of
+        %% 集約を含む式は元のカラムには束縛できない。
+        %% (bind_expr は #func{} を知らない)
+        true ->
+            rewrite_children(Expr, undefined, Ctx);
+        false ->
+            rewrite_grouped(Expr, Ctx)
+    end.
+
+%% 集約を含まない式は、GROUP BY のキーと一致すればその位置を指す。
+%% 一致しなければ「どの行の値か決まらない」のでエラー。
+rewrite_grouped(Expr, #{keys := Keys, columns := Columns} = Ctx) ->
+    case bind_expr(Expr, Columns) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Bound} ->
+            case index_of_key(Bound, Keys) of
+                {ok, Pos} -> {ok, {ref, Pos}, Ctx};
+                not_found -> rewrite_children(Expr, Bound, Ctx)
+            end
+    end.
+
+%% GROUP BY に無い式でも、中の部分式が集約なら書き換えられる
+%% (例: COUNT(*) + 1)。カラム参照が残る場合だけエラーにする。
+rewrite_children(#binop{op = Op, left = L, right = R}, _Bound, Ctx) ->
+    case rewrite(L, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, BL, Ctx1} ->
+            case rewrite(R, Ctx1) of
+                {error, Reason} -> {error, Reason};
+                {ok, BR, Ctx2} -> {ok, binop(Op, BL, BR), Ctx2}
+            end
+    end;
+rewrite_children(#unop{op = Op, arg = A}, _Bound, Ctx) ->
+    case rewrite(A, Ctx) of
+        {error, Reason} -> {error, Reason};
+        {ok, BA, Ctx2} when Op =:= 'not' -> {ok, {'not', BA}, Ctx2};
+        {ok, BA, Ctx2} -> {ok, {neg, BA}, Ctx2}
+    end;
+rewrite_children(#col_ref{name = Name}, _Bound, _Ctx) ->
+    {error, {not_grouped, Name}};
+rewrite_children(_Expr, _Bound, _Ctx) ->
+    {error, not_grouped}.
+
+%% 集約を登録して、その結果を指す参照を返す。
+%% 同じ集約が複数回出てきたら1つにまとめる。
+add_aggregate(#func{name = NameStr, args = Args, distinct = Dist},
+              #{keys := Keys, aggs := Aggs, columns := Columns} = Ctx) ->
+    case agg_func(string:lowercase(NameStr), Args) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Func, ArgExpr} ->
+            case bind_agg_arg(ArgExpr, Columns) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, BArg} ->
+                    Agg = #agg{func = Func, arg = BArg, distinct = Dist},
+                    case index_of(Agg, lists:reverse(Aggs)) of
+                        {ok, N} ->
+                            {ok, {ref, length(Keys) + N}, Ctx};
+                        not_found ->
+                            N = length(Aggs) + 1,
+                            {ok, {ref, length(Keys) + N}, Ctx#{aggs => [Agg | Aggs]}}
+                    end
+            end
+    end.
+
+bind_agg_arg(undefined, _Columns) -> {ok, undefined};
+bind_agg_arg(Expr, Columns) -> bind_expr(Expr, Columns).
+
+agg_func("count", star) -> {ok, count_star, undefined};
+agg_func("count", [A]) -> {ok, count, A};
+agg_func("sum", [A]) -> {ok, sum, A};
+agg_func("avg", [A]) -> {ok, avg, A};
+agg_func("min", [A]) -> {ok, min, A};
+agg_func("max", [A]) -> {ok, max, A};
+agg_func(Name, star) -> {error, {star_not_allowed, Name}};
+agg_func(Name, _) -> {error, {unknown_function, Name}}.
+
+%% ORDER BY は射影後の行を指すので、出力カラム名で解決する。
+bind_order_after_agg(Items, Ctx) ->
+    bind_order_after_agg(Items, Ctx, []).
+
+bind_order_after_agg([], _Ctx, Acc) ->
+    {ok, lists:reverse(Acc)};
+bind_order_after_agg([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Ctx, Acc) ->
+    case rewrite(E, Ctx) of
+        {error, Reason} -> {error, Reason};
+        {ok, Bound, _} -> bind_order_after_agg(T, Ctx, [{Bound, Dir, nulls_for(Dir, Nulls)} | Acc])
+    end.
+
+index_of_key(Bound, Keys) -> index_of(Bound, Keys).
+
+index_of(X, L) -> index_of(X, L, 1).
+index_of(_X, [], _N) -> not_found;
+index_of(X, [X | _], N) -> {ok, N};
+index_of(X, [_ | T], N) -> index_of(X, T, N + 1).
+
+bind_all(Exprs, Columns) ->
+    bind_all(Exprs, Columns, []).
+bind_all([], _Columns, Acc) ->
+    {ok, lists:reverse(Acc)};
+bind_all([E | T], Columns, Acc) ->
+    case bind_expr(E, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, B} -> bind_all(T, Columns, [B | Acc])
+    end.
+
+%% {ok, _} を返す関数を順に呼び、1つでも失敗したらそこで止める。
+with_ok(Funs, Cont) ->
+    with_ok(Funs, [], Cont).
+with_ok([], Acc, Cont) ->
+    Cont(lists:reverse(Acc));
+with_ok([F | T], Acc, Cont) ->
+    case F() of
+        {error, Reason} -> {error, Reason};
+        {ok, V} -> with_ok(T, [V | Acc], Cont)
+    end.
+
+%% 射影に集約が含まれるか。GROUP BY が無くても集約があれば集約プランになる。
+has_aggregate(Items) ->
+    lists:any(fun contains_func/1, Items).
+
+contains_func(#func{}) -> true;
+contains_func(#binop{left = L, right = R}) -> contains_func(L) orelse contains_func(R);
+contains_func(#unop{arg = A}) -> contains_func(A);
+contains_func(#is_null{arg = A}) -> contains_func(A);
+contains_func(_) -> false.
 
 wrap_filter(undefined, Node) -> Node;
 wrap_filter(Pred, Node) -> #p_filter{pred = Pred, input = Node}.

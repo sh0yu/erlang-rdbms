@@ -126,10 +126,6 @@ string_literal_does_not_match_atom(_) ->
 unsupported_syntax_is_reported(_) ->
     fun() ->
         C = fixture(),
-        %% 集約
-        ?assertMatch({error, {syntax_error, _, _}}, q(C, "SELECT count(*) FROM fruit")),
-        ?assertMatch({error, {syntax_error, _, _}},
-                     q(C, "SELECT name FROM fruit GROUP BY name")),
         %% JOIN と修飾カラム名
         ?assertMatch({error, _},
                      q(C, "SELECT a.name FROM fruit a JOIN fruit b ON a.name = b.name")),

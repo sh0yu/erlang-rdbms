@@ -268,6 +268,20 @@ format_error({duplicate_columns, Names}) ->
     io_lib:format("duplicate columns: ~ts", [lists:join(", ", Names)]);
 format_error(column_count_mismatch) ->
     "number of values does not match the number of columns";
+format_error({not_grouped, Name}) ->
+    io_lib:format("column ~ts must appear in GROUP BY or be used in an aggregate", [Name]);
+format_error(not_grouped) ->
+    "expression must appear in GROUP BY or be used in an aggregate";
+format_error({unknown_function, Name}) ->
+    io_lib:format("no such function: ~ts", [Name]);
+format_error({star_not_allowed, Name}) ->
+    io_lib:format("~ts(*) is not allowed (only COUNT(*))", [Name]);
+format_error(star_with_group_by) ->
+    "SELECT * cannot be used with GROUP BY or aggregates";
+format_error(only_constants_in_values) ->
+    "VALUES accepts constant expressions only";
+format_error(star_must_be_alone) ->
+    "SELECT * cannot be combined with other columns";
 format_error(ddl_in_transaction) ->
     "DDL cannot run inside a transaction (catalog changes are not rolled back)";
 format_error(Other) ->

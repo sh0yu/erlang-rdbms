@@ -162,6 +162,7 @@ INSERT INTO t [(c, ...)] VALUES (v, ...);
 UPDATE t SET c = expr, ... [WHERE expr];
 DELETE FROM t [WHERE expr];
 SELECT [DISTINCT] * | expr, ... FROM t [WHERE expr]
+  [GROUP BY expr, ...] [HAVING expr]
   [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
   [LIMIT n] [OFFSET n];
 BEGIN;  COMMIT;  ROLLBACK;
@@ -178,6 +179,7 @@ BEGIN;  COMMIT;  ROLLBACK;
 | 論理 | `AND` `OR` `NOT` `( )` |
 | 算術 | `+` `-` `*` `/`(ゼロ除算はNULL) |
 | NULL | `IS NULL` `IS NOT NULL` |
+| 集約 | `COUNT(*)` `COUNT(x)` `COUNT(DISTINCT x)` `SUM` `AVG` `MIN` `MAX` |
 
 比較の一方がNULLなら結果はNULLになり、`WHERE` は通らない。
 `NOT` をつけても通らない(3値論理)。
@@ -419,7 +421,9 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
 - `CREATE TABLE` / `DROP TABLE` は暗黙のトランザクションとして実行される。
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
-- JOIN・集約(`COUNT` `SUM` など)・`GROUP BY`・副問い合わせは未実装
+- JOIN・副問い合わせ・`UNION`・ウィンドウ関数は未実装
+- 集約は NULL を入力から外す(`COUNT(*)` だけが例外)。
+  空集合では `COUNT` が 0、それ以外は NULL を返す
 - `SELECT` は常に全表走査。索引を使うアクセスパス選択はプランナ未実装のため
 - 型宣言のないテーブル(タプルAPIで作ったもの)は全カラムが `any` 型になり、
   アトムをそのまま格納する。SQLの文字列リテラル(binary)とは一致しない

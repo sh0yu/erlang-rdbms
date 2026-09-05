@@ -111,10 +111,26 @@ SELECT name FROM fruit ORDER BY price DESC;
 SELECT DISTINCT price FROM fruit ORDER BY price;
 COMMIT;
 
+-- ============ 集約 ============
+BEGIN;
+SELECT COUNT(*) FROM fruit;
+
+-- COUNT(*) は NULL の行も数えるが、COUNT(x) は数えない
+SELECT COUNT(*), COUNT(ripe) FROM fruit;
+
+SELECT SUM(price), AVG(price), MIN(price), MAX(price) FROM fruit;
+SELECT ripe, COUNT(*) FROM fruit GROUP BY ripe;
+SELECT ripe, SUM(price) FROM fruit GROUP BY ripe HAVING COUNT(*) > 1;
+SELECT COUNT(DISTINCT ripe) FROM fruit;
+
+-- GROUP BY に無く集約でもないカラムは、どの行の値か決まらないので弾かれる
+SELECT name FROM fruit GROUP BY ripe;
+COMMIT;
+
 -- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
 BEGIN;
-SELECT count(*) FROM fruit;
 SELECT * FROM fruit a JOIN fruit b ON a.name = b.name;
+SELECT * FROM fruit WHERE price = (SELECT price FROM fruit);
 COMMIT;
 
 -- ============ DDLはトランザクションの中では実行できない ============

@@ -15,6 +15,8 @@
     columns,            % [式 | #star{}]
     from,               % #table_ref{}
     where,              % 式 | undefined
+    group_by = [],      % [式]
+    having = undefined, % 式 | undefined
     order_by = [],      % [#sort_item{}]
     limit = undefined,  % 非負整数 | undefined
     offset = undefined  % 非負整数 | undefined
@@ -101,6 +103,14 @@
 -record(unop, {
     op,
     arg
+}).
+
+%% 関数呼び出し。いまは集約のみ。
+%% 関数名を予約語にしていないので、未知の関数は意味解析で弾く。
+-record(func, {
+    name,               % string()
+    args,               % [式] | star
+    distinct = false
 }).
 
 %% IS NULL / IS NOT NULL
