@@ -8,12 +8,25 @@ OTPアプリケーション名は `transaction_db`。
 
 ## 動かす
 
-必要なもの: Erlang/OTP 25 以降。
+```sh
+cd erlang-rdbms
+bin/sqlsh
+```
+
+これだけ。初回は自動でビルドする。終了は `\q`。
+
+必要なものは Erlang/OTP 25 以降。`bin/sqlsh` は `erl` を
+PATH → `~/.local/erlang/bin` → `/usr/local/lib/erlang/bin` →
+`/usr/lib/erlang/bin` の順に探すので、これらのどこかにあれば
+PATHを通していなくても動く。見つからなければその旨を表示して終わる。
+
+開発時のコマンド:
 
 ```sh
 rebar3 compile
-rebar3 eunit          # 146 tests
-rebar3 shell          # transaction_dbを起動した状態のシェル
+rebar3 eunit          # 236 tests
+rebar3 dialyzer
+rebar3 shell          # transaction_dbを起動した状態のErlangシェル
 ```
 
 rebar3がない環境では同等のことがmakeでできる。

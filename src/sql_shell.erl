@@ -35,8 +35,9 @@ start(Opts) ->
     ok = ensure_db(Opts),
     {ok, Conn} = gen_connection:connect(),
     banner(),
-    Sh = #sh{conn = Conn},
-    loop(Sh, []).
+    try loop(#sh{conn = Conn}, [])
+    after shutdown()
+    end.
 
 %%----------------------------------------------------------------------
 %% @doc ファイルの文を順に実行して、入力と結果の両方を表示する。
@@ -47,13 +48,26 @@ run_file(Path) ->
 run_file(Path, Opts) ->
     ok = ensure_db(Opts),
     {ok, Conn} = gen_connection:connect(),
-    case file:read_file(Path) of
-        {ok, Bin} ->
-            run_statements(#sh{conn = Conn}, split_statements(binary_to_list(Bin)));
-        {error, Reason} ->
-            io:format("cannot read ~ts: ~p~n", [Path, Reason]),
-            {error, Reason}
+    try
+        case file:read_file(Path) of
+            {ok, Bin} ->
+                run_statements(#sh{conn = Conn}, split_statements(binary_to_list(Bin)));
+            {error, Reason} ->
+                io:format("cannot read ~ts: ~p~n", [Path, Reason]),
+                {error, Reason}
+        end
+    after
+        shutdown()
     end.
+
+%% 終了時にアプリケーションを止める。
+%%
+%% 止めずに halt/0 すると DETS と disk_log が閉じられないままになり、
+%% 次の起動で毎回 "not properly closed, repairing" が走る。
+%% データは失われないが、テーブルが大きいと修復に時間がかかる。
+shutdown() ->
+    _ = application:stop(transaction_db),
+    ok.
 
 %%----------------------------------------------------------------------
 %% @doc 同梱のツアー(priv/tour.sql)を実行する。
