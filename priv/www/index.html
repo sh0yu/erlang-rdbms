@@ -35,18 +35,45 @@
   .tbl li { color: var(--dim); font-size: 12px; }
   .tbl li b { color: var(--fg); font-weight: 400; }
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .editor { border-bottom: 1px solid var(--line); padding: 12px; }
-  textarea {
-    width: 100%; height: 110px; resize: vertical;
-    background: #0b0d11; color: var(--fg); border: 1px solid var(--line);
-    border-radius: 6px; padding: 10px; font: inherit; outline: none;
+
+  /* エディタが主役。既定で画面の4割を占める */
+  .editor {
+    flex: 0 0 auto; height: 40vh; min-height: 160px;
+    display: flex; flex-direction: column;
+    padding: 14px 14px 10px; gap: 10px;
   }
-  textarea:focus { border-color: var(--accent); }
-  .bar { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  textarea {
+    flex: 1; width: 100%; resize: none;
+    background: #0b0d11; color: var(--fg);
+    border: 2px solid var(--line); border-radius: 8px;
+    padding: 14px; font: inherit; font-size: 15px; line-height: 1.6;
+    outline: none;
+  }
+  textarea::placeholder { color: #4a5262; }
+  textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(90,169,230,.15);
+  }
+
+  /* エディタと結果の境目。ドラッグで高さを変えられる */
+  .splitter {
+    height: 6px; flex: none; cursor: row-resize; background: var(--line);
+    position: relative;
+  }
+  .splitter::after {
+    content: ""; position: absolute; left: 50%; top: 1px;
+    width: 40px; height: 4px; margin-left: -20px; border-radius: 2px;
+    background: #3a4250;
+  }
+  .splitter:hover { background: var(--accent); }
+
+  .bar { display: flex; align-items: center; gap: 10px; }
   button.run {
     background: var(--accent); color: #08111a; border: 0; border-radius: 6px;
-    padding: 7px 16px; font: inherit; font-weight: 700; cursor: pointer;
+    padding: 9px 22px; font: inherit; font-size: 14px; font-weight: 700;
+    cursor: pointer;
   }
+  button.run:hover { filter: brightness(1.1); }
   button.run:disabled { opacity: .5; cursor: default; }
   .chip {
     all: unset; cursor: pointer; color: var(--dim); font-size: 12px;
@@ -56,7 +83,7 @@
   .hint { color: var(--dim); font-size: 11px; margin-left: auto; }
   #status { font-size: 12px; }
   #status.tx { color: var(--ok); }
-  #out { flex: 1; overflow-y: auto; padding: 12px; }
+  #out { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 0; }
   .entry { margin-bottom: 18px; }
   .q { color: var(--accent); white-space: pre-wrap; margin-bottom: 6px; }
   .q::before { content: "sql> "; color: var(--dim); }
@@ -79,9 +106,12 @@
 </aside>
 
 <main>
-  <div class="editor">
-    <textarea id="sql" spellcheck="false"
-      placeholder="CREATE TABLE fruit (name VARCHAR, price INTEGER);"></textarea>
+  <div class="editor" id="editor">
+    <textarea id="sql" spellcheck="false" autofocus
+      placeholder="SELECT * FROM fruit WHERE price >= 150 AND price < 300;
+
+複数文は ; で区切ってまとめて実行できます。
+Ctrl+Enter で実行。"></textarea>
     <div class="bar">
       <button class="run" id="run">Run</button>
       <button class="chip" data-sql="BEGIN;">BEGIN</button>
@@ -91,6 +121,7 @@
       <span class="hint">Ctrl+Enter で実行 / 複数文は ; 区切り</span>
     </div>
   </div>
+  <div class="splitter" id="splitter" title="ドラッグで高さを変えられます"></div>
   <div id="out"></div>
 </main>
 
@@ -216,6 +247,19 @@ function insert(text) {
   sqlBox.focus();
 }
 
+// -- エディタの高さをドラッグで変える -------------------------------------
+(() => {
+  const splitter = $("#splitter"), editor = $("#editor");
+  let dragging = false;
+  splitter.addEventListener("mousedown", e => { dragging = true; e.preventDefault(); });
+  window.addEventListener("mousemove", e => {
+    if (!dragging) return;
+    const top = editor.getBoundingClientRect().top;
+    editor.style.height = Math.max(120, e.clientY - top) + "px";
+  });
+  window.addEventListener("mouseup", () => { dragging = false; });
+})();
+
 // -- 配線 ---------------------------------------------------------------
 $("#run").onclick = run;
 sqlBox.addEventListener("keydown", e => {
@@ -225,6 +269,7 @@ document.querySelectorAll(".chip").forEach(b => {
   b.onclick = async () => { render(await runOne(b.dataset.sql.replace(";", ""))); refresh(); };
 });
 refresh();
+sqlBox.focus();
 </script>
 </body>
 </html>
