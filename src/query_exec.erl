@@ -320,7 +320,7 @@ run_sql(State, {select, Plan}) ->
 run_sql(State, {explain, Logical}) ->
     %% 実行するときと同じカタログを渡す。違うものを渡すと、
     %% 表示された計画と実際に走る計画がずれる。
-    Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun(use_index(State)))),
+    Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun())),
     {reply, {ok, ['QUERY PLAN'], [[L] || L <- Lines]}, State};
 run_sql(State, {insert, Table, Row}) ->
     with_write_transaction(State, fun() -> do_insert(State, Table, Row) end);
@@ -332,7 +332,7 @@ run_sql(State, {delete, Table, Pred}) ->
 do_sql_select(State, Logical) ->
     %% 論理プランから物理プランを作る。実行方法(全表走査か索引か、
     %% どの結合アルゴリズムか)がここで決まる。
-    Plan = sql_planner:plan(Logical, catalog_fun(use_index(State))),
+    Plan = sql_planner:plan(Logical, catalog_fun()),
     %% 実行器にはストレージへの入口を関数で渡す。
     %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
     %% かつ走査がこのトランザクションの未コミット変更を見られる。
@@ -349,8 +349,6 @@ run_plan(#state{readonly = true} = State, Plan) ->
 run_plan(State, Plan) ->
     sql_exec:run(Plan, exec_ctx(State)).
 
-use_index(#state{readonly = true}) -> false;
-use_index(#state{})                -> true.
 
 exec_ctx(State) ->
     #{scan_open    => fun(T) -> tx_scan_open(State, T) end,
@@ -364,31 +362,13 @@ exec_ctx(State) ->
 %% 出ることを保てるようにするためと、試験で偽のカタログを渡して
 %% 索引がある場合と無い場合を書き分けられるようにするため。
 %%----------------------------------------------------------------------
-%% 引数は「索引を使ってよいか」。スナップショットで読むときは使えない。
-%%
-%% 索引は**いまの値**で引かれる。ある行の索引付き列が更新されると、
-%% その行は古い鍵では引けなくなり、新しい鍵で引けるようになる。
-%% undo は行の中身しか戻せないので、
-%%   - 昔その値だった行 → 索引に無く、見落とす
-%%   - いまその値の行   → 引けるが、戻すと条件に合わない行になる
-%% どちらも直せない。索引そのものを版管理していないため。
-%%
-%% よってスナップショットの読み手には索引を見せない。全表走査になるが、
-%% 走査した行は undo で正しく戻せるし、条件はその後に評価される。
-catalog_fun(false) ->
-    catalog_fun(true, fun(_Sys, _Table) -> [] end);
-catalog_fun(true) ->
-    catalog_fun(true, fun(Sys, Table) ->
-                              case sys_tbl_mng:get_index_column_list(Sys, Table) of
-                                  {ok, Cols} -> Cols;
-                                  {error, _} -> []
-                              end
-                      end).
-
-catalog_fun(true, IndexedFun) ->
+catalog_fun() ->
     Sys = whereis(sys_tbl_mng),
     fun(Table) ->
-            Indexed = IndexedFun(Sys, Table),
+            Indexed = case sys_tbl_mng:get_index_column_list(Sys, Table) of
+                          {ok, Cols} -> Cols;
+                          {error, _} -> []
+                      end,
             Stats = case sys_tbl_mng:get_stats(Sys, Table) of
                         {ok, S} -> S;
                         none    -> none
@@ -402,14 +382,77 @@ catalog_fun(true, IndexedFun) ->
 %% 実行器から索引を直接引かせると、自分がさっき入れた行が見えない。
 %% 重ね合わせはタプルAPIのSELECTと同じ経路を使う。
 %%----------------------------------------------------------------------
-%% スナップショットの読み手はここへ来ない(catalog_fun/1 が索引を隠す)ので、
-%% 巻き戻しは要らない。読み書きトランザクションは直列なので、
-%% 見えているのは常に最新のコミット済みの状態。
 tx_index_lookup(State, Table, ColName, Val) ->
-    QueryIdList = get_query_id_list(State),
-    OidList = select_object_id_list(State, Table, ColName, Val, QueryIdList),
-    ok = acquire_lock(State, OidList, read),
-    {ok, [R || R <- select_data(State, Table, OidList, QueryIdList), R =/= not_found]}.
+    case snapshot_overlay(State, Table) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Snap} when map_size(Snap) =:= 0 ->
+            %% 巻き戻す必要が無い。索引の結果をそのまま使う
+            QueryIdList = get_query_id_list(State),
+            OidList = select_object_id_list(State, Table, ColName, Val, QueryIdList),
+            ok = acquire_lock(State, OidList, read),
+            {ok, [R || R <- select_data(State, Table, OidList, QueryIdList),
+                       R =/= not_found]};
+        {ok, Snap} ->
+            snapshot_index_lookup(State, Table, ColName, Val, Snap)
+    end.
+
+%%----------------------------------------------------------------------
+%% スナップショットの時点で ColName = Val だった行を返す。
+%%
+%% 索引は**いまの値**で引かれるので、そのままでは足りない。
+%%   - 昔その値だった行は、いま別の値なら索引に出てこない
+%%   - いまその値の行は、昔は別の値だったかもしれない
+%%
+%% 索引そのものを版管理していないので、候補を広げて絞り直す。
+%% 候補は「いま索引に出てくる行」と「スナップショット以降に変わった行」の
+%% 和。後者は undo の重ね合わせの鍵そのもので、スナップショットを取って
+%% からの変更数しかないため、表の大きさには比例しない。
+%%
+%% 候補を巻き戻してから ColName = Val で絞るので、結果はその時点の
+%% 全表走査と一致する。
+%%----------------------------------------------------------------------
+snapshot_index_lookup(State, Table, ColName, Val, Snap) ->
+    case column_position(Table, ColName) of
+        not_found ->
+            {error, {column_not_found, ColName}};
+        Pos ->
+            QueryIdList = get_query_id_list(State),
+            Indexed = select_object_id_list(State, Table, ColName, Val, QueryIdList),
+            Candidates = lists:usort(Indexed ++ maps:keys(Snap)),
+            ok = acquire_lock(State, Candidates, read),
+            Local = build_delta(State, Table),
+            {ok, [Row || Oid <- Candidates,
+                         (Row = row_at(State, Table, Oid, Local, Snap)) =/= not_found,
+                         element(Pos, list_to_tuple(Row)) =:= Val]}
+    end.
+
+%% Oid の、このトランザクションから見える値。
+%% 自分の未コミット変更 > スナップショットの巻き戻し > 共有データ。
+row_at(State, Table, Oid, Local, Snap) ->
+    case maps:get(Oid, Local, none) of
+        deleted    -> not_found;
+        {row, V}   -> V;
+        none       ->
+            case maps:get(Oid, Snap, none) of
+                deleted  -> not_found;
+                {row, V} -> V;
+                none     -> read_shared(State, Table, Oid)
+            end
+    end.
+
+read_shared(_State, Table, Oid) ->
+    simple_db_server:read_data_oid(Table, Oid).
+
+column_position(Table, ColName) ->
+    case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), Table) of
+        {ok, ColList} -> position_in(ColName, ColList, 1);
+        _             -> not_found
+    end.
+
+position_in(_Name, [], _N)       -> not_found;
+position_in(Name, [Name | _], N) -> N;
+position_in(Name, [_ | T], N)    -> position_in(Name, T, N + 1).
 
 %% SQLのUPDATE / DELETE は、対象のOidを**先に確定させてから**適用する。
 %%
@@ -980,6 +1023,11 @@ merge_local_data(State, ShareData, Oid, QueryId) ->
 %%%===================================================================
 
 acquire_lock(_State, [], _RW) ->
+    ok;
+%% スナップショットの読み手はロックを取らない。
+%% 取っても意味が無い(読む値は undo で決まる)うえ、読み取り専用は
+%% tx_mng を通らないので解放する場所が無く、書き手が永久に待つ。
+acquire_lock(#state{readonly = true}, _ObjectId, _RW) ->
     ok;
 acquire_lock(State, ObjectId, RW) ->
     lock_mng:acquire_lock(get_lock_mng_pid(State), get_txid(State), ObjectId, RW).

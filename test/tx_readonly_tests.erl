@@ -27,7 +27,7 @@ readonly_test_() ->
       fun reader_sees_all_or_nothing_of_a_commit/1,
       fun reader_sees_old_values_after_update/1,
       fun reader_sees_deleted_rows/1,
-      fun reader_does_not_use_index/1,
+      fun reader_uses_index_and_still_sees_old_values/1,
       fun snapshot_is_released_on_commit_and_rollback/1,
       fun snapshot_is_released_when_connection_dies/1,
       fun nested_begin_is_rejected/1]}.
@@ -202,19 +202,33 @@ reader_sees_deleted_rows(_) ->
         ?assertEqual(1, count(C1))
     end.
 
-%% 索引は現在の値で引かれるので、巻き戻せない。
-%% スナップショットの読み手には索引を見せず、全表走査にする。
-reader_does_not_use_index(_) ->
+%% 索引は現在の値で引かれるので、そのままでは巻き戻せない。
+%% 候補を「いま索引に出る行」+「スナップショット以降に変わった行」に
+%% 広げてから絞り直すので、結果は全表走査と一致する。
+reader_uses_index_and_still_sees_old_values(_) ->
     fun() ->
-        C = seeded(),
-        ok = q(C, "CREATE INDEX t_id ON t (id)"),
-        Sql = "EXPLAIN SELECT id FROM t WHERE id = 1",
-        %% 通常のトランザクションなら索引を使う
-        ?assert(uses_index(one_shot(C, Sql))),
-        %% 読み取り専用では使わない
-        ok = q(C, "BEGIN READ ONLY"),
-        ?assertNot(uses_index(q(C, Sql))),
-        ok = q(C, "COMMIT")
+        C1 = seeded(),
+        C2 = connect(),
+        ok = q(C1, "CREATE INDEX t_id ON t (id)"),
+        Sql = "SELECT id FROM t WHERE id = 1",
+        ?assert(uses_index(one_shot(C1, "EXPLAIN " ++ Sql))),
+
+        ok = q(C1, "BEGIN READ ONLY"),
+        ?assertMatch({ok, _, [[1]]}, q(C1, Sql)),
+
+        %% 索引付きの列を書き換える。索引からは id=1 が消える
+        ok = q(C2, "BEGIN"),
+        {ok, _} = q(C2, "UPDATE t SET id = 7 WHERE id = 1"),
+        ok = q(C2, "COMMIT"),
+
+        %% 索引に無くなった行が、それでも見える
+        ?assertMatch({ok, _, [[1]]}, q(C1, Sql)),
+        %% 逆に、新しく id=7 になった行は見えてはいけない
+        ?assertMatch({ok, _, []}, q(C1, "SELECT id FROM t WHERE id = 7")),
+        ok = q(C1, "COMMIT"),
+
+        ?assertMatch({ok, _, []}, one_shot(C1, Sql)),
+        ?assertMatch({ok, _, [[7]]}, one_shot(C1, "SELECT id FROM t WHERE id = 7"))
     end.
 
 snapshot_is_released_on_commit_and_rollback(_) ->
