@@ -129,60 +129,88 @@ report(Dir, Sent) ->
 %%%===================================================================
 
 local_first() ->
-    title("6. 圏外で売る — 預かり(escrow)"),
+    title("6. 複製を受け取る — 購読"),
+    _ = [tether:request(<<"shop">>, I, [{put, {<<"orders">>, <<I:32>>}, <<"old">>}])
+         || I <- lists:seq(1, 3)],
+    {ok, V0, Rows0} = tether:subscribe(<<"alice">>, <<"orders">>),
+    result("版", V0),
+    result("受け取った中身", length(Rows0)),
+    say("クライアントは手元に複製を持った。以後は差分だけを受け取る。"),
+
+    title("7. 圏外の間、セッションが変更を溜め続ける"),
+    say("alice は圏外。しかし alice のプロセスはサーバで生きている。"),
+    _ = [tether:request(<<"shop">>, I, [{put, {<<"orders">>, <<I:32>>}, <<"new">>}])
+         || I <- lists:seq(4, 253)],
+    ok = wait_version(<<"alice">>, 253),
+    #{pending := P} = tether:session_info(<<"alice">>),
+    result("溜まっている変更", P),
+    say(""),
+    say("**行にはこれができない。** 行は溜められない。"),
+    say("接続に紐づける設計でもできない。切れたら消える。"),
+    say("スレッドでは 10^6 クライアントぶん載らない。"),
+    say(""),
+    say("alice が復帰する。"),
+    {delta, V1, Delta} = tether:sync(<<"alice">>),
+    result("返ってきた差分", length(Delta)),
+    result("版", V1),
+    say("全件ではなく、見落とした分だけが返った。"),
+
+    title("8. 溜めきれないときは、そのクライアントだけが取り直す"),
+    say("上限を持たないと、戻ってこないクライアント1人がメモリを食い潰す。"),
+    say("PostgreSQL の論理レプリケーションスロットが WAL を溜めて"),
+    say("ディスクを埋める事故と同じ形で、あちらは個別に止められない。"),
+    say(""),
+    {ok, _, _} = tether:subscribe(<<"bob">>, <<"orders">>),
+    say("alice は圏外のまま、bob はこまめに受け取る。変更を大量に起こす。"),
+    _ = [begin
+             tether:request(<<"shop">>, I, [{put, {<<"orders">>, <<I:32>>}, <<"x">>}]),
+             case I rem 50 of 0 -> tether:sync(<<"bob">>); _ -> ok end
+         end || I <- lists:seq(254, 253 + 12000)],
+    ok = wait_version(<<"alice">>, 253 + 12000),
+    ok = wait_version(<<"bob">>, 253 + 12000),
+    result("alice: 溜めきれたか", not maps:get(overflow, tether:session_info(<<"alice">>))),
+    result("bob:   溜めきれたか", not maps:get(overflow, tether:session_info(<<"bob">>))),
+    case tether:sync(<<"alice">>) of
+        {resync, _, [{_, Snap}]} ->
+            result("alice → 取り直し(全件)", length(Snap));
+        {delta, _, D} ->
+            result("alice → 差分", length(D))
+    end,
+    {delta, _, BD} = tether:sync(<<"bob">>),
+    result("bob   → 差分", length(BD)),
+    say("**alice だけが取り直しに落ちた。bob は何も感じていない。**"),
+
+    title("9. 圏外でも書ける — 預かり(escrow)"),
+    say("読むだけなら差分で足りる。書くと、共有された有限資源が問題になる。"),
     {ok, 100} = tether:stock(<<"sku:1">>, 100),
-    say("在庫を100個入れた。"),
-    say("alice が**あらかじめ持ち分を預かる**。"),
-    %% 第一部の続きなので、通番は resume で聞いて続ける
     #{last_seq := L0} = tether:resume(<<"alice">>),
     {ok, [{granted, G, _}]} =
-        tether:request(<<"alice">>, L0 + 1, [{acquire, <<"sku:1">>, 5, 600000}]),
-    result("alice が預かった量", G),
-    result("中央 / 配ってある量", tether:pool(<<"sku:1">>)),
-    say(""),
-    say("ここで alice が圏外になる。その間に bob が中央を売り切る。"),
-    drain(<<"bob">>, 1),
-    result("中央 / 配ってある量", tether:pool(<<"sku:1">>)),
-    say("中央は空。**普通のDBなら alice は何も売れない。**"),
+        tether:request(<<"alice">>, L0 + 1, [{acquire, <<"sku:1">>, 4, 600000}]),
+    result("預かった量", G),
+    say("この範囲なら、中央が空でも売れる。合計が在庫を超えることはない。"),
+    say("CRDT は統合できるが在庫がマイナスになる。"),
+    say("同期エンジンは competing write として弾く。"),
+    {ok, R} = tether:request_batch(<<"alice">>, L0 + 2,
+                [[{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"x1">>}, <<"c">>}],
+                 [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"x2">>}, <<"c">>}]]),
+    result("圏外で積んだ2件", [element(1, X) || X <- R]),
+    say("束は**最初の失敗で止まる**。在庫を確保できていないのに"),
+    say("注文が確定する、という結果を作らないため。"),
 
-    title("7. 圏外で積んだ操作を、戻ってから流す"),
-    say("alice が圏外で積んだもの:"),
-    say("  カートに追加 / 引き当て+注文 ×3"),
-    Queued = [[{put, {<<"cart">>, <<"a1">>}, <<"item">>}],
-              [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o1">>}, <<"c">>}],
-              [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o2">>}, <<"c">>}],
-              [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o3">>}, <<"c">>}]],
-    {ok, R} = tether:request_batch(<<"alice">>, L0 + 2, Queued),
-    result("結果", [element(1, X) || X <- R]),
-    say(""),
-    say("**中央が空でも4件すべて通った。** 事前に権利を持っていたから。"),
-    say("CRDT なら統合はできるが在庫がマイナスになる。"),
-    say("同期エンジンなら competing write として弾かれる。"),
-    result("在庫の保存則 (中央+預かり+売れた=100)", conserved()),
-
-    title("8. 端末を作り直した — resume"),
-    say("alice が手元の通番を失った。次に何番を送ればいいか分からない。"),
+    title("10. 端末を作り直した — resume"),
     #{last_seq := L, grants := Gr} = tether:resume(<<"alice">>),
     result("last_seq", L),
     result("いま有効な預かり", Gr),
-    say(""),
-    say("通番も預かりも返ってくるので、**そのまま圏外に戻れる。**"),
-    say("FIX の Order Mass Status Request にあたるが、向こうは"),
-    say("別サブシステムへの問い合わせで、注文の記録と食い違いうる。"),
-    say("ここでは記憶も預かりも同じログから復元されるので、食い違わない。"),
+    say("通番も預かりも返るので、そのまま圏外に戻れる。"),
     io:format("~n"),
     ok.
 
-conserved() ->
-    {A, G} = tether:pool(<<"sku:1">>),
-    {A, G, 100 - A - G, 100 =:= A + G + (100 - A - G)}.
-
-drain(C, Seq) ->
-    case tether:request(C, Seq, [{acquire, <<"sku:1">>, 1000000, 600000}]) of
-        {ok, [{granted, G, _}]} ->
-            {ok, [{consumed, 0}]} = tether:request(C, Seq+1, [{consume, <<"sku:1">>, G}]),
-            drain(C, Seq + 2);
-        {error, 1, sold_out} -> ok
+wait_version(C, V) -> wait_version(C, V, 400).
+wait_version(_C, _V, 0) -> error(timeout);
+wait_version(C, V, N) ->
+    case tether:session_info(C) of
+        #{version := Cur} when Cur >= V -> ok;
+        _ -> timer:sleep(5), wait_version(C, V, N - 1)
     end.
 
 num(Label, N) ->
