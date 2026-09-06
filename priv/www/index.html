@@ -9,186 +9,216 @@
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-  header{padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header{padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
   header h1{margin:0;font-size:15px;letter-spacing:.04em}
-  header p{margin:6px 0 0;color:var(--dim);font-size:12px}
-  .try{margin-top:8px;font-size:12px;color:var(--dim)}
+  .try{margin-top:6px;font-size:12px;color:var(--dim)}
   .try b{color:var(--accent);font-weight:600}
-  main{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;padding:16px;
-       align-items:start;max-width:1400px;margin:0 auto}
-  /* min-width:0 が無いと、ボタン列の幅で列が押し広げられて右がはみ出す */
+  .try .bad{color:var(--err)}
+  main{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:14px;
+       align-items:start;max-width:1500px;margin:0 auto}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-        padding:14px;min-width:0;overflow:hidden}
+        padding:13px;min-width:0;overflow:hidden}
   .card.server{border-color:#33405a}
-  .card h2{margin:0 0 2px;font-size:14px;display:flex;align-items:center;gap:8px}
+  .card h2{margin:0;font-size:14px;display:flex;align-items:center;gap:8px}
   .badge{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600}
   .on{background:rgba(111,207,151,.15);color:var(--ok)}
   .off{background:rgba(122,131,154,.18);color:var(--off)}
-  .stats{display:flex;flex-wrap:wrap;gap:4px 14px;margin:10px 0;font-size:12px;
+  .stats{display:flex;flex-wrap:wrap;gap:2px 12px;margin:8px 0;font-size:11px;
          color:var(--dim)}
   .stats b{color:var(--fg);font-weight:600}
-  .btns{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 12px}
+  .stats .hot{color:var(--warn)}
+  .note{margin:8px 0;padding:7px 9px;border-radius:6px;font-size:12px;
+        background:#11151b;border:1px solid var(--line);word-break:break-all}
+  .note.diff{border-color:var(--warn);background:rgba(242,201,76,.09)}
+  .note.reject{border-color:var(--err);background:rgba(235,87,87,.12);color:#ffb4b4}
+  .note.resync{border-color:var(--warn);background:rgba(242,201,76,.12)}
+  .note small{color:var(--dim);display:block;font-size:10px;margin-bottom:2px}
+  .btns{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 10px}
   button{background:#1e2530;color:var(--fg);border:1px solid var(--line);
-         border-radius:6px;padding:6px 10px;font:inherit;font-size:12px;
+         border-radius:6px;padding:5px 9px;font:inherit;font-size:11px;
          cursor:pointer;white-space:nowrap}
   button:hover{border-color:var(--accent);color:#fff}
   button.net{background:var(--accent);color:#08111a;border:0;font-weight:700}
   button.net.isoff{background:var(--off);color:#0c0f14}
-  ul{list-style:none;margin:0;padding:0;font-size:12px;
-     max-height:340px;overflow-y:auto}
-  li{display:flex;justify-content:space-between;gap:8px;padding:3px 8px;
+  button.danger{border-color:#5a3340;color:#e8a0a0}
+  button.danger:hover{border-color:var(--err);color:#fff}
+  ul{list-style:none;margin:0;padding:0;font-size:11.5px;
+     max-height:220px;overflow-y:auto}
+  li{display:flex;justify-content:space-between;gap:8px;padding:2px 8px;
      border-radius:4px;border-left:3px solid transparent;
-     overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+     overflow:hidden;white-space:nowrap}
   li .v{color:var(--dim)}
   li.local{border-left-color:var(--warn);background:rgba(242,201,76,.08)}
-  li.missing{border-left-color:var(--err);background:rgba(235,87,87,.08);opacity:.75}
-  .legend{margin-top:10px;font-size:11px;color:var(--dim);line-height:1.9}
+  li.missing{border-left-color:var(--err);background:rgba(235,87,87,.08);opacity:.7}
+  .legend{margin-top:8px;font-size:10.5px;color:var(--dim);line-height:1.8}
   .sw{display:inline-block;width:9px;height:9px;border-radius:2px;
       margin-right:5px;vertical-align:middle}
-  .empty{color:var(--dim);font-size:12px;padding:4px 8px}
-  .pool{display:flex;gap:6px;margin:8px 0 2px}
-  .bar{height:22px;border-radius:4px;display:flex;align-items:center;
+  .empty{color:var(--dim);font-size:11.5px;padding:3px 8px}
+  .pool{display:flex;gap:5px;margin:7px 0 2px}
+  .bar{height:20px;border-radius:4px;display:flex;align-items:center;
        justify-content:center;font-size:11px;font-weight:700;color:#0c0f14}
   .bar.a{background:var(--ok)} .bar.g{background:var(--warn)}
+  .hist{display:flex;gap:2px;align-items:flex-end;height:34px;margin:6px 0 2px}
+  .hist div{background:var(--accent);width:13px;border-radius:2px 2px 0 0;
+            font-size:9px;text-align:center;color:#08111a;font-weight:700}
+  /* イベントログ */
+  .log{max-width:1500px;margin:0 auto 20px;padding:0 14px}
+  .log h3{font-size:12px;color:var(--dim);margin:4px 0 8px;font-weight:600}
+  .ev{display:flex;gap:10px;padding:5px 10px;border-radius:6px;font-size:12px;
+      margin-bottom:3px;background:var(--panel);border-left:3px solid var(--line)}
+  .ev.ok{border-left-color:var(--ok)}
+  .ev.warn{border-left-color:var(--warn)}
+  .ev.bad{border-left-color:var(--err);background:rgba(235,87,87,.10)}
+  .ev .who{color:var(--accent);min-width:62px;font-weight:600}
+  .ev .det{color:var(--dim);margin-left:auto;font-size:11px}
 </style>
 </head>
 <body>
 
 <header>
   <h1>tether — セッションが接続より長生きするデータベース</h1>
-  <p>端末2台とサーバ。圏外にすると手元だけが進み、同期すると揃う。</p>
   <p class="try">
-    試す順:
-    <b>① alice を圏外にする</b> →
-    <b>② 預かりを取る…は圏外では失敗する</b> →
-    <b>③ 圏内で預かりを取ってから圏外へ</b> →
-    <b>④ 圏外で「1個売る」</b>（中央在庫は動かない） →
-    <b>⑤ 「在庫を空にする」</b> →
-    <b>⑥ alice を圏内に戻して同期</b>（それでも売上は通る）
+    <b>圏外で売る:</b> alice ①預かり ②圏外 ③1個売る（中央在庫は動かない） ④在庫を空にする ⑤圏内 ⑥同期 → <b>通る</b>
+  </p>
+  <p class="try">
+    <span class="bad">覆るところを見る:</span> alice ①共有メモを編集 ②圏外 ③共有メモを編集 ④サーバの「第三者が編集」 ⑤圏内 ⑥同期 → <span class="bad">手元の編集が消える</span>
+  </p>
+  <p class="try">
+    <span class="bad">取り直しに落ちる:</span> alice ①圏外 ②サーバの「40件書く」 ③圏内 ④同期 →
+    <span class="bad">差分では追いつけない</span>　|　
+    <span class="bad">期限切れ:</span> ①短い預かり(8秒) ②圏外 ③1個売る ④8秒待つ ⑤圏内 ⑥同期
   </p>
 </header>
 
 <main id="app"></main>
+<div class="log"><h3>起きたこと（新しい順）</h3><div id="log"></div></div>
 
 <script>
-const $ = s => document.querySelector(s);
 let S = null;
+const $ = s => document.querySelector(s);
+const el = (t,c,x)=>{const n=document.createElement(t); if(c)n.className=c;
+                     if(x!==undefined)n.textContent=x; return n;};
 
-async function load()      { S = await (await fetch("/api/tether_web:state")).json(); draw(); }
-async function act(c, a)   { S = await (await fetch("/api/tether_web:act",
-                               {method:"POST", body:`client=${c}&action=${a}`})).json(); draw(); }
+async function load(){ S = await (await fetch("/api/tether_web:state")).json(); draw(); }
+async function act(c,a){ S = await (await fetch("/api/tether_web:act",
+                          {method:"POST",body:`client=${c}&action=${a}`})).json(); draw(); }
 
-function el(tag, cls, txt) {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (txt !== undefined) n.textContent = txt;
-  return n;
-}
+const NOTE = "note";
+const noteOf = rows => (rows.find(o=>o.key===NOTE)||{}).value || "—";
+const items  = rows => rows.filter(o=>o.key!==NOTE);
 
-// サーバが持っている鍵の集合。手元との差を色で出す。
-function serverKeys() { return new Set(S.server.orders.map(o => o.key)); }
-
-function draw() {
-  const app = $("#app");
-  app.textContent = "";
-  const [a, b] = S.clients;
-  app.append(clientCard(a), serverCard(), clientCard(b));
-}
-
-function clientCard(c) {
-  const card = el("div", "card");
-  const h = el("h2", "", c.name);
-  h.append(el("span", "badge " + (c.online ? "on" : "off"),
-              c.online ? "圏内" : "圏外"));
-  card.append(h);
-
-  const st = el("div", "stats");
-  st.innerHTML = `版 <b>${c.version}</b>　送信待ち <b>${c.queued}</b>　預かり <b>${c.grant}</b>`;
-  card.append(st);
-
-  const btns = el("div", "btns");
-  const net = el("button", "net" + (c.online ? "" : " isoff"),
-                 c.online ? "圏外にする" : "圏内に戻す");
-  net.onclick = () => act(c.name, c.online ? "offline" : "online");
-  btns.append(net);
-  [["メモを書く","write"],["預かりを取る","acquire"],["1個売る","sell"],["同期","sync"]]
-    .forEach(([label, action]) => {
-      const btn = el("button", "", label);
-      btn.onclick = () => act(c.name, action);
-      btns.append(btn);
-    });
-  card.append(btns);
-
-  const sk = serverKeys();
-  const ck = new Set(c.orders.map(o => o.key));
-  const ul = el("ul");
-  c.orders.forEach(o => {
-    const li = el("li", sk.has(o.key) ? "" : "local");
-    li.append(el("span", "", o.key), el("span", "v", o.value));
-    ul.append(li);
+function draw(){
+  const app=$("#app"); app.textContent="";
+  const [a,b]=S.clients;
+  app.append(card(a), server(), card(b));
+  const log=$("#log"); log.textContent="";
+  S.log.forEach(e=>{
+    const d=el("div","ev "+e.kind);
+    d.append(el("span","who",e.who), el("span","",e.what));
+    if(e.detail) d.append(el("span","det",e.detail));
+    log.append(d);
   });
-  // サーバにあって手元に無いもの
-  S.server.orders.filter(o => !ck.has(o.key)).forEach(o => {
-    const li = el("li", "missing");
-    li.append(el("span", "", o.key), el("span", "v", "未受信"));
-    ul.append(li);
-  });
-  card.append(ul.children.length ? ul : el("div", "empty", "(空)"));
-
-  const lg = el("div", "legend");
-  lg.innerHTML =
-    `<span class="sw" style="background:var(--warn)"></span>手元だけ(未送信)<br>` +
-    `<span class="sw" style="background:var(--err)"></span>サーバにあるが未受信`;
-  card.append(lg);
-  return card;
 }
 
-function serverCard() {
-  const s = S.server;
-  const card = el("div", "card server");
-  card.append(el("h2", "", "サーバ"));
+function card(c){
+  const k=el("div","card");
+  const h=el("h2","",c.name);
+  h.append(el("span","badge "+(c.online?"on":"off"), c.online?"圏内":"圏外"));
+  k.append(h);
 
-  const st = el("div", "stats");
-  st.innerHTML = `版 <b>${s.version}</b>　中央在庫 <b>${s.available}</b>　配ってある <b>${s.granted}</b>`;
-  card.append(st);
+  const st=el("div","stats");
+  st.innerHTML = `版 <b>${c.version}</b>　送信待ち <b class="${c.queued?'hot':''}">${c.queued}</b>`
+    + `　預かり <b>${c.grant}</b>` + (c.grant&&c.expires<60 ? `<b class="hot">（あと${c.expires}秒）</b>`:"");
+  k.append(st);
 
-  // 在庫の内訳を棒で
-  const total = s.available + s.granted || 1;
-  const pool = el("div", "pool");
-  if (s.available) {
-    const d = el("div", "bar a", String(s.available));
-    d.style.flex = s.available; pool.append(d);
+  // 直前の同期で何が起きたか。**却下されたことを黙って消さない**
+  const L=c.last||{};
+  if(L.state==="rejected"){
+    const w=el("div","note reject");
+    w.append(el("small","","直前の同期"),
+             document.createTextNode(`${L.at}件目で却下された。${L.unsent}件は送られていない（手元の変更は覆った）`));
+    k.append(w);
+  } else if(L.state==="resynced"){
+    const w=el("div","note resync");
+    w.append(el("small","","直前の同期"),
+             document.createTextNode("差分では追いつけず、全件を取り直した"));
+    k.append(w);
   }
-  if (s.granted) {
-    const d = el("div", "bar g", String(s.granted));
-    d.style.flex = s.granted; pool.append(d);
-  }
-  if (!s.available && !s.granted) pool.append(el("div", "empty", "在庫なし"));
-  card.append(pool);
-  card.append(el("div", "legend",
-                 "緑=中央に残っている　黄=端末に配ってある(未消費)"));
 
-  const btns = el("div", "btns");
-  [["第三者が書く","server_write"],["在庫を空にする","drain"]]
-    .forEach(([label, action]) => {
-      const btn = el("button", "", label);
-      btn.onclick = () => act("alice", action);
-      btns.append(btn);
-    });
-  card.append(btns);
+  // 共有メモ。サーバと違えば黄枠。**覆る瞬間はここに出る**
+  const mine=noteOf(c.orders), srv=noteOf(S.server.orders);
+  const n=el("div","note"+(mine!==srv?" diff":""));
+  n.append(el("small","","共有メモ"), document.createTextNode(mine));
+  k.append(n);
 
-  const ul = el("ul");
-  s.orders.forEach(o => {
-    const li = el("li");
-    li.append(el("span", "", o.key), el("span", "v", o.value));
-    ul.append(li);
+  const b=el("div","btns");
+  const net=el("button","net"+(c.online?"":" isoff"), c.online?"圏外にする":"圏内に戻す");
+  net.onclick=()=>act(c.name, c.online?"offline":"online"); b.append(net);
+  [["共有メモを編集","edit"],["メモ","write"],["預かり","acquire"],
+   ["短い預かり(8秒)","short"],["1個売る","sell"],["同期","sync"]]
+   .forEach(([l,a])=>{const x=el("button","",l); x.onclick=()=>act(c.name,a); b.append(x);});
+  k.append(b);
+
+  const sk=new Set(items(S.server.orders).map(o=>o.key));
+  const ck=new Set(items(c.orders).map(o=>o.key));
+  const ul=el("ul");
+  items(c.orders).forEach(o=>{
+    const li=el("li", sk.has(o.key)?"":"local");
+    li.append(el("span","",o.key), el("span","v",o.value)); ul.append(li);
   });
-  card.append(ul.children.length ? ul : el("div", "empty", "(空)"));
-  return card;
+  items(S.server.orders).filter(o=>!ck.has(o.key)).forEach(o=>{
+    const li=el("li","missing");
+    li.append(el("span","",o.key), el("span","v","未受信")); ul.append(li);
+  });
+  k.append(ul.children.length?ul:el("div","empty","(空)"));
+  const lg=el("div","legend");
+  lg.innerHTML=`<span class="sw" style="background:var(--warn)"></span>手元だけ(未送信)`
+    +`<br><span class="sw" style="background:var(--err)"></span>サーバにあるが未受信`;
+  k.append(lg);
+  return k;
 }
 
-load();
-setInterval(load, 1000);
+function server(){
+  const s=S.server, k=el("div","card server");
+  k.append(el("h2","","サーバ"));
+  const st=el("div","stats");
+  st.innerHTML=`版 <b>${s.version}</b>　中央在庫 <b>${s.available}</b>　配ってある <b>${s.granted}</b>`;
+  k.append(st);
+
+  const n=el("div","note");
+  n.append(el("small","","共有メモ（正)"), document.createTextNode(noteOf(s.orders)));
+  k.append(n);
+
+  const pool=el("div","pool"), tot=s.available+s.granted;
+  if(s.available){const d=el("div","bar a",String(s.available)); d.style.flex=s.available; pool.append(d);}
+  if(s.granted){const d=el("div","bar g",String(s.granted)); d.style.flex=s.granted; pool.append(d);}
+  if(!tot) pool.append(el("div","empty","在庫なし"));
+  k.append(pool);
+  k.append(el("div","legend","緑=中央に残っている　黄=端末に配ってある(未消費)"));
+
+  if(S.hist.length){
+    k.append(el("div","legend","配られた量の推移（在庫が減ると小さくなる）"));
+    const hs=el("div","hist"), mx=Math.max(...S.hist);
+    S.hist.forEach(g=>{const d=el("div","",String(g));
+      d.style.height=Math.max(12, 34*g/mx)+"px"; hs.append(d);});
+    k.append(hs);
+  }
+
+  const b=el("div","btns");
+  [["第三者が書く","server_write",""],["第三者が共有メモを編集","conflict","danger"],
+   ["40件書く","flood","danger"],["在庫を空にする","drain","danger"],
+   ["最初から","reset",""]]
+   .forEach(([l,a,c])=>{const x=el("button",c,l); x.onclick=()=>act("alice",a); b.append(x);});
+  k.append(b);
+
+  const ul=el("ul");
+  items(s.orders).forEach(o=>{const li=el("li");
+    li.append(el("span","",o.key), el("span","v",o.value)); ul.append(li);});
+  k.append(ul.children.length?ul:el("div","empty","(空)"));
+  return k;
+}
+
+load(); setInterval(load, 1000);
 </script>
 </body>
 </html>

@@ -33,7 +33,9 @@
 -record(c, {
           replica       :: tether_replica:replica(),
           colls  = []   :: [binary()],
-          online = true :: boolean()
+          online = true :: boolean(),
+          %% 直近の sync の結果。**拒否されたことを見せるために要る。**
+          last   = none :: none | map()
          }).
 
 %%%===================================================================
@@ -136,7 +138,11 @@ handle_call({acquire, Res, Want, Ttl}, _From, #c{replica = R} = S) ->
 
 handle_call(sync, _From, S) ->
     {Reply, S1} = do_sync(S),
-    {reply, Reply, S1};
+    Last = case Reply of
+               {ok, Out} -> Out;
+               {error, E} -> #{error => E}
+           end,
+    {reply, Reply, S1#c{last = Last}};
 
 handle_call(state, _From, #c{replica = R, online = On} = S) ->
     {reply, #{client  => tether_replica:client(R),
@@ -144,6 +150,8 @@ handle_call(state, _From, #c{replica = R, online = On} = S) ->
               seq     => tether_replica:seq(R),
               queued  => tether_replica:queued_count(R),
               grants  => tether_replica:grants(now_ms(), R),
+              expires => tether_replica:expiry(now_ms(), R),
+              last    => S#c.last,
               online  => On}, S};
 
 handle_call({dump, Coll}, _From, #c{replica = R} = S) ->

@@ -34,7 +34,7 @@
 
 -export([new/1, seq/1, version/1, client/1]).
 -export([apply_local/3, view/2, get/3, pending/1, queued_count/1]).
--export([confirm/4, confirm_seq/2, reset/4, set_grant/4, grants/2]).
+-export([confirm/4, confirm_seq/2, reset/4, set_grant/4, grants/2, expiry/2]).
 
 -export_type([replica/0, outcome/0]).
 
@@ -52,9 +52,11 @@
 %%   accepted  サーバが実行した束の数
 %%   rejected  そこで落ちた理由(あれば)
 %%   unsent    落ちた後ろで**実行されなかった**束。判断は呼び出し側に返す
+%%   resynced  差分で追いつけず、全件を取り直した場合だけ付く
 -type outcome() :: #{accepted := non_neg_integer(),
                      rejected := none | {pos_integer(), term()},
-                     unsent   := [[tether_data:op()]]}.
+                     unsent   := [[tether_data:op()]],
+                     resynced => boolean()}.
 
 %%%===================================================================
 
@@ -154,6 +156,19 @@ set_grant(Resource, Remaining, Expires, #rep{client = Cl, confirmed = C} = R) ->
     G = #{remaining => Remaining, taken => 0,
           granted_at => Expires, expires_at => Expires},
     R#rep{confirmed = C#{K => term_to_binary(G)}}.
+
+%% @doc 預かりの残り時間(ミリ秒)。切れていたら 0。
+-spec expiry(integer(), replica()) -> integer().
+expiry(Now, #rep{client = Cl} = R) ->
+    Db = view(Now, R),
+    case tether_escrow:holdings(Cl, Db) of
+        [Res | _] ->
+            case tether_escrow:grant_view(Cl, Res, Db) of
+                {_, E} -> max(0, E - Now);
+                none   -> 0
+            end;
+        [] -> 0
+    end.
 
 %% @doc 手元が把握している預かり(未送信の消費を差し引いたもの)。
 -spec grants(integer(), replica()) -> [{binary(), non_neg_integer()}].
