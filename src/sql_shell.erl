@@ -20,7 +20,7 @@
 
 -define(PROMPT, "sql> ").
 -define(CONT_PROMPT, "  -> ").
--define(MAX_COL_WIDTH, 40).
+-define(MAX_COL_WIDTH, 100).   %% 実行計画の行が入る幅にしてある
 
 -record(sh, {conn, timing = false}).
 

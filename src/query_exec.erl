@@ -260,6 +260,12 @@ run_sql(State, {drop_table, Table}) ->
 %% DML。トランザクションが要る
 run_sql(State, {select, Plan}) ->
     with_transaction(State, fun() -> do_sql_select(State, Plan) end);
+
+%% EXPLAIN はデータに触らないのでトランザクションを要らない。
+%% 必要なカタログの照合は解析の時点で済んでいる。
+run_sql(State, {explain, Logical}) ->
+    Lines = sql_explain:explain(sql_planner:plan(Logical)),
+    {reply, {ok, ['QUERY PLAN'], [[L] || L <- Lines]}, State};
 run_sql(State, {insert, Table, Row}) ->
     with_transaction(State, fun() -> do_insert(State, Table, Row) end);
 run_sql(State, {update, Table, Assigns, Pred}) ->
@@ -267,7 +273,10 @@ run_sql(State, {update, Table, Assigns, Pred}) ->
 run_sql(State, {delete, Table, Pred}) ->
     with_transaction(State, fun() -> do_sql_delete(State, Table, Pred) end).
 
-do_sql_select(State, Plan) ->
+do_sql_select(State, Logical) ->
+    %% 論理プランから物理プランを作る。実行方法(全表走査か索引か、
+    %% どの結合アルゴリズムか)がここで決まる。
+    Plan = sql_planner:plan(Logical),
     %% 実行器にはストレージへの入口を関数で渡す。
     %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
     %% かつ走査がこのトランザクションの未コミット変更を見られる。

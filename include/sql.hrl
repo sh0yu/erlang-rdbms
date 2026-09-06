@@ -65,6 +65,11 @@
 %%% FROM句
 %%%===================================================================
 
+%% EXPLAIN <SELECT文>。実行せずに、選ばれた実行計画を返す。
+-record(explain_stmt, {
+    stmt
+}).
+
 -record(table_ref, {
     name,               % string() -> アナライザ後は atom()
     alias = undefined   % string() | undefined

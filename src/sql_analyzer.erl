@@ -1,6 +1,9 @@
 %%%-------------------------------------------------------------------
 %%% @doc
-%%% 意味解析(binder)。ASTとカタログを突き合わせて実行可能な形にする。
+%%% 意味解析(binder)。ASTとカタログを突き合わせて**論理プラン**にする。
+%%%
+%%% ここが出すのは「何をするか」までで、どうやるかは決めない。
+%%% 索引を使うか、どの順で結合するかは sql_planner の仕事。
 %%%
 %%% パーサは構文だけを見るのでカタログを知らない。ここが担うのは:
 %%%   - テーブル名・カラム名の解決(存在チェック)
@@ -21,7 +24,7 @@
 -export([analyze/1]).
 
 -include("../include/sql.hrl").
--include("../include/plan.hrl").
+-include("../include/logical.hrl").
 -include("../include/catalog.hrl").
 
 %% 名前解決のスコープ。結合すると複数テーブルのカラムが1つの行に並ぶので、
@@ -64,6 +67,15 @@ analyze(#delete_stmt{table = TableStr, where = Where}) ->
                        end
                end);
 
+%% EXPLAIN は中の文を解析するだけで実行しない。
+%% 実行計画を持つのは SELECT だけなので、他は断る。
+analyze(#explain_stmt{stmt = Inner}) ->
+    case analyze(Inner) of
+        {ok, {select, Logical}} -> {ok, {explain, Logical}};
+        {ok, _Other}            -> {error, explain_requires_select};
+        {error, Reason}         -> {error, Reason}
+    end;
+
 analyze(#select_stmt{from = From} = Stmt) ->
     case build_from(From) of
         {error, Reason} -> {error, Reason};
@@ -83,7 +95,7 @@ build_from(#table_ref{name = TableStr, alias = Alias}) ->
             Scope = [#sc{alias = Name, name = C#column.name, type = C#column.type,
                          pos = C#column.position}
                      || C <- Columns],
-            {ok, Scope, #p_seq_scan{table = Table, schema = [C#column.name || C <- Columns]}}
+            {ok, Scope, #lp_scan{table = Table, schema = [C#column.name || C <- Columns]}}
     end;
 build_from(#join{type = Type, left = L, right = R, on = On}) ->
     case build_from(L) of
@@ -102,7 +114,7 @@ build_from(#join{type = Type, left = L, right = R, on = On}) ->
                         {error, Reason} ->
                             {error, Reason};
                         {ok, Pred} ->
-                            {ok, Scope, #p_nl_join{type = Type, pred = Pred,
+                            {ok, Scope, #lp_join{type = Type, pred = Pred,
                                                    left = LNode, right = RNode,
                                                    right_width = length(RScope)}}
                     end
@@ -151,7 +163,7 @@ bind_plain_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
                         {ok, Keys} ->
                             Filtered = wrap_filter(Pred, Node),
                             Sorted = wrap_sort(Keys, Limit, Offset, Filtered),
-                            Projected = #p_project{exprs = Exprs, names = Names,
+                            Projected = #lp_project{exprs = Exprs, names = Names,
                                                    input = Sorted},
                             %% DISTINCT は射影の後(出力する列で重複を見る)
                             Distincted = wrap_distinct(Distinct, Projected),
@@ -186,7 +198,7 @@ bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group
                           {error, Reason} ->
                               {error, Reason};
                           {ok, BHaving, #{aggs := Aggs}} ->
-                              Agg = #p_agg{group_by = Keys, aggs = lists:reverse(Aggs),
+                              Agg = #lp_agg{group_by = Keys, aggs = lists:reverse(Aggs),
                                            having = BHaving,
                                            input = wrap_filter(Pred, Node)},
                               %% 並べ替えは集約と射影の**間**に置く。
@@ -197,7 +209,7 @@ bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group
                                       {error, Reason};
                                   {ok, SortKeys} ->
                                       Sorted = wrap_sort_after(SortKeys, Agg),
-                                      Proj = #p_project{exprs = Exprs, names = Names,
+                                      Proj = #lp_project{exprs = Exprs, names = Names,
                                                         input = Sorted},
                                       D = wrap_distinct(Distinct, Proj),
                                       {ok, {select, wrap_limit(Limit, Offset, SortKeys, D)}}
@@ -208,7 +220,7 @@ bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group
 
 %% 集約の後ろに置く並べ替えは、射影済みの行に対して働く。
 wrap_sort_after([], Node) -> Node;
-wrap_sort_after(Keys, Node) -> #p_sort{keys = Keys, input = Node}.
+wrap_sort_after(Keys, Node) -> #lp_sort{keys = Keys, input = Node}.
 
 %% 射影の各項目を、集約後の行を指す形に書き換える。
 rewrite_items(Items, Ctx) ->
@@ -375,26 +387,26 @@ contains_func(#is_null{arg = A}) -> contains_func(A);
 contains_func(_) -> false.
 
 wrap_filter(undefined, Node) -> Node;
-wrap_filter(Pred, Node) -> #p_filter{pred = Pred, input = Node}.
+wrap_filter(Pred, Node) -> #lp_filter{pred = Pred, input = Node}.
 
 wrap_sort([], _Limit, _Offset, Node) ->
     Node;
 wrap_sort(Keys, Limit, Offset, Node) ->
     %% LIMIT があるなら、全件並べずに上位 (offset + count) 件だけ保てばよい。
     %% DISTINCT があると件数が変わるので、その場合は上限を渡さない。
-    #p_sort{keys = Keys, limit = topn_limit(Limit, Offset), input = Node}.
+    #lp_sort{keys = Keys, limit = topn_limit(Limit, Offset), input = Node}.
 
 topn_limit(undefined, _Offset) -> undefined;
 topn_limit(Count, undefined) -> Count;
 topn_limit(Count, Offset) -> Count + Offset.
 
 wrap_distinct(false, Node) -> Node;
-wrap_distinct(true, Node) -> #p_distinct{input = Node}.
+wrap_distinct(true, Node) -> #lp_distinct{input = Node}.
 
 wrap_limit(undefined, undefined, _Keys, Node) ->
     Node;
 wrap_limit(Count, Offset, _Keys, Node) ->
-    #p_limit{count = Count, offset = default_offset(Offset), input = Node}.
+    #lp_limit{count = Count, offset = default_offset(Offset), input = Node}.
 
 default_offset(undefined) -> 0;
 default_offset(N) -> N.

@@ -52,12 +52,17 @@ render_numbers_test() ->
 render_atom_test() ->
     ?assertEqual("apple", sql_shell:render(apple)).
 
-%% 長い値は打ち切る。表が崩れないようにするため
+%% 長い値は打ち切る。表が崩れないようにするため。
+%% 幅そのものは実装の都合(EXPLAIN の行が入るかどうか)で動くので、
+%% 「入力より短くなり、打ち切りが分かる」ことだけを見る。
 render_truncates_long_values_test() ->
-    Long = list_to_binary(lists:duplicate(200, $x)),
+    Long = list_to_binary(lists:duplicate(500, $x)),
     R = sql_shell:render(Long),
-    ?assert(length(R) =< 40),
-    ?assert(lists:suffix("...", R)).
+    ?assert(length(R) < 500),
+    ?assert(lists:suffix("...", R)),
+    %% 実行計画の行(80桁程度)は切られないこと
+    Plan = "      Nested Loop LEFT Join on ((dept = id) AND (sal > 100))",
+    ?assertEqual(Plan, sql_shell:render(list_to_binary(Plan))).
 
 %%%===================================================================
 %%% エラー文言

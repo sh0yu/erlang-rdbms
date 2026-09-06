@@ -52,10 +52,8 @@ run(Plan, {ScanOpen, ScanNext}) ->
             {error, Reason};
         Op ->
             try
-                case drain(Op, []) of
-                    {ok, Rows} -> {ok, column_names(Plan), Rows};
-                    {error, Reason} -> {error, Reason}
-                end
+                {ok, Rows} = drain(Op, []),
+                {ok, column_names(Plan), Rows}
             after
                 close(Op)
             end
@@ -104,10 +102,8 @@ open(#p_sort{keys = Keys, limit = Limit, input = Input}, Ctx) ->
         {error, Reason} ->
             {error, Reason};
         Child ->
-            case collect(Child, []) of
-                {error, Reason} -> {error, Reason};
-                {ok, Rows} -> #op{kind = sorted, st = sort_rows(Keys, Limit, Rows)}
-            end
+            {ok, Rows} = collect(Child, []),
+            #op{kind = sorted, st = sort_rows(Keys, Limit, Rows)}
     end;
 open(#p_limit{count = Count, offset = Offset, input = Input}, Ctx) ->
     case open(Input, Ctx) of
@@ -131,16 +127,12 @@ open(#p_nl_join{type = Type, pred = Pred, left = L, right = R, right_width = W},
                 {error, Reason} ->
                     {error, Reason};
                 Right ->
-                    case collect(Right, []) of
-                        {error, Reason} ->
-                            {error, Reason};
-                        {ok, Rows} ->
-                            close(Right),
-                            #op{kind = nl_join,
-                                st = #{type => Type, pred => Pred, left => Left,
-                                       rows => Rows, rest => [], cur => undefined,
-                                       matched => false, width => W}}
-                    end
+                    {ok, Rows} = collect(Right, []),
+                    close(Right),
+                    #op{kind = nl_join,
+                        st = #{type => Type, pred => Pred, left => Left,
+                               rows => Rows, rest => [], cur => undefined,
+                               matched => false, width => W}}
             end
     end;
 %% 集約もブロッキング演算子。入力を読み切ってグループごとにまとめる。
@@ -149,16 +141,12 @@ open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) 
         {error, Reason} ->
             {error, Reason};
         Child ->
-            case collect(Child, []) of
-                {error, Reason} ->
-                    {error, Reason};
-                {ok, Rows} ->
-                    %% 上位の演算子(並べ替え・射影)は行をタプルとして扱う。
-                    %% 束縛済みの式が位置参照で、element/2 で引くため。
-                    Out = [list_to_tuple(R) || R <- aggregate(Keys, Aggs, Rows)],
-                    #op{kind = sorted,
-                        st = [R || R <- Out, sql_expr:eval_pred(Having, R)]}
-            end
+            {ok, Rows} = collect(Child, []),
+            %% 上位の演算子(並べ替え・射影)は行をタプルとして扱う。
+            %% 束縛済みの式が位置参照で、element/2 で引くため。
+            Out = [list_to_tuple(R) || R <- aggregate(Keys, Aggs, Rows)],
+            #op{kind = sorted,
+                st = [R || R <- Out, sql_expr:eval_pred(Having, R)]}
     end.
 
 %% 入力を読み切る。並べ替えのようなブロッキング演算子で使う。
