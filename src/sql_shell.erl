@@ -87,6 +87,11 @@ tour_path() ->
 %% data_dir を指定できるようにしておくと、試すたびに
 %% 前回のデータを引きずらずに済む。
 ensure_db(Opts) ->
+    %% load を先に済ませること。application:load/1 は .app の env を
+    %% 読み込むので、未 load の状態で set_env しても上書きされて
+    %% 既定値に戻る。VM内で最初に起動したときだけ data_dir が
+    %% 無視される、という再現しにくい形で出る。
+    _ = application:load(transaction_db),
     case maps:get(data_dir, Opts, undefined) of
         undefined -> ok;
         Dir -> application:set_env(transaction_db, data_dir, Dir)

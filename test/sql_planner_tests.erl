@@ -17,7 +17,14 @@ planner_test_() ->
       fun filter_and_project_pass_through/1,
       fun join_maps_to_nested_loop/1,
       fun agg_sort_limit_distinct_pass_through/1,
-      fun rewrite_is_identity_for_now/1,
+      fun single_table_filter_is_unchanged/1,
+      fun pushdown_splits_across_inner_join/1,
+      fun pushdown_shifts_positions_to_right_side/1,
+      fun left_join_where_on_null_side_stays_above/1,
+      fun left_join_on_condition_on_null_side_is_pushed/1,
+      fun left_join_on_condition_on_preserved_side_stays/1,
+      fun cross_predicate_stays_above/1,
+      fun left_join_results_unchanged_by_pushdown/1,
       fun explain_renders_tree/1,
       fun explain_names_positions/1,
       fun explain_schema_of_join_is_concatenation/1,
@@ -61,14 +68,115 @@ agg_sort_limit_distinct_pass_through(_) ->
                           "GROUP BY dept ORDER BY dept LIMIT 2"))
     end.
 
-%% いまの rewrite/1 は恒等。7-2 で述語を落とすようになったら、
-%% このテストが落ちて変更に気づける。
-rewrite_is_identity_for_now(_) ->
+%% 落とす先が無い(結合が無い)ときは何も変わらない。
+single_table_filter_is_unchanged(_) ->
     fun() ->
         seed(),
         L = logical("SELECT name FROM emp WHERE id = 1"),
         ?assertEqual(L, sql_planner:rewrite(L)),
         ?assertMatch(#lp_project{input = #lp_filter{input = #lp_scan{table = emp}}}, L)
+    end.
+
+%%%===================================================================
+%%% 述語のプッシュダウン
+%%%===================================================================
+
+%% 片側だけを見ている条件は、その側へ落ちる。
+pushdown_splits_across_inner_join(_) ->
+    fun() ->
+        seed2(),
+        ?assertEqual([<<"Project (name, dname)">>,
+                      <<"  Nested Loop INNER Join on (dept = id)">>,
+                      <<"    Filter (sal > 100)">>,
+                      <<"      Seq Scan on emp">>,
+                      <<"    Filter (budget < 900)">>,
+                      <<"      Seq Scan on dept">>],
+                     lines("SELECT e.name, d.dname FROM emp e JOIN dept d "
+                           "ON e.dept = d.id WHERE e.sal > 100 AND d.budget < 900"))
+    end.
+
+%% 右側へ落とすときは位置を左の幅だけ戻す。
+%% 戻し忘れると別のカラムを見ることになる。
+pushdown_shifts_positions_to_right_side(_) ->
+    fun() ->
+        seed2(),
+        P = plan("SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id "
+                 "WHERE d.budget < 900"),
+        #p_project{input = #p_nl_join{right = Right}} = P,
+        %% dept の budget は dept 単体では3番目。結合後は 4+3=7番目。
+        ?assertMatch(#p_filter{pred = {comp, '<', {ref, 3}, {const, 900}}}, Right)
+    end.
+
+%% LEFT JOIN の NULL を供給する側に対する WHERE は落とせない。
+%% 落とすと、一致しない左の行がNULL埋めで残ってしまい結果が変わる。
+left_join_where_on_null_side_stays_above(_) ->
+    fun() ->
+        seed2(),
+        ?assertEqual([<<"Project (name, dname)">>,
+                      <<"  Filter (budget < 900)">>,
+                      <<"    Nested Loop LEFT Join on (dept = id)">>,
+                      <<"      Seq Scan on emp">>,
+                      <<"      Seq Scan on dept">>],
+                     lines("SELECT e.name, d.dname FROM emp e LEFT JOIN dept d "
+                           "ON e.dept = d.id WHERE d.budget < 900"))
+    end.
+
+%% 同じ条件でも ON に書いてあれば落とせる。
+%% ON は「何を一致とみなすか」なので、先に絞っても一致集合は変わらない。
+left_join_on_condition_on_null_side_is_pushed(_) ->
+    fun() ->
+        seed2(),
+        ?assertEqual([<<"Project (name)">>,
+                      <<"  Nested Loop LEFT Join on (dept = id)">>,
+                      <<"    Seq Scan on emp">>,
+                      <<"    Filter (budget < 900)">>,
+                      <<"      Seq Scan on dept">>],
+                     lines("SELECT e.name FROM emp e LEFT JOIN dept d "
+                           "ON e.dept = d.id AND d.budget < 900"))
+    end.
+
+%% 保存される側(左)の ON 条件は落とせない。
+%% 落とすと、条件を満たさない左の行が消える。本来はNULL埋めで残る。
+left_join_on_condition_on_preserved_side_stays(_) ->
+    fun() ->
+        seed2(),
+        ?assertEqual([<<"Project (name)">>,
+                      <<"  Nested Loop LEFT Join on ((dept = id) AND (sal > 100))">>,
+                      <<"    Seq Scan on emp">>,
+                      <<"    Seq Scan on dept">>],
+                     lines("SELECT e.name FROM emp e LEFT JOIN dept d "
+                           "ON e.dept = d.id AND e.sal > 100"))
+    end.
+
+%% 両側を見ている条件はどちらにも落とせない。
+cross_predicate_stays_above(_) ->
+    fun() ->
+        seed2(),
+        L = lines("SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id "
+                  "WHERE e.sal < d.budget"),
+        ?assertEqual([<<"Project (name)">>,
+                      <<"  Filter (sal < budget)">>,
+                      <<"    Nested Loop INNER Join on (dept = id)">>,
+                      <<"      Seq Scan on emp">>,
+                      <<"      Seq Scan on dept">>], L)
+    end.
+
+%% 書き換えは結果を変えてはならない。危ないのは外部結合なので、
+%% 実際に走らせて確かめる。
+left_join_results_unchanged_by_pushdown(_) ->
+    fun() ->
+        C = seed2(),
+        %% dan(dept未設定) は一致しないのでNULL埋め。
+        %% budget < 900 は NULL に対して unknown なので落ちる。
+        ?assertEqual([[<<"ada">>, <<"eng">>]],
+                     rows(C, "SELECT e.name, d.dname FROM emp e LEFT JOIN dept d "
+                             "ON e.dept = d.id WHERE d.budget < 900")),
+        %% 同じ条件を ON に書くと、一致しない行がNULL埋めで残る
+        ?assertEqual([[<<"ada">>, <<"eng">>],
+                      [<<"bob">>, null],
+                      [<<"dan">>, null]],
+                     rows(C, "SELECT e.name, d.dname FROM emp e LEFT JOIN dept d "
+                             "ON e.dept = d.id AND d.budget < 900 ORDER BY e.name"))
     end.
 
 %%%===================================================================
@@ -134,6 +242,29 @@ explain_does_not_execute(_) ->
 %%%===================================================================
 %%% 土台
 %%%===================================================================
+
+%% budget を持つ dept と、一致しない行を含む emp。
+seed2() ->
+    C = connect(),
+    ok = q(C, "CREATE TABLE emp (id INTEGER, name VARCHAR, dept INTEGER, sal INTEGER)"),
+    ok = q(C, "CREATE TABLE dept (id INTEGER, dname VARCHAR, budget INTEGER)"),
+    ok = q(C, "BEGIN"),
+    {ok, _} = q(C, "INSERT INTO emp VALUES (1, 'ada', 10, 500)"),
+    {ok, _} = q(C, "INSERT INTO emp VALUES (2, 'bob', 20, 300)"),
+    {ok, _} = q(C, "INSERT INTO emp (id, name, sal) VALUES (3, 'dan', 50)"),
+    {ok, _} = q(C, "INSERT INTO dept VALUES (10, 'eng', 800)"),
+    {ok, _} = q(C, "INSERT INTO dept VALUES (20, 'sales', 1200)"),
+    ok = q(C, "COMMIT"),
+    C.
+
+lines(Sql) -> sql_explain:explain(plan(Sql)).
+
+%% SELECT はトランザクションを要求する(暗黙には開かない)。
+rows(C, Sql) ->
+    ok = q(C, "BEGIN"),
+    {ok, _, R} = q(C, Sql),
+    ok = q(C, "ROLLBACK"),
+    R.
 
 seed() ->
     C = connect(),
