@@ -148,7 +148,7 @@ ok = gen_connection:disconnect(C).
 | `client_1:exec()` | ストレージエンジンを直接叩く例(トランザクションなし) |
 | `client_query_exec:exec()` | トランザクションつきの一通りの操作 |
 | `client_perf:exec(N)` | INSERT/SELECT/UPDATE/DELETEのスループット測定 |
-| `client_query_tx_perf:exec(N)` | N個の接続が同じ行を並行に加算し、取りこぼしがないことを確認 |
+| `client_query_tx_perf:exec(N)` | N個の接続が同じ行を並行に加算。分離水準と書き方で結果がどう変わるかを3通り並べて出す |
 
 ## クエリ
 
@@ -174,7 +174,7 @@ SELECT [DISTINCT] * | expr [AS name], ... FROM from_item [WHERE expr]
 
 from_item は表名、結合、または導出表:
   FROM (SELECT ...) AS t
-BEGIN;  BEGIN READ ONLY;  COMMIT;  ROLLBACK;
+BEGIN;  BEGIN READ ONLY;  BEGIN READ COMMITTED;  COMMIT;  ROLLBACK;
 ```
 
 型は `INTEGER` / `FLOAT` / `VARCHAR` / `BOOLEAN`。暗黙変換はしない
@@ -299,6 +299,14 @@ UPDATE ...;       -- その行の書き込みロックを取る。競合すれ�
 COMMIT;           -- 衝突を確かめてから適用する
 ```
 
+分離水準は2つある。
+
+| | スナップショットを取る単位 | 待たされた後 |
+| --- | --- | --- |
+| `BEGIN`(既定) | トランザクションに1つ | 断る(`serialization_failure`) |
+| `BEGIN READ COMMITTED` | **文ごと** | 読み直して文をやり直す |
+| `BEGIN READ ONLY` | トランザクションに1つ。書けない | — |
+
 読み取り専用(`BEGIN READ ONLY`)は、これに加えて `tx_mng` にも
 `lock_mng` にも触らない。**読み手と書き手は互いを待たない。**
 
@@ -410,6 +418,34 @@ buf_dir : {TableName, PageId} -> {BufName, Gen}
 
 修正前は8接続で頭打ちだった。修正後は16接続あたりまで伸びて、そこからは
 CPU(16コア)で頭打ちになる。**待っている場所がプロセスからCPUに移った。**
+
+#### READ COMMITTED
+
+既定(`BEGIN`)は反復可能読み取りを保つ代わりに、同じ行を同時に更新すると
+後から来た方を断る。1つの行に接続が集中すると、待たされた側が**必ず**
+断られるので、やり直しが O(n^2) になる。
+
+`BEGIN READ COMMITTED` はスナップショットを文ごとに取り直す。行ロックを
+待たされた後は、待っている間に入った変更を読み直して**文の頭からやり直す**
+(ロックはもう持っているので2度目は待たない)。断らないので、やり直しは
+待ちの回数だけで済む。失うのは反復可能読み取りで、同じトランザクションの
+中で2度読むと違う結果が返りうる。PostgreSQL の既定と同じ割り切り。
+
+**ただし守るのは文の中だけ。** 100接続が同じ行を +1 する例
+(`client_query_tx_perf:exec(100)`):
+
+| 書き方 | 結果 | やり直し | 時間 |
+| --- | --- | ---: | ---: |
+| `BEGIN` + クライアント側で読んで足す + やり直し | 100 ✓ | 4,950 | 1,303 ms |
+| `BEGIN READ COMMITTED` + クライアント側で読んで足す | **1**(99件が消える) | 0 | 608 ms |
+| `BEGIN READ COMMITTED` + `SET v = v + 1` | 100 ✓ | 0 | 470 ms |
+
+2行目が READ COMMITTED の罠で、**断られないので気づけない**。
+`SELECT` で読んだ値は `UPDATE` を書いた時点ではもう古い。
+PostgreSQL の既定でも同じことが起きる。
+
+文をまたぐ「読んで書く」を守るには、`BEGIN` でやり直すか、
+`SELECT ... FOR UPDATE`(未実装)で読む時点でロックを取るしかない。
 
 #### 何が保証され、何が保証されないか
 
@@ -800,11 +836,9 @@ lost update は防げるが write skew は防げない。
 * **グループコミット** — fsync ありの伸びが鈍いのは、コミットごとに
   1回同期しているため。複数のコミットのログを1回の fsync でまとめれば、
   接続数に対してもっと素直に伸びる
-* **`READ COMMITTED`** — 1つの行に多数の接続が集中すると、スナップショット
-  分離では待った側が必ず断られ、やり直しが O(n^2) になる(200接続が同じ行を
-  +1 する例で19,900回)。PostgreSQL の既定である READ COMMITTED は、
-  ロック待ちのあとにその行だけ読み直して続行するのでこれを避ける。
-  分離水準を選べるようにするのが筋
+* **`SELECT ... FOR UPDATE`** — 文をまたぐ「読んで書く」を守る手段が、
+  いまは `BEGIN`(REPEATABLE READ)でやり直すしかない。読む時点で行ロックを
+  取れれば、READ COMMITTED でも取りこぼさずに書ける
 * **ファントム** — `INSERT` はロックの対象になる行が無い(新しいOid)。
   いまはスナップショットが読みを固定するので走査からは見えないが、
   述語ロックを入れるならここが対象になる
@@ -909,7 +943,8 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
 - 読み取り専用であることは宣言が要る。自動では判定しない
 - デッドロックは断るだけで、再実行はしない。`deadlock` や
   `serialization_failure` を受けたらクライアントがやり直す
-- 分離レベルはスナップショット分離。write skew は防げない(直列化可能ではない)。
+- 分離レベルはスナップショット分離(既定)と READ COMMITTED の2つ。
+  どちらも直列化可能ではなく、write skew は防げない。
   行ごとのバージョン鎖(xmin/xmax)を持つ本来のMVCCではなく、
   コミット単位の undo をメモリに積んで巻き戻す方式
 - undo はメモリ上にしか無く、上限(`max_undo`、既定1000コミット)を超えると

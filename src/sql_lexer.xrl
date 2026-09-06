@@ -66,7 +66,7 @@ keywords() ->
      "order", "by", "asc", "desc", "limit", "offset", "distinct",
      "nulls", "first", "last",
      "group", "having",
-     "explain", "index", "analyze", "read", "only",
+     "explain", "index", "analyze", "read", "only", "committed",
      "union", "intersect", "except", "all",
      "in", "exists",
      %% RIGHT / FULL は未実装だが予約語にしておく。

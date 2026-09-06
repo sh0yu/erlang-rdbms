@@ -23,6 +23,10 @@ concurrent_test_() ->
       fun lost_update_is_refused/1,
       fun deadlock_is_refused_and_rolled_back/1,
       fun write_skew_is_not_prevented/1,
+      fun read_committed_sees_other_commits/1,
+      fun repeatable_read_does_not/1,
+      fun read_committed_retries_instead_of_refusing/1,
+      fun concurrent_increments_all_land/1,
       fun ddl_waits_for_a_writer_on_that_table/1,
       fun ddl_does_not_wait_for_another_table/1]}.
 
@@ -130,6 +134,82 @@ write_skew_is_not_prevented(_) ->
         ok = q(C2, "COMMIT"),
         %% 直列化可能なら 0 にはならないが、なる
         ?assertEqual([[1, 0], [2, 0]], rows(C1))
+    end.
+
+%%%===================================================================
+%%% READ COMMITTED
+%%%===================================================================
+
+%% 文ごとにスナップショットを取り直すので、途中で入ったコミットが見える。
+%% これが READ COMMITTED の定義そのもの(反復可能読み取りを失う)。
+read_committed_sees_other_commits(_) ->
+    fun() ->
+        C1 = seeded(),
+        C2 = connect(),
+        ok = q(C1, "BEGIN READ COMMITTED"),
+        ?assertMatch({ok, _, [[1]]}, q(C1, "SELECT v FROM t WHERE id = 1")),
+
+        ok = q(C2, "BEGIN"),
+        {ok, 1} = q(C2, "UPDATE t SET v = 99 WHERE id = 1"),
+        ok = q(C2, "COMMIT"),
+
+        %% 同じトランザクションの中なのに、値が変わって見える
+        ?assertMatch({ok, _, [[99]]}, q(C1, "SELECT v FROM t WHERE id = 1")),
+        ok = q(C1, "COMMIT")
+    end.
+
+%% 既定(REPEATABLE READ)は変わらない。
+repeatable_read_does_not(_) ->
+    fun() ->
+        C1 = seeded(),
+        C2 = connect(),
+        ok = q(C1, "BEGIN"),
+        ?assertMatch({ok, _, [[1]]}, q(C1, "SELECT v FROM t WHERE id = 1")),
+
+        ok = q(C2, "BEGIN"),
+        {ok, 1} = q(C2, "UPDATE t SET v = 99 WHERE id = 1"),
+        ok = q(C2, "COMMIT"),
+
+        ?assertMatch({ok, _, [[1]]}, q(C1, "SELECT v FROM t WHERE id = 1")),
+        ok = q(C1, "COMMIT")
+    end.
+
+%% 同じ行を待たされても断られない。読み直して文をやり直す。
+read_committed_retries_instead_of_refusing(_) ->
+    fun() ->
+        C1 = seeded(),
+        C2 = connect(),
+        ok = q(C1, "BEGIN"),
+        ok = q(C2, "BEGIN READ COMMITTED"),
+        %% 双方が v = 1 を見ている
+        ?assertMatch({ok, _, [[1]]}, q(C2, "SELECT v FROM t WHERE id = 1")),
+
+        {ok, 1} = q(C1, "UPDATE t SET v = 10 WHERE id = 1"),
+        ok = q(C1, "COMMIT"),
+
+        %% REPEATABLE READ ならここで serialization_failure。
+        %% READ COMMITTED は通る
+        ?assertEqual({ok, 1}, q(C2, "UPDATE t SET v = v + 1 WHERE id = 1")),
+        ok = q(C2, "COMMIT"),
+        %% 読み直した後の値(10)に +1 されている。10 を踏み潰していない
+        ?assertEqual([[1, 11], [2, 2]], rows(C1))
+    end.
+
+%% 多数の接続が同じ行を +1 する。1つも取りこぼさないこと。
+concurrent_increments_all_land(_) ->
+    fun() ->
+        C1 = seeded(),
+        N = 20,
+        Parent = self(),
+        [spawn(fun() ->
+                       C = connect(),
+                       ok = q(C, "BEGIN READ COMMITTED"),
+                       {ok, 1} = q(C, "UPDATE t SET v = v + 1 WHERE id = 1"),
+                       ok = q(C, "COMMIT"),
+                       Parent ! done
+               end) || _ <- lists:seq(1, N)],
+        [receive done -> ok after 10000 -> error(timeout) end || _ <- lists:seq(1, N)],
+        ?assertEqual([[1, 1 + N], [2, 2]], rows(C1))
     end.
 
 %% DDL はその表を書きかけのトランザクションを待つ。

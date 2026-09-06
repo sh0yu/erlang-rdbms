@@ -31,10 +31,12 @@
                 %% 読み取り専用トランザクションかどうか。
                 %% true のとき tx_mng の直列化の列に並ばない。
                 readonly = false,
-                %% 読み取り専用トランザクションが見る版。
-                %% これがあると、コミットの適用を待たずに
-                %% 開始時点の状態を読める。
-                snapshot = undefined}).
+                %% このトランザクションが見る版。
+                %% コミットの適用を待たずに、開始時点の状態を読める。
+                snapshot = undefined,
+                %% repeatable_read  スナップショットはトランザクションに1つ
+                %% read_committed   文ごとに取り直す
+                isolation = repeatable_read}).
 
 %% トランザクションから見えるテーブル走査の状態。
 %% base   : 共有ページの走査カーソル
@@ -134,6 +136,28 @@ handle_call({exec_query, {begin_tx}}, _From, State) ->
 %% スナップショット分離が許す異常(ライトスキューなど)は書き込みが
 %% 絡んで初めて起きるので、書かないトランザクションには現れない。
 %%----------------------------------------------------------------------
+%%----------------------------------------------------------------------
+%% READ COMMITTED。
+%%
+%% 既定(REPEATABLE READ)は、同じ行を同時に更新すると後から来た方が
+%% 断られる。1つの行に接続が集中すると、待たされた側が必ず断られるので
+%% やり直しが O(n^2) になる。200接続が同じ行を +1 する例で19,900回。
+%%
+%% READ COMMITTED はスナップショットを**文ごとに**取り直す。行ロックを
+%% 待たされた後は、待っている間に入った変更を読み直して文をやり直す。
+%% 断らないので、やり直しは待ちの回数だけで済む。
+%%
+%% 代わりに失うのは反復可能読み取り。同じトランザクションの中で
+%% 2度読むと違う結果が返りうる。PostgreSQL の既定と同じ割り切り。
+%%----------------------------------------------------------------------
+handle_call({exec_query, {begin_read_committed}}, _From, #state{txid = undefined} = State) ->
+    Txid = tx_mng:begin_tx(get_tx_mng_pid(State)),
+    Snap = snapshot_mng:acquire(),
+    {reply, Txid, State#state{txid = Txid, snapshot = Snap,
+                              isolation = read_committed, queryId = []}};
+handle_call({exec_query, {begin_read_committed}}, _From, State) ->
+    {reply, {error, transaction_already_started}, State};
+
 handle_call({exec_query, {begin_read_only}}, _From, #state{txid = undefined} = State) ->
     Snap = snapshot_mng:acquire(),
     {reply, ok, State#state{txid = readonly, readonly = true,
@@ -142,10 +166,10 @@ handle_call({exec_query, {begin_read_only}}, _From, State) ->
     {reply, {error, transaction_already_started}, State};
 
 handle_call({exec_query, {commit_tx}}, _From, State) ->
-    with_transaction(State, fun() -> do_commit(State) end);
+    with_transaction(State, fun(S) -> do_commit(S) end);
 
 handle_call({exec_query, {rollback_tx}}, _From, State) ->
-    with_transaction(State, fun() -> do_rollback(State) end);
+    with_transaction(State, fun(S) -> do_rollback(S) end);
 
 %% DDLは暗黙のトランザクションとして実行する(下の with_ddl/3 を参照)。
 handle_call({exec_query, {create_table, TableName, ColumnList}}, _From, State) ->
@@ -157,13 +181,13 @@ handle_call({exec_query, {drop_table, TableName}}, _From, State) ->
              fun() -> simple_db_server:drop_table(get_db_pid(State), TableName) end);
 
 handle_call({exec_query, {insert, TableName, Val}}, _From, State) ->
-    with_write_transaction(State, fun() -> do_insert(State, TableName, Val) end);
+    with_write_transaction(State, fun(S) -> do_insert(S, TableName, Val) end);
 
 handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State) ->
-    with_transaction(State, fun() -> do_select(State, TableName, ColName, Val) end);
+    with_transaction(State, fun(S) -> do_select(S, TableName, ColName, Val) end);
 
 handle_call({exec_query, {scan, TableName}}, _From, State) ->
-    with_transaction(State, fun() -> do_scan(State, TableName) end);
+    with_transaction(State, fun(S) -> do_scan(S, TableName) end);
 
 %% SQL文はここでトランザクションを要求しない。
 %% do_sql/2 が文の種類ごとに、DDLなら with_ddl、DMLなら with_transaction、
@@ -172,10 +196,10 @@ handle_call({exec_query, {sql, Sql}}, _From, State) ->
     do_sql(State, Sql);
 
 handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State) ->
-    with_write_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
+    with_write_transaction(State, fun(S) -> do_update(S, TableName, SetQuery, ColName, Val) end);
 
 handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State) ->
-    with_write_transaction(State, fun() -> do_delete(State, TableName, ColName, Val) end);
+    with_write_transaction(State, fun(S) -> do_delete(S, TableName, ColName, Val) end);
 
 handle_call({exec_query, Query}, _From, State) ->
     {reply, {error, {unsupported_query, Query}}, State};
@@ -256,23 +280,57 @@ with_write_transaction(#state{readonly = true} = State, _Fun) ->
 with_write_transaction(State, Fun) ->
     with_transaction(State, Fun).
 
+%%----------------------------------------------------------------------
 %% トランザクションが開始済みであることを確かめてから Fun を実行する。
 %%
-%% 文の途中で捨てるしかなくなったとき(デッドロック)は throw で
-%% ここまで戻る。文の途中で止めると、ローカル領域に半端な変更が
-%% 残ったままトランザクションが続いてしまうので、その場で捨てる。
+%% 文の途中で捨てるしかなくなったとき(デッドロック、衝突)は
+%% throw {abort, Reason} でここまで戻る。文の途中で止めると、
+%% ローカル領域に半端な変更が残ったままトランザクションが続くので、
+%% その場で捨てる。
+%%
+%% READ COMMITTED では、行ロックを待たされた後に
+%% throw restart_statement が来る。文の頭からやり直せばよい。
+%% ロックは持ったままなので、2度目は待たされない。
+%%----------------------------------------------------------------------
+-define(MAX_RESTARTS, 100).
+
 with_transaction(State, Fun) ->
     case ask_transaction(State) of
         transaction_not_found ->
             {reply, transaction_not_found, State};
         ok ->
-            try Fun()
-            catch
-                throw:{abort, Reason} ->
-                    {reply, _, State2} = do_rollback(State),
-                    {reply, {error, Reason}, State2}
-            end
+            run_statement(statement_start(State), Fun, ?MAX_RESTARTS)
     end.
+
+run_statement(State, _Fun, 0) ->
+    %% やり直しが尽きた。これ以上粘っても同じなので捨てる
+    {reply, _, State2} = do_rollback(State),
+    {reply, {error, serialization_failure}, State2};
+run_statement(State, Fun, N) ->
+    try Fun(State)
+    catch
+        throw:restart_statement ->
+            run_statement(refresh_snapshot(State), Fun, N - 1);
+        throw:{abort, Reason} ->
+            {reply, _, State2} = do_rollback(State),
+            {reply, {error, Reason}, State2}
+    end.
+
+%%----------------------------------------------------------------------
+%% 文の開始。READ COMMITTED は**文ごとに**スナップショットを取り直す。
+%%
+%% REPEATABLE READ(既定)はトランザクションの最初に取ったものを使い続ける。
+%% 同じトランザクションの中で2度読んだら同じ結果になる、という保証は
+%% ここから来ている。
+%%----------------------------------------------------------------------
+statement_start(#state{isolation = read_committed} = State) ->
+    refresh_snapshot(State);
+statement_start(State) ->
+    State.
+
+refresh_snapshot(#state{snapshot = Old} = State) ->
+    ok = release_snapshot(Old),
+    State#state{snapshot = snapshot_mng:acquire()}.
 
 do_insert(State, TableName, Val) ->
     case check_table(State, TableName, Val) of
@@ -321,6 +379,11 @@ run_sql(State, {tx, 'begin'}) ->
     end;
 run_sql(State, {tx, begin_read_only}) ->
     handle_call({exec_query, {begin_read_only}}, undefined, State);
+run_sql(State, {tx, begin_read_committed}) ->
+    case handle_call({exec_query, {begin_read_committed}}, undefined, State) of
+        {reply, {error, Reason}, S} -> {reply, {error, Reason}, S};
+        {reply, _Txid, S}           -> {reply, ok, S}
+    end;
 run_sql(State, {tx, commit}) ->
     handle_call({exec_query, {commit_tx}}, undefined, State);
 run_sql(State, {tx, rollback}) ->
@@ -344,7 +407,7 @@ run_sql(State, {drop_index, Name}) ->
 
 %% DML。トランザクションが要る
 run_sql(State, {select, Plan}) ->
-    with_transaction(State, fun() -> do_sql_select(State, Plan) end);
+    with_transaction(State, fun(S) -> do_sql_select(S, Plan) end);
 
 %% EXPLAIN はデータに触らないのでトランザクションを要らない。
 %% 必要なカタログの照合は解析の時点で済んでいる。
@@ -354,11 +417,11 @@ run_sql(State, {explain, Logical}) ->
     Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun())),
     {reply, {ok, ['QUERY PLAN'], [[L] || L <- Lines]}, State};
 run_sql(State, {insert, Table, Row}) ->
-    with_write_transaction(State, fun() -> do_insert(State, Table, Row) end);
+    with_write_transaction(State, fun(S) -> do_insert(S, Table, Row) end);
 run_sql(State, {update, Table, Assigns, Pred}) ->
-    with_write_transaction(State, fun() -> do_sql_update(State, Table, Assigns, Pred) end);
+    with_write_transaction(State, fun(S) -> do_sql_update(S, Table, Assigns, Pred) end);
 run_sql(State, {delete, Table, Pred}) ->
-    with_write_transaction(State, fun() -> do_sql_delete(State, Table, Pred) end).
+    with_write_transaction(State, fun(S) -> do_sql_delete(S, Table, Pred) end).
 
 do_sql_select(State, Logical) ->
     %% 論理プランから物理プランを作る。実行方法(全表走査か索引か、
@@ -414,49 +477,60 @@ catalog_fun() ->
 %% 重ね合わせはタプルAPIのSELECTと同じ経路を使う。
 %%----------------------------------------------------------------------
 tx_index_lookup(State, Table, ColName, Val) ->
-    case snapshot_overlay(State, Table) of
-        {error, Reason} ->
-            {error, Reason};
-        {ok, Snap} when map_size(Snap) =:= 0 ->
-            %% 巻き戻す必要が無い。索引の結果をそのまま使う
-            QueryIdList = get_query_id_list(State),
-            OidList = select_object_id_list(State, Table, ColName, Val, QueryIdList),
-            ok = acquire_lock(State, OidList, read),
-            {ok, [R || R <- select_data(State, Table, OidList, QueryIdList),
-                       R =/= not_found]};
-        {ok, Snap} ->
-            snapshot_index_lookup(State, Table, ColName, Val, Snap)
+    case lookup_pairs(State, Table, ColName, Val) of
+        {error, Reason} -> {error, Reason};
+        {ok, Pairs}     -> {ok, [Row || {_Oid, Row} <- Pairs]}
     end.
 
 %%----------------------------------------------------------------------
-%% スナップショットの時点で ColName = Val だった行を返す。
+%% ColName = Val の行を、**このトランザクションから見える形**で
+%% {Oid, 行} の組で返す。
+%%
+%% 更新も削除も「どの行か(Oid)」と「いまの値」の両方が要るので、
+%% 読みと同じ経路をここに集めてある。別々に書くと、片方だけ
+%% スナップショットを見ないといった食い違いが出る。実際それで
+%% タプルAPIの UPDATE が、他の接続の適用の途中(削除と挿入の隙間)を
+%% 見て0件になっていた。
+%%----------------------------------------------------------------------
+%% 更新・削除から使う。読めなければ文の境界まで戻す
+%% (スナップショットが古すぎる、カラムが無い)。
+pairs_or_abort(State, Table, ColName, Val) ->
+    case lookup_pairs(State, Table, ColName, Val) of
+        {ok, Pairs}     -> Pairs;
+        {error, Reason} -> throw({abort, Reason})
+    end.
+
+lookup_pairs(State, Table, ColName, Val) ->
+    case snapshot_overlay(State, Table) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Snap} ->
+            case column_position(Table, ColName) of
+                not_found -> {error, {column_not_found, ColName}};
+                Pos       -> {ok, matching_pairs(State, Table, ColName, Val, Pos, Snap)}
+            end
+    end.
+
+%%----------------------------------------------------------------------
+%% 候補を集めて、巻き戻してから絞る。
 %%
 %% 索引は**いまの値**で引かれるので、そのままでは足りない。
-%%   - 昔その値だった行は、いま別の値なら索引に出てこない
-%%   - いまその値の行は、昔は別の値だったかもしれない
+%% 索引付き列が更新されると、その行は古い鍵では引けなくなり、
+%% 新しい鍵で引けてしまう。索引そのものは版を持たない。
 %%
-%% 索引そのものを版管理していないので、候補を広げて絞り直す。
-%% 候補は「いま索引に出てくる行」と「スナップショット以降に変わった行」の
-%% 和。後者は undo の重ね合わせの鍵そのもので、スナップショットを取って
-%% からの変更数しかないため、表の大きさには比例しない。
-%%
-%% 候補を巻き戻してから ColName = Val で絞るので、結果はその時点の
-%% 全表走査と一致する。
+%% そこで候補を「いま索引に出てくる行」と「スナップショット以降に
+%% 変わった行」の和にする。後者は undo の重ね合わせの鍵そのもので、
+%% スナップショットを取ってからの変更数しかない。表の大きさには
+%% 比例しないので、索引を使う意味が残る。
 %%----------------------------------------------------------------------
-snapshot_index_lookup(State, Table, ColName, Val, Snap) ->
-    case column_position(Table, ColName) of
-        not_found ->
-            {error, {column_not_found, ColName}};
-        Pos ->
-            QueryIdList = get_query_id_list(State),
-            Indexed = select_object_id_list(State, Table, ColName, Val, QueryIdList),
-            Candidates = lists:usort(Indexed ++ maps:keys(Snap)),
-            ok = acquire_lock(State, Candidates, read),
-            Local = build_delta(State, Table),
-            {ok, [Row || Oid <- Candidates,
-                         (Row = row_at(State, Table, Oid, Local, Snap)) =/= not_found,
-                         element(Pos, list_to_tuple(Row)) =:= Val]}
-    end.
+matching_pairs(State, Table, ColName, Val, Pos, Snap) ->
+    QueryIdList = get_query_id_list(State),
+    Indexed = select_object_id_list(State, Table, ColName, Val, QueryIdList),
+    Candidates = lists:usort(Indexed ++ maps:keys(Snap)),
+    Local = build_delta(State, Table),
+    [{Oid, Row} || Oid <- Candidates,
+                   (Row = row_at(State, Table, Oid, Local, Snap)) =/= not_found,
+                   element(Pos, list_to_tuple(Row)) =:= Val].
 
 %% Oid の、このトランザクションから見える値。
 %% 自分の未コミット変更 > スナップショットの巻き戻し > 共有データ。
@@ -611,17 +685,15 @@ do_update_1(State, TableName, SetQuery, ColName, Val, ColumnList) ->
     QueryId = db_id:new(),
     LKvstore = get_local_kvstore(State),
     LColumnIndex = get_local_column_index(State),
-    QueryIdList = get_query_id_list(State),
     SetQueryConverted = simple_db_server:convert_set_query(SetQuery, ColumnList),
-    OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-    ok = lock_for_write(State, TableName, OidList),
+    %% 読みと同じ経路で {Oid, 行} を得る。共有データを直に読むと、
+    %% 他の接続が適用している途中(削除と挿入の隙間)を見てしまう
+    Pairs = pairs_or_abort(State, TableName, ColName, Val),
+    ok = lock_for_write(State, TableName, [Oid || {Oid, _} <- Pairs]),
     Updated =
         lists:foldl(
-          fun(Oid, Count) ->
-                  case select_data(State, TableName, Oid, QueryIdList) of
-                      not_found ->
-                          Count;
-                      OldVal ->
+          fun({Oid, OldVal}, Count) ->
+                  begin
                           NewVal = simple_db_server:build_new_val(OldVal, SetQueryConverted),
                           %% 更新前値を消して更新後値を入れる、をローカル領域に記録する
                           ets:insert(LKvstore, {QueryId, del, TableName, Oid, OldVal}),
@@ -638,26 +710,17 @@ do_update_1(State, TableName, SetQuery, ColName, Val, ColumnList) ->
                             end, lists:zip3(ColumnList, OldVal, NewVal)),
                           Count + 1
                   end
-          end, 0, OidList),
+          end, 0, Pairs),
     {reply, {ok, Updated}, add_query_id(State, QueryId)}.
 
 do_delete(State, TableName, ColName, Val) ->
     QueryId = db_id:new(),
-    QueryIdList = get_query_id_list(State),
-    OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-    ok = lock_for_write(State, TableName, OidList),
-    Deleted =
-        lists:foldl(
-          fun(Oid, Count) ->
-                  case select_data(State, TableName, Oid, QueryIdList) of
-                      not_found ->
-                          Count;
-                      RowVal ->
-                          ok = local_delete_data(State, QueryId, TableName, Oid, RowVal),
-                          Count + 1
-                  end
-          end, 0, OidList),
-    {reply, {ok, Deleted}, add_query_id(State, QueryId)}.
+    Pairs = pairs_or_abort(State, TableName, ColName, Val),
+    ok = lock_for_write(State, TableName, [Oid || {Oid, _} <- Pairs]),
+    lists:foreach(fun({Oid, RowVal}) ->
+                          ok = local_delete_data(State, QueryId, TableName, Oid, RowVal)
+                  end, Pairs),
+    {reply, {ok, length(Pairs)}, add_query_id(State, QueryId)}.
 
 %%%===================================================================
 %%% トランザクションから見える走査
@@ -852,7 +915,8 @@ do_commit_1(#state{snapshot = Snap} = State, Txid, TPid, QueryIdList, Changes, U
     clear_local(State, QueryIdList),
     ok = release_snapshot(Snap),
     Rep = tx_mng:commit_tx(TPid, Txid),
-    {reply, Rep, State#state{txid = undefined, snapshot = undefined, queryId = []}}.
+    {reply, Rep, State#state{txid = undefined, snapshot = undefined,
+                             isolation = repeatable_read, queryId = []}}.
 
 release_snapshot(undefined) -> ok;
 release_snapshot(Snap)      -> snapshot_mng:release(Snap).
@@ -886,7 +950,7 @@ do_rollback(#state{snapshot = Snap} = State) ->
     ok = release_snapshot(Snap),
     Rep = tx_mng:rollback_tx(TPid, Txid),
     {reply, Rep, State#state{txid = undefined, snapshot = undefined,
-                             queryId = []}}.
+                             isolation = repeatable_read, queryId = []}}.
 
 %% ローカル領域の変更をクエリの実行順に並べる。
 %% 同じOidに対するdel→insの順序が保たれている必要がある。
@@ -1064,31 +1128,6 @@ apply_local_index({_QueryId, ins, _TableName, _ColName, _Val, Oid}, ShareData) -
 apply_local_index({_QueryId, del, _TableName, _ColName, _Val, Oid}, ShareData) ->
     lists:filter(fun(X) -> X =/= Oid end, ShareData).
 
-%% オブジェクトIDから行を読む。
-%% 共有データを読んだ上に、自分のローカルの変更を実行順に重ねる。
-select_data(State, TableName, OidList, QueryIdList) when is_list(OidList) ->
-    [select_data(State, TableName, Oid, QueryIdList) || Oid <- OidList];
-select_data(State, TableName, Oid, QueryIdList) ->
-    ShareData = case simple_db_server:read_data_oid(TableName, Oid) of
-                    {error, _} -> not_found;
-                    Val -> Val
-                end,
-    lists:foldl(fun(QueryId, SData) -> merge_local_data(State, SData, Oid, QueryId) end,
-                ShareData, QueryIdList).
-
-merge_local_data(State, ShareData, Oid, QueryId) ->
-    LKvstore = get_local_kvstore(State),
-    case ets:match_object(LKvstore, {QueryId, '_', '_', Oid, '_'}) of
-        [] ->
-            ShareData;
-        LocalData ->
-            %% insがあればその値、delだけならnot_found
-            case [V || {_Q, ins, _T, _O, V} <- LocalData] of
-                [Val | _] -> Val;
-                [] -> not_found
-            end
-    end.
-
 %%%===================================================================
 %%% Lock funcs
 %%%===================================================================
@@ -1124,9 +1163,24 @@ lock_for_write(_State, _Table, []) ->
 lock_for_write(State, Table, OidList) ->
     ok = acquire_lock(State, OidList, write),
     case check_conflicts(State, [{Table, Oid} || Oid <- OidList]) of
-        ok              -> ok;
-        {error, Reason} -> throw({abort, Reason})
+        ok ->
+            ok;
+        {error, Reason} ->
+            on_conflict(State, Reason)
     end.
+
+%% 待っている間に、自分が書こうとしている行が変わっていた。
+%%
+%% REPEATABLE READ は捨てるしかない。この文をやり直しても、自分の
+%% スナップショットは変わらないので同じ判定になる。
+%%
+%% READ COMMITTED は文ごとにスナップショットを取り直すので、
+%% 読み直して文をやり直せばよい。ロックはもう持っているので、
+%% 2度目は待たされない。
+on_conflict(#state{isolation = read_committed}, _Reason) ->
+    throw(restart_statement);
+on_conflict(#state{}, Reason) ->
+    throw({abort, Reason}).
 
 %%----------------------------------------------------------------------
 %% 表そのもののロック。

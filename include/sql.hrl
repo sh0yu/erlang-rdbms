@@ -58,7 +58,8 @@
 
 %% BEGIN / COMMIT / ROLLBACK
 -record(tx_stmt, {
-    op                  % 'begin' | begin_read_only | commit | rollback
+    op                  % 'begin' | begin_read_only | begin_read_committed
+                        % | commit | rollback
 }).
 
 %%%===================================================================
