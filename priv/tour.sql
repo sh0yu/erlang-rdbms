@@ -154,6 +154,38 @@ COMMIT;
 
 DROP TABLE box;
 
+-- ============ 実行計画 ============
+-- EXPLAIN は実行せずに、選ばれた計画を返す
+EXPLAIN SELECT name FROM fruit WHERE price >= 150;
+
+-- 述語は結合の下へ落ちる。結合してから捨てるより、捨ててから結合する方が
+-- 中間結果が小さい
+CREATE TABLE box (fruit VARCHAR, qty INTEGER);
+EXPLAIN SELECT f.name FROM fruit f JOIN box b ON f.name = b.fruit
+  WHERE f.price > 100 AND b.qty > 0;
+
+-- ============ 索引 ============
+-- 索引は明示的に作る。CREATE TABLE は自動では張らない
+CREATE INDEX fruit_price ON fruit (price);
+-- 対話シェルなら \di で索引の一覧が見られる
+
+-- 統計を採ると、索引を使うかどうかを費用で判断できるようになる
+ANALYZE fruit;
+EXPLAIN SELECT name FROM fruit WHERE price = 150;
+
+-- 索引の無いカラムでも引ける(全表走査に落ちる)
+BEGIN;
+SELECT name FROM fruit WHERE name = 'apple';
+COMMIT;
+
+-- 同じ索引名は作れない / 同じカラムに二重には張れない
+CREATE INDEX fruit_price ON fruit (name);
+CREATE INDEX fruit_price2 ON fruit (price);
+DROP INDEX fruit_price;
+DROP INDEX fruit_price;
+
+DROP TABLE box;
+
 -- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
 BEGIN;
 SELECT * FROM fruit WHERE price = (SELECT price FROM fruit);

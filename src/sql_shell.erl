@@ -197,6 +197,10 @@ list_tables() ->
         {ok, Tables} -> print_table(["table"], [[T] || T <- Tables])
     end.
 
+%% 名前はアトムのことも文字列のこともある
+name_str(N) when is_atom(N) -> atom_to_list(N);
+name_str(N)                 -> N.
+
 list_indexes() ->
     case sys_tbl_mng:list_indexes(whereis(sys_tbl_mng)) of
         {ok, []} ->
@@ -275,7 +279,17 @@ format_error({lex_error, Line, Msg}) ->
 format_error({table_not_found, Name}) ->
     io_lib:format("no such table: ~ts", [Name]);
 format_error({column_not_found, Name}) ->
-    io_lib:format("no such column: ~ts", [Name]);
+    io_lib:format("no such column: ~ts", [name_str(Name)]);
+format_error({no_such_column, Name}) ->
+    io_lib:format("no such column: ~ts", [name_str(Name)]);
+format_error({index_not_found, Name}) ->
+    io_lib:format("no such index: ~ts", [name_str(Name)]);
+format_error(index_already_exists) ->
+    "an index with that name already exists";
+format_error(already_indexed) ->
+    "that column is already indexed";
+format_error(explain_requires_select) ->
+    "EXPLAIN only works on SELECT";
 format_error({type_mismatch, Col, Type, Value}) ->
     io_lib:format("column ~ts expects ~ts, got ~ts",
                   [Col, sql_type:name(Type), render(Value)]);

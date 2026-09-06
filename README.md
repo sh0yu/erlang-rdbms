@@ -26,7 +26,7 @@ sudo apt install erlang-nox erlang-dev erlang-parsetools erlang-dialyzer
 
 ```sh
 rebar3 compile
-rebar3 eunit          # 236 tests
+rebar3 eunit          # 365 tests
 rebar3 dialyzer
 rebar3 shell          # transaction_dbを起動した状態のErlangシェル
 ```
