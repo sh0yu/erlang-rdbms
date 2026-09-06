@@ -69,6 +69,7 @@ column_names(#p_sort{input = In}) -> column_names(In);
 column_names(#p_limit{input = In}) -> column_names(In);
 column_names(#p_distinct{input = In}) -> column_names(In);
 column_names(#p_agg{}) -> [];
+column_names(#p_setop{left = L}) -> column_names(L);
 column_names(#p_nl_join{left = L, right = R}) -> column_names(L) ++ column_names(R);
 column_names(#p_seq_scan{schema = Schema}) -> Schema.
 
@@ -173,6 +174,27 @@ open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
                                table => build_hash(Rows, RK), lkeys => LK,
                                rest => [], cur => undefined,
                                matched => false, width => W}}
+            end
+    end;
+%% 集合演算。両側を読み切ってから突き合わせる。
+open(#p_setop{op = Op, all = All, left = L, right = R}, Ctx) ->
+    case open(L, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        Left ->
+            case open(R, Ctx) of
+                {error, Reason} ->
+                    close(Left),
+                    {error, Reason};
+                Right ->
+                    {ok, LRows} = collect(Left, []),
+                    {ok, RRows} = collect(Right, []),
+                    close(Left),
+                    close(Right),
+                    %% 上に並べ替えが載ることがあるのでタプルで出す。
+                    %% 位置参照(element/2)がリストでは引けない。
+                    #op{kind = sorted,
+                        st = [to_tuple(Row) || Row <- set_op(Op, All, LRows, RRows)]}
             end
     end;
 open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) ->
@@ -313,6 +335,78 @@ nl_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
 
 concat_rows(A, B) ->
     list_to_tuple(tuple_to_list(A) ++ tuple_to_list(B)).
+
+%%%===================================================================
+%%% 集合演算
+%%%
+%%% 重複の判定は sql_value:group_key/1 を通す。DISTINCT と同じで、
+%%% NULL同士は同じとみなし、100 と 100.0 も同じ扱いにする。
+%%% `=` の意味論(NULL = NULL は unknown)とは別であることに注意。
+%%%===================================================================
+
+set_op('union', true, L, R) ->
+    L ++ R;
+set_op('union', false, L, R) ->
+    dedup(L ++ R);
+set_op(intersect, All, L, R) ->
+    match_op(L, counts(R), All, intersect, [], #{});
+set_op(except, All, L, R) ->
+    match_op(L, counts(R), All, except, [], #{}).
+
+%% 右側の重複度を数える。
+counts(Rows) ->
+    lists:foldl(fun(Row, Acc) ->
+                        maps:update_with(key(Row), fun(N) -> N + 1 end, 1, Acc)
+                end, #{}, Rows).
+
+%%----------------------------------------------------------------------
+%% 左を順に見て、右にあるかどうかで通す/落とす。
+%%
+%% ALL のときは**左の1行が右の1行を打ち消す**。消費しないと重複度が狂う。
+%%
+%%   a = [1, 2, 2, 3]、b = [2] のとき
+%%     INTERSECT ALL  → [2]        右の2は1つしか無いので1回だけ一致
+%%     EXCEPT ALL     → [1, 2, 3]  右の2が左の2を1つだけ打ち消す
+%%
+%% ALL でなければ Seen で重複を落とす。
+%%----------------------------------------------------------------------
+match_op([], _Counts, _All, _Op, Acc, _Seen) ->
+    lists:reverse(Acc);
+match_op([Row | T], Counts, All, Op, Acc, Seen) ->
+    K = key(Row),
+    N = maps:get(K, Counts, 0),
+    Matched = N > 0,
+    Counts1 = case All andalso Matched of
+                  true  -> Counts#{K => N - 1};
+                  false -> Counts
+              end,
+    Emit = case Op of
+               intersect -> Matched;
+               except    -> not Matched
+           end,
+    case Emit andalso (All orelse not maps:is_key(K, Seen)) of
+        true  -> match_op(T, Counts1, All, Op, [Row | Acc], Seen#{K => []});
+        false -> match_op(T, Counts1, All, Op, Acc, Seen)
+    end.
+
+dedup(Rows) ->
+    {Out, _} = lists:foldl(
+                 fun(Row, {Acc, Seen}) ->
+                         K = key(Row),
+                         case maps:is_key(K, Seen) of
+                             true  -> {Acc, Seen};
+                             false -> {[Row | Acc], Seen#{K => []}}
+                         end
+                 end, {[], #{}}, Rows),
+    lists:reverse(Out).
+
+key(Row) -> [sql_value:group_key(V) || V <- to_list(Row)].
+
+to_list(Row) when is_list(Row)  -> Row;
+to_list(Row) when is_tuple(Row) -> tuple_to_list(Row).
+
+to_tuple(Row) when is_list(Row)  -> list_to_tuple(Row);
+to_tuple(Row) when is_tuple(Row) -> Row.
 
 %%%===================================================================
 %%% ハッシュ結合

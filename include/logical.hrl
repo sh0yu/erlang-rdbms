@@ -74,6 +74,19 @@
     input
 }).
 
+%% 集合演算。UNION(∪) / INTERSECT(∩) / EXCEPT(−)。
+%%
+%% 左右は同じ列数でなければならない。出力の列名は左に従う。
+%% all が false なら重複を落とす。true なら重複度を保つ
+%% (INTERSECT ALL は min、EXCEPT ALL は差)。
+-record(lp_setop, {
+    op,                 % 'union' | intersect | except
+    all = false,
+    left,
+    right,
+    names = []
+}).
+
 %% 射影(π)。
 -record(lp_project, {
     exprs = [],

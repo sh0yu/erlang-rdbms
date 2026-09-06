@@ -66,6 +66,8 @@ rewrite(#lp_sort{input = In} = N)     -> N#lp_sort{input = rewrite(In)};
 rewrite(#lp_limit{input = In} = N)    -> N#lp_limit{input = rewrite(In)};
 rewrite(#lp_distinct{input = In} = N) -> N#lp_distinct{input = rewrite(In)};
 rewrite(#lp_agg{input = In} = N)      -> N#lp_agg{input = rewrite(In)};
+rewrite(#lp_setop{left = L, right = R} = N) ->
+    N#lp_setop{left = rewrite(L), right = rewrite(R)};
 rewrite(#lp_scan{} = N)               -> N.
 
 %%%===================================================================
@@ -188,7 +190,8 @@ shift({is_not_null, E}, D) -> {is_not_null, shift(E, D)}.
 %% その部分木が出す行の幅。FROM句の中には走査・結合・選択しか現れない。
 width(#lp_scan{schema = S})          -> length(S);
 width(#lp_filter{input = In})        -> width(In);
-width(#lp_join{left = L, right = R}) -> width(L) + width(R).
+width(#lp_join{left = L, right = R}) -> width(L) + width(R);
+width(#lp_setop{names = N})          -> length(N).
 
 %% AND を平らにする / 組み直す
 conjuncts(undefined)   -> [];
@@ -260,6 +263,8 @@ physical(#lp_limit{count = C, offset = O, input = In}, Cat) ->
     #p_limit{count = C, offset = O, input = physical(In, Cat)};
 physical(#lp_distinct{input = In}, Cat) ->
     #p_distinct{input = physical(In, Cat)};
+physical(#lp_setop{op = Op, all = All, left = L, right = R}, Cat) ->
+    #p_setop{op = Op, all = All, left = physical(L, Cat), right = physical(R, Cat)};
 physical(#lp_project{exprs = E, names = N, input = In}, Cat) ->
     #p_project{exprs = E, names = N, input = physical(In, Cat)}.
 

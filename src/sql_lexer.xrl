@@ -60,6 +60,7 @@ keywords() ->
      "nulls", "first", "last",
      "group", "having",
      "explain", "index", "analyze", "read", "only",
+     "union", "intersect", "except", "all",
      "join", "inner", "left", "outer", "cross", "on", "as"].
 
 keyword_or_identifier(Chars, Line) ->

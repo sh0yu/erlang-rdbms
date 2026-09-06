@@ -65,6 +65,22 @@
 %%% FROM句
 %%%===================================================================
 
+%% 集合演算。UNION / INTERSECT / EXCEPT。
+%%
+%% ORDER BY / LIMIT は演算全体に掛かるので、ここが持つ。
+%% 被演算子(#select_stmt{})の側は持たない。
+%%   SELECT a FROM t UNION SELECT b FROM u ORDER BY 1
+%% の ORDER BY は右の SELECT ではなく和集合に掛かる。
+-record(set_op_stmt, {
+    op,                 % 'union' | intersect | except
+    all = false,        % ALL なら重複を残す
+    left,
+    right,
+    order_by = [],
+    limit,
+    offset
+}).
+
 %% ANALYZE [table]。table が undefined なら全テーブル。
 -record(analyze_stmt, {
     table

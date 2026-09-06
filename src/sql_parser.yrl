@@ -28,6 +28,7 @@ Nonterminals
     select_stmt create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
     explain_stmt create_index_stmt drop_index_stmt analyze_stmt
     select_list select_item table_ref opt_where expr literal
+    query set_expr set_term select_core opt_all
     neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
     opt_group opt_having expr_list func_call
     from_item join_kw opt_alias
@@ -49,6 +50,7 @@ Terminals
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
     'group' 'having' 'explain' 'index' 'analyze' 'read' 'only'
+    'union' 'intersect' 'except' 'all'
     'join' 'inner' 'left' 'outer' 'cross' 'on' 'as' '.'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
@@ -83,7 +85,7 @@ Unary 800 neg.
 %%% 文
 %%%===================================================================
 
-stmt -> select_stmt     : '$1'.
+stmt -> query           : '$1'.
 stmt -> create_stmt     : '$1'.
 stmt -> drop_stmt       : '$1'.
 stmt -> insert_stmt     : '$1'.
@@ -94,7 +96,7 @@ stmt -> explain_stmt    : '$1'.
 stmt -> create_index_stmt : '$1'.
 stmt -> drop_index_stmt   : '$1'.
 stmt -> analyze_stmt      : '$1'.
-stmt -> select_stmt ';' : '$1'.
+stmt -> query ';'       : '$1'.
 stmt -> create_stmt ';' : '$1'.
 stmt -> drop_stmt ';'   : '$1'.
 stmt -> insert_stmt ';' : '$1'.
@@ -182,19 +184,45 @@ create_index_stmt -> create 'index' identifier on identifier '(' identifier ')' 
 drop_index_stmt -> drop 'index' identifier :
     #drop_index_stmt{name = value_of('$3')}.
 
-explain_stmt -> 'explain' select_stmt : #explain_stmt{stmt = '$2'}.
+explain_stmt -> 'explain' query : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' insert_stmt : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' update_stmt : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' delete_stmt : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' create_stmt : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' drop_stmt   : #explain_stmt{stmt = '$2'}.
 
-select_stmt -> select opt_distinct select_list from from_item opt_where
-               opt_group opt_having opt_order opt_limit :
-    {Limit, Offset} = '$10',
+%%%-------------------------------------------------------------------
+%%% 問い合わせ式。
+%%%
+%%% ORDER BY / LIMIT は**集合演算全体に掛かる**ので、被演算子ではなく
+%%% ここで受ける。単一のSELECTもこの規則を通るので、経路は1本で済む。
+%%%
+%%% 優先順位は標準SQLに合わせ、INTERSECT が UNION / EXCEPT より強い。
+%%% 文法を2段(set_expr / set_term)にして表す。
+%%%-------------------------------------------------------------------
+query -> set_expr opt_order opt_limit :
+    attach_tail('$1', '$2', '$3').
+
+set_expr -> set_expr 'union' opt_all set_term :
+    #set_op_stmt{op = 'union', all = '$3', left = '$1', right = '$4'}.
+set_expr -> set_expr 'except' opt_all set_term :
+    #set_op_stmt{op = except, all = '$3', left = '$1', right = '$4'}.
+set_expr -> set_term : '$1'.
+
+set_term -> set_term 'intersect' opt_all select_core :
+    #set_op_stmt{op = intersect, all = '$3', left = '$1', right = '$4'}.
+set_term -> select_core : '$1'.
+
+opt_all -> '$empty' : false.
+opt_all -> 'all'    : true.
+
+select_core -> select opt_distinct select_list from from_item opt_where
+               opt_group opt_having :
     #select_stmt{distinct = '$2', columns = '$3', from = '$5', where = '$6',
-                 group_by = '$7', having = '$8', order_by = '$9',
-                 limit = Limit, offset = Offset}.
+                 group_by = '$7', having = '$8'}.
+
+%% 互換のために名前を残す(他の規則が select_stmt を参照している)。
+select_stmt -> select_core : '$1'.
 
 opt_group -> '$empty'                : [].
 opt_group -> 'group' 'by' expr_list  : '$3'.
@@ -331,5 +359,12 @@ Erlang code.
 
 %% leexのトークンは {Type, Line, Value} または {Type, Line}
 value_of({_Type, _Line, Value}) -> Value.
+
+%% 末尾の ORDER BY / LIMIT を問い合わせ式に付ける。
+%% 単一のSELECTなら #select_stmt{} に、集合演算なら #set_op_stmt{} に付く。
+attach_tail(#select_stmt{} = S, Order, {Limit, Offset}) ->
+    S#select_stmt{order_by = Order, limit = Limit, offset = Offset};
+attach_tail(#set_op_stmt{} = S, Order, {Limit, Offset}) ->
+    S#set_op_stmt{order_by = Order, limit = Limit, offset = Offset}.
 
 

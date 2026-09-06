@@ -105,11 +105,95 @@ analyze(#explain_stmt{stmt = Inner}) ->
         {error, Reason}         -> {error, Reason}
     end;
 
+%%----------------------------------------------------------------------
+%% 集合演算。左右をそれぞれ解析してから突き合わせる。
+%%
+%% 出力の列名は左に従う(標準SQL)。ORDER BY / LIMIT は演算全体に掛かり、
+%% **結果の列**に対して束縛する。被演算子のスコープではない。
+%% 例: SELECT a FROM t UNION SELECT b FROM u ORDER BY a
+%%     この a は左の出力列であって、右のスコープには無い。
+%%----------------------------------------------------------------------
+analyze(#set_op_stmt{op = Op, all = All, left = L, right = R,
+                     order_by = Order, limit = Limit, offset = Offset}) ->
+    case {analyze(L), analyze(R)} of
+        {{error, Reason}, _} -> {error, Reason};
+        {_, {error, Reason}} -> {error, Reason};
+        {{ok, {select, LP}}, {ok, {select, RP}}} ->
+            LNames = output_names(LP),
+            RNames = output_names(RP),
+            case length(LNames) =:= length(RNames) of
+                false ->
+                    {error, {set_op_arity_mismatch, length(LNames), length(RNames)}};
+                true ->
+                    build_set_op(Op, All, LP, RP, LNames, Order, Limit, Offset)
+            end
+    end;
+
 analyze(#select_stmt{from = From} = Stmt) ->
     case build_from(reorder_joins(From, Stmt#select_stmt.where)) of
         {error, Reason} -> {error, Reason};
         {ok, Scope, Node} -> bind_select(Stmt, Scope, Node)
     end.
+
+%%%===================================================================
+%%% 集合演算
+%%%===================================================================
+
+build_set_op(Op, All, LP, RP, Names, Order, Limit, Offset) ->
+    Set = #lp_setop{op = Op, all = All, left = LP, right = RP, names = Names},
+    case bind_set_order(Order, Names) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Keys} ->
+            Sorted = case Keys of
+                         [] -> Set;
+                         _  -> #lp_sort{keys = Keys, input = Set}
+                     end,
+            %% 射影を必ず1枚かぶせる。集合演算はタプルを出すので、
+            %% 結果の形(リスト)へ戻すのがこの射影の役目。
+            Proj = #lp_project{exprs = [{ref, N} || N <- lists:seq(1, length(Names))],
+                               names = Names, input = Sorted},
+            {ok, {select, wrap_limit(Limit, Offset, Keys, Proj)}}
+    end.
+
+%% その論理プランが出す列名。
+output_names(#lp_project{names = N})  -> N;
+output_names(#lp_distinct{input = In}) -> output_names(In);
+output_names(#lp_limit{input = In})    -> output_names(In);
+output_names(#lp_sort{input = In})     -> output_names(In);
+output_names(#lp_setop{names = N})     -> N.
+
+%%----------------------------------------------------------------------
+%% 集合演算の ORDER BY は結果の列に対して束縛する。
+%% 列名か、序数(1始まり)で指す。標準SQLと同じ。
+%%----------------------------------------------------------------------
+bind_set_order(Items, Names) -> bind_set_order(Items, Names, []).
+
+bind_set_order([], _Names, Acc) ->
+    {ok, lists:reverse(Acc)};
+bind_set_order([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Names, Acc) ->
+    case set_order_pos(E, Names) of
+        {error, Reason} -> {error, Reason};
+        {ok, Pos} ->
+            bind_set_order(T, Names, [{{ref, Pos}, Dir, nulls_for(Dir, Nulls)} | Acc])
+    end.
+
+set_order_pos(#const{value = N}, Names) when is_integer(N), N >= 1, N =< length(Names) ->
+    {ok, N};
+set_order_pos(#const{value = N}, Names) when is_integer(N) ->
+    {error, {order_by_position_out_of_range, N, length(Names)}};
+set_order_pos(#col_ref{table = undefined, name = NameStr}, Names) ->
+    case index_of_name(to_atom(NameStr), Names, 1) of
+        not_found -> {error, {no_such_column, NameStr}};
+        Pos       -> {ok, Pos}
+    end;
+set_order_pos(_Other, _Names) ->
+    %% 集合演算の結果には元のスコープが無いので、任意の式は書けない
+    {error, set_op_order_by_must_be_column_or_position}.
+
+index_of_name(_N, [], _I)        -> not_found;
+index_of_name(N, [N | _], I)     -> I;
+index_of_name(N, [_ | T], I)     -> index_of_name(N, T, I + 1).
 
 %%%===================================================================
 %%% FROM句からスコープと走査プランを組み立てる

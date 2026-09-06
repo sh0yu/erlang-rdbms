@@ -170,6 +170,7 @@ SELECT [DISTINCT] * | expr, ... FROM from_item [WHERE expr]
   [GROUP BY expr, ...] [HAVING expr]
   [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
   [LIMIT n] [OFFSET n];
+<query> UNION|INTERSECT|EXCEPT [ALL] <query> [ORDER BY ...] [LIMIT n];
 BEGIN;  BEGIN READ ONLY;  COMMIT;  ROLLBACK;
 ```
 
@@ -376,6 +377,32 @@ application:set_env(transaction_db, index_module, index).
 `{Name, Columns}` を変えると既存のデータファイルとの互換が切れるので、
 別のDETSに分けてある。
 
+### 集合演算
+
+```sql
+SELECT k FROM a UNION     SELECT k FROM b ORDER BY 1;
+SELECT k FROM a UNION ALL SELECT k FROM b;
+SELECT k FROM a INTERSECT SELECT k FROM b;
+SELECT k FROM a EXCEPT    SELECT k FROM b;
+```
+
+`INTERSECT` は `UNION` / `EXCEPT` より強く結合する(標準SQL)。
+`ORDER BY` / `LIMIT` は演算全体に掛かり、結果の列名か序数で指す。
+出力の列名は左に従う。
+
+`ALL` は重複度を保つ。
+
+```
+a = [1, 2, 2, 3]、b = [2] のとき
+  UNION ALL      → [1, 2, 2, 3, 2]
+  INTERSECT ALL  → [2]        右の2は1つしか無いので1回だけ一致
+  EXCEPT ALL     → [1, 2, 3]  右の2が左の2を1つだけ打ち消す
+```
+
+重複の判定は `sql_value:group_key/1` を通す。**`=` の意味論とは違い、
+NULL 同士は等しいとみなす**(標準SQLの "not distinct from")。
+`=` をそのまま使うと、NULL の行が `UNION` で重複除去されずに残る。
+
 ### 実行計画
 
 `EXPLAIN` で選ばれた計画が見られる。
@@ -579,7 +606,9 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
 - 索引は単一カラムのみ。複合索引・一意索引は未実装
-- 副問い合わせ・`UNION`・ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
+- 副問い合わせ・ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
+- 集合演算の `ORDER BY` は結果の列名か序数のみ。任意の式は書けない
+  (結果には元のスコープが無いため)
 - 結合の右側は、どちらの方式でも開始時にメモリへ載せる。
   外部結合の右側が巨大だと載り切らない
 - 集約は NULL を入力から外す(`COUNT(*)` だけが例外)。
