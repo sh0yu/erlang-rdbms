@@ -137,3 +137,45 @@ seeded() ->
 
 connect() -> {ok, Pid} = gen_connection:connect(), Pid.
 q(C, Sql) -> query_exec:exec_query(C, {sql, Sql}).
+
+%%%===================================================================
+%%% 見積もり
+%%%===================================================================
+
+selectivity_of_equality_test() ->
+    S = stats(1000, [{a, 100}, {b, 2}]),
+    %% 異なり値が多いほど選択率は良い(小さい)
+    ?assertEqual(0.01, sql_stats:selectivity({comp, '=', {ref, 1}, {const, 5}}, [a, b], S)),
+    ?assertEqual(0.5,  sql_stats:selectivity({comp, '=', {ref, 2}, {const, 5}}, [a, b], S)),
+    %% 左右どちらに定数があっても同じ
+    ?assertEqual(0.01, sql_stats:selectivity({comp, '=', {const, 5}, {ref, 1}}, [a, b], S)).
+
+selectivity_of_and_or_not_test() ->
+    S = stats(1000, [{a, 100}, {b, 100}]),
+    E1 = {comp, '=', {ref, 1}, {const, 1}},
+    E2 = {comp, '=', {ref, 2}, {const, 2}},
+    ?assertEqual(0.0001, sql_stats:selectivity({'and', [E1, E2]}, [a, b], S)),
+    ?assert(abs(sql_stats:selectivity({'or', [E1, E2]}, [a, b], S) - 0.0199) < 1.0e-9),
+    ?assertEqual(0.99, sql_stats:selectivity({'not', E1}, [a, b], S)).
+
+selectivity_without_stats_falls_back_test() ->
+    %% 統計が無くても見積もる。「分からないから最適化しない」ではない
+    ?assertEqual(0.1, sql_stats:selectivity({comp, '=', {ref, 1}, {const, 1}}, [a], none)),
+    ?assertEqual(0.5, sql_stats:selectivity({some, unknown, form}, [a], none)).
+
+selectivity_of_null_tests_test() ->
+    S = {table_stats, t, 100, [{a, {col_stats, 10, 25, undefined, undefined}}], 0},
+    ?assertEqual(0.25, sql_stats:selectivity({is_null, {ref, 1}}, [a], S)),
+    ?assertEqual(0.75, sql_stats:selectivity({is_not_null, {ref, 1}}, [a], S)).
+
+%% 索引を使うかどうかは、この2つの比較だけで決まる。
+cost_decides_index_vs_seq_test() ->
+    S = stats(1000, [{a, 1000}, {b, 2}]),
+    Good = sql_stats:selectivity({comp, '=', {ref, 1}, {const, 1}}, [a, b], S),
+    Bad  = sql_stats:selectivity({comp, '=', {ref, 2}, {const, 1}}, [a, b], S),
+    ?assert(sql_stats:cost_index_scan(S, Good) < sql_stats:cost_seq_scan(S)),
+    ?assert(sql_stats:cost_index_scan(S, Bad)  > sql_stats:cost_seq_scan(S)).
+
+stats(Rows, Distincts) ->
+    {table_stats, t, Rows,
+     [{N, {col_stats, D, 0, undefined, undefined}} || {N, D} <- Distincts], 0}.

@@ -25,6 +25,13 @@ planner_test_() ->
       fun left_join_on_condition_on_preserved_side_stays/1,
       fun cross_predicate_stays_above/1,
       fun left_join_results_unchanged_by_pushdown/1,
+      fun index_scan_when_selective/1,
+      fun no_index_scan_when_not_selective/1,
+      fun no_index_scan_on_unindexed_column/1,
+      fun residual_conjuncts_stay_as_filter/1,
+      fun most_selective_index_is_chosen/1,
+      fun index_scan_returns_same_rows/1,
+      fun index_scan_sees_uncommitted_changes/1,
       fun explain_renders_tree/1,
       fun explain_names_positions/1,
       fun explain_schema_of_join_is_concatenation/1,
@@ -180,6 +187,103 @@ left_join_results_unchanged_by_pushdown(_) ->
     end.
 
 %%%===================================================================
+%%% アクセスパスの選択
+%%%
+%%% カタログを関数で渡せるので、索引や統計を偽って書き分けられる。
+%%% 実データを作らずに「この統計ならこの計画」を直接試験できる。
+%%%===================================================================
+
+%% 異なり値が多い(選択率が良い)なら索引を使う。
+index_scan_when_selective(_) ->
+    fun() ->
+        seed2(),
+        L = logical("SELECT name FROM emp WHERE id = 2"),
+        P = sql_planner:plan(L, cat(emp, [id], 1000, [{id, 1000}])),
+        ?assertMatch(#p_project{input = #p_index_scan{table = emp, column = id, value = 2}}, P)
+    end.
+
+%% 異なり値が2しかないカラムでは、索引で半分の行をランダムに読むより
+%% 順に舐めた方が速い。**索引があっても使わない**のが正しい。
+no_index_scan_when_not_selective(_) ->
+    fun() ->
+        seed2(),
+        L = logical("SELECT name FROM emp WHERE dept = 10"),
+        P = sql_planner:plan(L, cat(emp, [dept], 1000, [{dept, 2}])),
+        ?assertMatch(#p_project{input = #p_filter{input = #p_seq_scan{table = emp}}}, P)
+    end.
+
+no_index_scan_on_unindexed_column(_) ->
+    fun() ->
+        seed2(),
+        L = logical("SELECT name FROM emp WHERE id = 2"),
+        P = sql_planner:plan(L, cat(emp, [], 1000, [{id, 1000}])),
+        ?assertMatch(#p_project{input = #p_filter{input = #p_seq_scan{}}}, P)
+    end.
+
+%% 索引で使わなかった条件は選択として残る。落とすと結果が変わる。
+residual_conjuncts_stay_as_filter(_) ->
+    fun() ->
+        seed2(),
+        L = logical("SELECT name FROM emp WHERE id = 2 AND sal > 100"),
+        P = sql_planner:plan(L, cat(emp, [id], 1000, [{id, 1000}])),
+        ?assertEqual([<<"Project (name)">>,
+                      <<"  Filter (sal > 100)">>,
+                      <<"    Index Scan on emp (id = 2)">>],
+                     sql_explain:explain(P))
+    end.
+
+%% 索引が複数使えるときは、選択率のいちばん良いものを選ぶ。
+most_selective_index_is_chosen(_) ->
+    fun() ->
+        seed2(),
+        L = logical("SELECT name FROM emp WHERE dept = 10 AND id = 2"),
+        P = sql_planner:plan(L, cat(emp, [id, dept], 1000, [{id, 1000}, {dept, 4}])),
+        ?assertMatch(#p_project{input = #p_filter{input = #p_index_scan{column = id}}}, P)
+    end.
+
+%% 索引を使っても使わなくても結果は同じ。
+index_scan_returns_same_rows(_) ->
+    fun() ->
+        C = seed2(),
+        Before = rows(C, "SELECT name FROM emp WHERE dept = 10"),
+        ok = q(C, "CREATE INDEX emp_dept ON emp (dept)"),
+        {ok, _} = q(C, "ANALYZE emp"),
+        After = rows(C, "SELECT name FROM emp WHERE dept = 10"),
+        ?assertEqual([[<<"ada">>]], Before),
+        ?assertEqual(Before, After)
+    end.
+
+%% **索引スキャンでも自分の未コミット変更が見えること。**
+%% 実行器から索引を直接引かせると、さっき入れた行が見えない。
+index_scan_sees_uncommitted_changes(_) ->
+    fun() ->
+        C = seed2(),
+        %% 索引が選ばれるだけの行数を入れる。3行では
+        %% 全表走査の方が安いので、索引は(正しく)選ばれない。
+        ok = q(C, "BEGIN"),
+        _ = [q(C, lists:flatten(io_lib:format(
+                    "INSERT INTO emp VALUES (~p, 'x~p', 99, 1)", [I, I])))
+             || I <- lists:seq(100, 160)],
+        ok = q(C, "COMMIT"),
+        ok = q(C, "CREATE INDEX emp_id ON emp (id)"),
+        {ok, _} = q(C, "ANALYZE emp"),
+        %% 索引が選ばれていることを確かめてから
+        ?assertMatch([_, <<"  Index Scan on emp (id = 9)">>],
+                     explain_rows(C, "SELECT name FROM emp WHERE id = 9")),
+        ok = q(C, "BEGIN"),
+        {ok, _} = q(C, "INSERT INTO emp VALUES (9, 'zed', 10, 1)"),
+        {ok, _, R1} = q(C, "SELECT name FROM emp WHERE id = 9"),
+        ?assertEqual([[<<"zed">>]], R1),
+        %% 自分の削除も見えないこと
+        {ok, 1} = q(C, "DELETE FROM emp WHERE id = 1"),
+        {ok, _, R2} = q(C, "SELECT name FROM emp WHERE id = 1"),
+        ?assertEqual([], R2),
+        ok = q(C, "ROLLBACK"),
+        %% 巻き戻したら元通り
+        ?assertEqual([[<<"ada">>]], rows(C, "SELECT name FROM emp WHERE id = 1"))
+    end.
+
+%%%===================================================================
 %%% EXPLAIN
 %%%===================================================================
 
@@ -258,6 +362,18 @@ seed2() ->
     C.
 
 lines(Sql) -> sql_explain:explain(plan(Sql)).
+
+%% 偽のカタログ。索引と統計を指定して、計画の選択だけを試験する。
+cat(Table, Indexed, Rows, Distincts) ->
+    Cols = [{N, {col_stats, D, 0, undefined, undefined}} || {N, D} <- Distincts],
+    Stats = {table_stats, Table, Rows, Cols, 0},
+    fun(T) when T =:= Table -> #{indexed => Indexed, stats => Stats};
+       (_) -> #{indexed => [], stats => none}
+    end.
+
+explain_rows(C, Sql) ->
+    {ok, _, R} = q(C, "EXPLAIN " ++ Sql),
+    [L || [L] <- R].
 
 %% SELECT はトランザクションを要求する(暗黙には開かない)。
 rows(C, Sql) ->

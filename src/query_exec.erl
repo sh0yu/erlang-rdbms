@@ -273,7 +273,9 @@ run_sql(State, {select, Plan}) ->
 %% EXPLAIN はデータに触らないのでトランザクションを要らない。
 %% 必要なカタログの照合は解析の時点で済んでいる。
 run_sql(State, {explain, Logical}) ->
-    Lines = sql_explain:explain(sql_planner:plan(Logical)),
+    %% 実行するときと同じカタログを渡す。違うものを渡すと、
+    %% 表示された計画と実際に走る計画がずれる。
+    Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun())),
     {reply, {ok, ['QUERY PLAN'], [[L] || L <- Lines]}, State};
 run_sql(State, {insert, Table, Row}) ->
     with_transaction(State, fun() -> do_insert(State, Table, Row) end);
@@ -285,12 +287,49 @@ run_sql(State, {delete, Table, Pred}) ->
 do_sql_select(State, Logical) ->
     %% 論理プランから物理プランを作る。実行方法(全表走査か索引か、
     %% どの結合アルゴリズムか)がここで決まる。
-    Plan = sql_planner:plan(Logical),
+    Plan = sql_planner:plan(Logical, catalog_fun()),
     %% 実行器にはストレージへの入口を関数で渡す。
     %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
     %% かつ走査がこのトランザクションの未コミット変更を見られる。
-    Ctx = {fun(T) -> tx_scan_open(State, T) end, fun(C) -> tx_scan_next(C) end},
-    {reply, sql_exec:run(Plan, Ctx), State}.
+    {reply, sql_exec:run(Plan, exec_ctx(State)), State}.
+
+exec_ctx(State) ->
+    #{scan_open    => fun(T) -> tx_scan_open(State, T) end,
+      scan_next    => fun(C) -> tx_scan_next(C) end,
+      index_lookup => fun(T, Col, Val) -> tx_index_lookup(State, T, Col, Val) end}.
+
+%%----------------------------------------------------------------------
+%% プランナに渡すカタログ。索引の有無と統計だけを見せる。
+%%
+%% プランナがカタログを直接引かないのは、同じ入力から同じプランが
+%% 出ることを保てるようにするためと、試験で偽のカタログを渡して
+%% 索引がある場合と無い場合を書き分けられるようにするため。
+%%----------------------------------------------------------------------
+catalog_fun() ->
+    Sys = whereis(sys_tbl_mng),
+    fun(Table) ->
+            Indexed = case sys_tbl_mng:get_index_column_list(Sys, Table) of
+                          {ok, Cols} -> Cols;
+                          {error, _} -> []
+                      end,
+            Stats = case sys_tbl_mng:get_stats(Sys, Table) of
+                        {ok, S} -> S;
+                        none    -> none
+                    end,
+            #{indexed => Indexed, stats => Stats}
+    end.
+
+%%----------------------------------------------------------------------
+%% 索引で引いた結果に、このトランザクションの未コミット変更を重ねる。
+%%
+%% 実行器から索引を直接引かせると、自分がさっき入れた行が見えない。
+%% 重ね合わせはタプルAPIのSELECTと同じ経路を使う。
+%%----------------------------------------------------------------------
+tx_index_lookup(State, Table, ColName, Val) ->
+    QueryIdList = get_query_id_list(State),
+    OidList = select_object_id_list(State, Table, ColName, Val, QueryIdList),
+    ok = acquire_lock(State, OidList, read),
+    {ok, [R || R <- select_data(State, Table, OidList, QueryIdList), R =/= not_found]}.
 
 %% SQLのUPDATE / DELETE は、対象のOidを**先に確定させてから**適用する。
 %%

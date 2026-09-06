@@ -29,6 +29,7 @@ lines(Node, Depth) ->
     [[Pad, label(Node)] | lists:append([lines(C, Depth + 1) || C <- children(Node)])].
 
 children(#p_seq_scan{})                    -> [];
+children(#p_index_scan{})                  -> [];
 children(#p_filter{input = In})            -> [In];
 children(#p_nl_join{left = L, right = R})  -> [L, R];
 children(#p_agg{input = In})               -> [In];
@@ -43,6 +44,8 @@ children(#p_project{input = In})           -> [In].
 
 label(#p_seq_scan{table = T}) ->
     ["Seq Scan on ", atom_to_list(T)];
+label(#p_index_scan{table = T, column = C, value = V}) ->
+    ["Index Scan on ", atom_to_list(T), " (", atom_to_list(C), " = ", value(V), ")"];
 label(#p_filter{pred = P, input = In}) ->
     ["Filter ", expr(P, schema(In))];
 label(#p_nl_join{type = Ty, pred = P, left = L, right = R}) ->
@@ -102,6 +105,7 @@ agg_name(#agg{func = F, arg = A, distinct = D}, S) ->
 %%----------------------------------------------------------------------
 -spec schema(term()) -> [atom() | string()].
 schema(#p_seq_scan{schema = S})                -> S;
+schema(#p_index_scan{schema = S})              -> S;
 schema(#p_filter{input = In})                  -> schema(In);
 schema(#p_nl_join{left = L, right = R})        -> schema(L) ++ schema(R);
 schema(#p_agg{group_by = G, aggs = A, input = In}) -> group_schema(G, A, schema(In));

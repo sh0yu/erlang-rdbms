@@ -16,16 +16,36 @@
 %%%-------------------------------------------------------------------
 -module(sql_planner).
 
--export([plan/1, rewrite/1, physical/1]).
+-export([plan/1, plan/2, rewrite/1, physical/1, physical/2, no_catalog/0]).
+
+-export_type([catalog/0]).
 
 -include("../include/logical.hrl").
 -include("../include/plan.hrl").
+-include("../include/catalog.hrl").
+
+%%----------------------------------------------------------------------
+%% テーブルについて、実行方法を決めるのに要る情報を返す関数。
+%%
+%% プランナがカタログを直接引かずに関数で受け取るのは、
+%%   - 純粋に保てる(同じ入力から同じプランが出る)
+%%   - 試験で偽のカタログを渡して、索引がある場合と無い場合を書き分けられる
+%% ため。
+%%----------------------------------------------------------------------
+-type catalog() :: fun((atom()) -> #{indexed := [atom()],
+                                     stats := #table_stats{} | none}).
 
 %%----------------------------------------------------------------------
 %% @doc 論理プランから物理プランを作る。
 %%----------------------------------------------------------------------
-plan(Logical) ->
-    physical(rewrite(Logical)).
+plan(Logical) -> plan(Logical, no_catalog()).
+
+plan(Logical, Catalog) -> physical(rewrite(Logical), Catalog).
+
+%% 索引も統計も無いものとして扱うカタログ。
+%% 書き換えだけを試したいときや、カタログを引けない文脈で使う。
+-spec no_catalog() -> catalog().
+no_catalog() -> fun(_Table) -> #{indexed => [], stats => none} end.
 
 %%%===================================================================
 %%% 論理 → 論理
@@ -175,30 +195,90 @@ conj(Es)  -> {'and', Es}.
 wrap(undefined, Node) -> Node;
 wrap(Pred, Node)      -> #lp_filter{pred = Pred, input = Node}.
 
+wrap_phys(undefined, Node) -> Node;
+wrap_phys(Pred, Node)      -> #p_filter{pred = Pred, input = Node}.
+
 %%%===================================================================
 %%% 論理 → 物理
 %%%===================================================================
 
 %%----------------------------------------------------------------------
 %% @doc 実行方法を決める。
-%%
-%% いまは1対1の対応。走査は全表走査、結合は入れ子ループ。
-%% Stage 7-5 でここに索引スキャンの選択が入る。
 %%----------------------------------------------------------------------
-physical(#lp_scan{table = T, schema = S}) ->
+physical(Node) -> physical(Node, no_catalog()).
+
+%% 走査の直上にある選択は、索引で置き換えられることがある。
+%% 述語のプッシュダウン(rewrite/1)を先に済ませてあるので、
+%% 1テーブルだけを見る条件はここまで落ちてきている。
+physical(#lp_filter{pred = P, input = #lp_scan{table = T, schema = Sch}}, Cat) ->
+    #{indexed := Indexed, stats := Stats} = Cat(T),
+    Conjs = conjuncts(P),
+    case best_index_path(Conjs, Sch, Indexed, Stats) of
+        none ->
+            #p_filter{pred = P, input = #p_seq_scan{table = T, schema = Sch}};
+        {Col, Val, Rest} ->
+            %% 索引で使わなかった条件は選択として残す。
+            %% **物理の選択を作ること。** 論理の wrap/2 を使うと
+            %% 実行器が知らない節点が物理プランに混ざる
+            wrap_phys(conj(Rest),
+                      #p_index_scan{table = T, schema = Sch, column = Col, value = Val})
+    end;
+physical(#lp_scan{table = T, schema = S}, _Cat) ->
     #p_seq_scan{table = T, schema = S};
-physical(#lp_filter{pred = P, input = In}) ->
-    #p_filter{pred = P, input = physical(In)};
-physical(#lp_join{type = Ty, pred = P, left = L, right = R, right_width = W}) ->
-    #p_nl_join{type = Ty, pred = P, left = physical(L), right = physical(R),
+physical(#lp_filter{pred = P, input = In}, Cat) ->
+    #p_filter{pred = P, input = physical(In, Cat)};
+physical(#lp_join{type = Ty, pred = P, left = L, right = R, right_width = W}, Cat) ->
+    #p_nl_join{type = Ty, pred = P, left = physical(L, Cat), right = physical(R, Cat),
                right_width = W};
-physical(#lp_agg{group_by = G, aggs = A, having = H, input = In}) ->
-    #p_agg{group_by = G, aggs = A, having = H, input = physical(In)};
-physical(#lp_sort{keys = K, limit = L, input = In}) ->
-    #p_sort{keys = K, limit = L, input = physical(In)};
-physical(#lp_limit{count = C, offset = O, input = In}) ->
-    #p_limit{count = C, offset = O, input = physical(In)};
-physical(#lp_distinct{input = In}) ->
-    #p_distinct{input = physical(In)};
-physical(#lp_project{exprs = E, names = N, input = In}) ->
-    #p_project{exprs = E, names = N, input = physical(In)}.
+physical(#lp_agg{group_by = G, aggs = A, having = H, input = In}, Cat) ->
+    #p_agg{group_by = G, aggs = A, having = H, input = physical(In, Cat)};
+physical(#lp_sort{keys = K, limit = L, input = In}, Cat) ->
+    #p_sort{keys = K, limit = L, input = physical(In, Cat)};
+physical(#lp_limit{count = C, offset = O, input = In}, Cat) ->
+    #p_limit{count = C, offset = O, input = physical(In, Cat)};
+physical(#lp_distinct{input = In}, Cat) ->
+    #p_distinct{input = physical(In, Cat)};
+physical(#lp_project{exprs = E, names = N, input = In}, Cat) ->
+    #p_project{exprs = E, names = N, input = physical(In, Cat)}.
+
+%%%===================================================================
+%%% アクセスパスの選択
+%%%===================================================================
+
+%%----------------------------------------------------------------------
+%% 索引で引ける条件のうち、いちばん選択率が良いものを選ぶ。
+%% それでも全表走査より高くつくなら使わない。
+%%
+%% 「索引があるなら使う」ではないのが要点。異なり値が2しかない
+%% カラムでは、索引で半分の行をランダムに読むより順に舐めた方が速い。
+%%----------------------------------------------------------------------
+best_index_path(Conjs, Schema, Indexed, Stats) ->
+    Cands = [{sql_stats:selectivity(C, Schema, Stats), Col, Val, C}
+             || C <- Conjs, {Col, Val} <- eq_on_indexed(C, Schema, Indexed)],
+    case lists:sort(Cands) of
+        [] ->
+            none;
+        [{Sel, Col, Val, Used} | _] ->
+            case sql_stats:cost_index_scan(Stats, Sel) < sql_stats:cost_seq_scan(Stats) of
+                false -> none;
+                true  -> {Col, Val, Conjs -- [Used]}
+            end
+    end.
+
+%% 索引の張られたカラムに対する等値条件なら {カラム名, 値} を返す。
+%% それ以外は空リスト(内包表記でそのまま落ちる)。
+eq_on_indexed({comp, '=', {ref, P}, {const, V}}, Schema, Indexed) ->
+    indexed_col(P, Schema, Indexed, V);
+eq_on_indexed({comp, '=', {const, V}, {ref, P}}, Schema, Indexed) ->
+    indexed_col(P, Schema, Indexed, V);
+eq_on_indexed(_Other, _Schema, _Indexed) ->
+    [].
+
+indexed_col(P, Schema, Indexed, V) when P >= 1, P =< length(Schema) ->
+    Name = lists:nth(P, Schema),
+    case lists:member(Name, Indexed) of
+        true  -> [{Name, V}];
+        false -> []
+    end;
+indexed_col(_P, _Schema, _Indexed, _V) ->
+    [].

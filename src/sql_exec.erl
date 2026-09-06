@@ -31,7 +31,7 @@
 
 %% 実行文脈。ストレージへの入口を関数で渡すことで、
 %% 実行器が query_exec の内部状態に直接触らないようにする。
--record(ctx, {scan_open, scan_next}).
+-record(ctx, {scan_open, scan_next, index_lookup}).
 
 -export_type([ctx/0]).
 -opaque ctx() :: #ctx{}.
@@ -39,14 +39,17 @@
 %%----------------------------------------------------------------------
 %% @doc プランを最後まで走らせて結果セットを返す。
 %%
-%% Ctx は {ScanOpenFun, ScanNextFun}。
+%% Ctx は #{scan_open => F, scan_next => F, index_lookup => F}。
+%% index_lookup を渡さないと索引スキャンは実行できない
+%% (プランナが索引を選ばなければ要らない)。
 %% Returns: {ok, ColumnNames, Rows} | {error, Reason}
 %%
 %% カラム名を一緒に返すのは、結果セットが「名前つきの列の並び」だから。
 %% クライアントが見出しを出すのに要る。
 %%----------------------------------------------------------------------
-run(Plan, {ScanOpen, ScanNext}) ->
-    Ctx = #ctx{scan_open = ScanOpen, scan_next = ScanNext},
+run(Plan, #{scan_open := ScanOpen, scan_next := ScanNext} = Fns) ->
+    Ctx = #ctx{scan_open = ScanOpen, scan_next = ScanNext,
+               index_lookup = maps:get(index_lookup, Fns, undefined)},
     case open(Plan, Ctx) of
         {error, Reason} ->
             {error, Reason};
@@ -86,6 +89,22 @@ open(#p_seq_scan{table = Table}, #ctx{scan_open = ScanOpen} = Ctx) ->
         {ok, Cursor} ->
             #op{kind = seq_scan, st = {Ctx, Cursor, []}}
     end;
+%% 索引による等値検索。走査せずに一致する行だけを読む。
+%%
+%% 索引そのものは共有データしか知らないので、引くのは
+%% query_exec が渡す関数に任せる。そちらが未コミットの
+%% ローカル変更を重ねてから返す。ここで索引を直接引くと、
+%% 自分がさっき入れた行が見えない。
+open(#p_index_scan{table = Table, column = Col, value = Val},
+     #ctx{index_lookup = Lookup}) when is_function(Lookup, 3) ->
+    case Lookup(Table, Col, Val) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Rows} ->
+            #op{kind = sorted, st = [list_to_tuple(R) || R <- Rows]}
+    end;
+open(#p_index_scan{}, _Ctx) ->
+    {error, index_lookup_not_available};
 open(#p_filter{pred = Pred, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};

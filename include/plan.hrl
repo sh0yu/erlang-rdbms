@@ -17,6 +17,18 @@
     schema = []
 }).
 
+%% 索引による等値検索。走査せずに一致する行だけを読む。
+%%
+%% **等値だけ。範囲は扱わない。** 未コミットのローカル変更を
+%% 重ねる仕組み(query_exec の merge_local_index)が等値条件でしか
+%% 動かないため、範囲で索引を引くと自分の変更が見えなくなる。
+-record(p_index_scan, {
+    table,
+    schema = [],
+    column,
+    value
+}).
+
 %% 述語を満たす行だけを通す(σ)。
 -record(p_filter, {
     pred,

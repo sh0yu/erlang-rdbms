@@ -16,6 +16,7 @@
 -export([empty/1, accumulate/2, finish/3]).
 -export([rows/1, distinct/2, nulls/2, column/2]).
 -export([default_rows/0]).
+-export([selectivity/3, cost_seq_scan/1, cost_index_scan/2]).
 
 -include("../include/catalog.hrl").
 
@@ -80,6 +81,84 @@ finish(Columns, RowCount, Acc) when is_list(Columns) ->
                                        min = Min, max = Max}}
              end, Columns, Acc),
     #table_stats{rows = RowCount, columns = Cols}.
+
+%%%===================================================================
+%%% 見積もり
+%%%===================================================================
+
+%% 異なり値が分からないときの等値条件の選択率。
+-define(DEFAULT_EQ_SEL, 0.1).
+%% 範囲条件の選択率。最小最大から求めることもできるが、
+%% 型をまたぐと比較できないので定数にしてある(PostgreSQLも既定は 1/3)。
+-define(RANGE_SEL, 0.33).
+%% 読めない述語の選択率。半分通ると仮定する。
+-define(UNKNOWN_SEL, 0.5).
+%% 索引経由の1行はランダム読み。順次走査の1行より高くつく。
+-define(RANDOM_PAGE_COST, 2.0).
+
+%%----------------------------------------------------------------------
+%% @doc 述語が何割の行を通すか。0.0〜1.0。
+%% Schema は位置参照をカラム名に戻すための並び。
+%%----------------------------------------------------------------------
+-spec selectivity(term(), [atom()], #table_stats{} | none) -> float().
+selectivity(undefined, _Schema, _Stats) ->
+    1.0;
+selectivity({'and', Es}, Schema, Stats) ->
+    %% 条件は独立と仮定して掛ける。相関があると外れるが、
+    %% 相関を測る統計を持っていない
+    lists:foldl(fun(E, A) -> A * selectivity(E, Schema, Stats) end, 1.0, Es);
+selectivity({'or', Es}, Schema, Stats) ->
+    1.0 - lists:foldl(fun(E, A) -> A * (1.0 - selectivity(E, Schema, Stats)) end, 1.0, Es);
+selectivity({'not', E}, Schema, Stats) ->
+    1.0 - selectivity(E, Schema, Stats);
+selectivity({comp, '=', {ref, P}, {const, _}}, Schema, Stats) ->
+    eq_sel(P, Schema, Stats);
+selectivity({comp, '=', {const, _}, {ref, P}}, Schema, Stats) ->
+    eq_sel(P, Schema, Stats);
+selectivity({comp, '<>', {ref, P}, {const, _}}, Schema, Stats) ->
+    1.0 - eq_sel(P, Schema, Stats);
+selectivity({comp, Op, _, _}, _Schema, _Stats)
+  when Op =:= '<'; Op =:= '<='; Op =:= '>'; Op =:= '>=' ->
+    ?RANGE_SEL;
+selectivity({is_null, {ref, P}}, Schema, Stats) ->
+    null_frac(P, Schema, Stats);
+selectivity({is_not_null, {ref, P}}, Schema, Stats) ->
+    1.0 - null_frac(P, Schema, Stats);
+selectivity(_Other, _Schema, _Stats) ->
+    ?UNKNOWN_SEL.
+
+eq_sel(P, Schema, Stats) ->
+    case name_at(P, Schema) of
+        undefined -> ?DEFAULT_EQ_SEL;
+        Name ->
+            case distinct(Stats, Name) of
+                0 -> ?DEFAULT_EQ_SEL;
+                D -> 1.0 / D
+            end
+    end.
+
+null_frac(P, Schema, Stats) ->
+    case {name_at(P, Schema), rows(Stats)} of
+        {undefined, _} -> ?UNKNOWN_SEL;
+        {_, 0}         -> 0.0;
+        {Name, R}      -> nulls(Stats, Name) / R
+    end.
+
+name_at(P, Schema) when P >= 1, P =< length(Schema) -> lists:nth(P, Schema);
+name_at(_P, _Schema)                                -> undefined.
+
+%%----------------------------------------------------------------------
+%% @doc 費用。単位は「順次走査で1行読む」を 1.0 とする相対値。
+%%----------------------------------------------------------------------
+-spec cost_seq_scan(#table_stats{} | none) -> float().
+cost_seq_scan(Stats) -> float(rows(Stats)).
+
+%% 索引スキャンは一致した行だけを読むが、1行ごとにランダム読みになる。
+%% 選択率が悪いと順次走査に負ける。異なり値が2しかないカラムに
+%% 索引を張っても使われないのは、この式のため。
+-spec cost_index_scan(#table_stats{} | none, float()) -> float().
+cost_index_scan(Stats, Sel) ->
+    1.0 + rows(Stats) * Sel * ?RANDOM_PAGE_COST.
 
 %%%===================================================================
 %%% 参照
