@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>分散の現象 — tether</title>
+<style>
+  :root{--bg:#0f1115;--panel:#161a21;--line:#262c36;--fg:#d7dce3;--dim:#8b94a3;
+        --accent:#5aa9e6;--ok:#6fcf97;--warn:#f2c94c;--err:#eb5757;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{padding:12px 22px;border-bottom:1px solid var(--line);background:var(--panel);
+         display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header h1{margin:0;font-size:15px}
+  header a{color:var(--accent);font-size:12px;text-decoration:none}
+  header a:hover{text-decoration:underline}
+  .pick{padding:9px 22px;background:#12161d;border-bottom:1px solid var(--line);
+        display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .pick .lbl{font-size:11px;color:var(--dim);margin-right:2px}
+  button{background:#1e2530;color:var(--fg);border:1px solid var(--line);
+         border-radius:6px;padding:5px 11px;font:inherit;font-size:11.5px;
+         cursor:pointer;white-space:nowrap}
+  button:hover{border-color:var(--accent);color:#fff}
+  button.on{background:var(--accent);color:#08111a;border:0;font-weight:700}
+  main{max-width:1180px;margin:0 auto;padding:20px 22px 60px}
+  h2{font-size:17px;margin:0 0 10px}
+  .why{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+       border-radius:0 8px 8px 0;padding:12px 15px;font-size:13px;color:#c3cad4;margin:0 0 20px}
+  .why b{color:var(--fg)}
+  table{width:100%;border-collapse:separate;border-spacing:8px 0;margin-bottom:6px}
+  th{font-size:12px;color:var(--dim);text-align:left;padding:0 12px 6px;font-weight:600}
+  td{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+     padding:12px;font-size:13px;vertical-align:top;transition:background .3s}
+  td.chg{background:#1d2634;border-color:var(--accent)}
+  td.bad{border-color:#5a3340}
+  .steps{margin:22px 0 0;list-style:none;padding:0}
+  .steps li{padding:7px 12px;border-radius:6px;color:var(--dim);font-size:13px;
+            border-left:3px solid transparent;margin-bottom:2px}
+  .steps li.now{background:var(--panel);color:var(--fg);border-left-color:var(--accent)}
+  .steps li.done{color:#98a1af}
+  .steps li b{color:var(--warn)}
+  .steps .n{display:inline-block;width:22px;color:var(--dim)}
+  .verdict{margin-top:24px;display:none}
+  .verdict.on{display:block}
+  .verdict h3{font-size:12px;color:var(--dim);margin:0 0 8px;font-weight:600}
+  .v{padding:9px 13px;border-radius:7px;margin-bottom:5px;font-size:13px;
+     background:var(--panel);border-left:3px solid var(--err)}
+  .v.good{border-left-color:var(--ok)}
+  .v .who{color:var(--fg);font-weight:700;margin-right:10px}
+  .v .mark{margin-right:8px}
+  .v.good .mark{color:var(--ok)} .v .mark{color:var(--err)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>分散の現象 — 同じ出来事に、方式を当ててみる</h1>
+  <a href="/">← 端末2台とサーバのデモ</a>
+</header>
+
+<div class="pick">
+  <span class="lbl">現象:</span>
+  <span id="tabs"></span>
+  <button id="all">全部を続けて</button>
+  <span class="lbl">速さ</span>
+  <button data-sp="2200" class="on">ふつう</button>
+  <button data-sp="1100">速い</button>
+  <button data-sp="3600">ゆっくり</button>
+</div>
+
+<main id="main"></main>
+
+<script>
+const $=s=>document.querySelector(s);
+const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
+                   if(x!==undefined)n.textContent=x;return n;};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const md=s=>s.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>");
+
+let LAB=[], speed=2200, run=0;
+
+async function boot(){
+  LAB = await (await fetch("/api/tether_web:lab")).json();
+  const tabs=$("#tabs");
+  LAB.forEach((p,i)=>{
+    const b=el("button","",p.title.split(" — ")[0]);
+    b.onclick=()=>play([i]); tabs.append(b);
+  });
+  $("#all").onclick=()=>play(LAB.map((_,i)=>i));
+  document.querySelectorAll("[data-sp]").forEach(b=>b.onclick=()=>{
+    speed=+b.dataset.sp;
+    document.querySelectorAll("[data-sp]").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+  });
+  play([0]);
+}
+
+async function play(idxs){
+  const me = ++run;
+  for(const i of idxs){
+    if(me!==run) return;
+    await one(LAB[i], me);
+    if(me!==run) return;
+    await sleep(speed);
+  }
+}
+
+async function one(p, me){
+  const m=$("#main"); m.textContent="";
+  m.append(el("h2","",p.title));
+  const why=el("div","why"); why.innerHTML=md(p.why); m.append(why);
+
+  // 方式ごとの列
+  const tb=el("table"), hr=el("tr"), br=el("tr");
+  p.policies.forEach(pol=>{ hr.append(el("th","",pol.name)); br.append(el("td","","—")); });
+  const thead=el("thead"); thead.append(hr);
+  const tbody=el("tbody"); tbody.append(br);
+  tb.append(thead, tbody); m.append(tb);
+
+  // 手順
+  const ul=el("ul","steps");
+  p.steps.forEach((s,i)=>{
+    const li=el("li");
+    li.innerHTML=`<span class="n">${i+1}</span>`+md(s.say);
+    ul.append(li);
+  });
+  m.append(ul);
+
+  const vd=el("div","verdict");
+  vd.append(el("h3","","結果"));
+  m.append(vd);
+
+  // 1手順ずつ進める
+  const prev={};
+  for(let i=0;i<p.steps.length;i++){
+    if(me!==run) return;
+    ul.children[i].className="now";
+    if(i>0) ul.children[i-1].className="done";
+    p.policies.forEach((pol,c)=>{
+      const v=p.steps[i].state[pol.key];
+      const td=br.children[c];
+      td.textContent=v;
+      td.className = (prev[pol.key]!==undefined && prev[pol.key]!==v) ? "chg" : "";
+      prev[pol.key]=v;
+    });
+    await sleep(speed);
+    p.policies.forEach((pol,c)=>br.children[c].classList.remove("chg"));
+  }
+  if(me!==run) return;
+  ul.children[p.steps.length-1].className="done";
+
+  // 判定
+  p.policies.forEach(pol=>{
+    const ok=(p.good||[]).includes(pol.key);
+    const d=el("div","v"+(ok?" good":""));
+    const txt=el("span","");
+    txt.innerHTML=md(p.verdict[pol.key]);
+    d.append(el("span","mark",ok?"✓":"✗"), el("span","who",pol.name), txt);
+    vd.append(d);
+  });
+  vd.className="verdict on";
+}
+
+boot();
+</script>
+</body>
+</html>

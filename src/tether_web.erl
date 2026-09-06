@@ -14,7 +14,7 @@
 -behaviour(gen_server).
 
 -export([start/0, start/1, stop/0]).
--export([state/3, act/3]).                    % mod_esi
+-export([state/3, act/3, lab/3]).              % mod_esi
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(COLL, <<"orders">>).
@@ -60,7 +60,9 @@ start(Port) ->
                                            {"js","application/javascript"}]}]) of
         {ok, Pid} ->
             io:format("~n  tether — local-first のデモ~n"
-                      "  http://127.0.0.1:~p~n~n", [Port]),
+                      "  http://127.0.0.1:~p          端末2台とサーバ~n"
+                      "  http://127.0.0.1:~p/lab.html  分散の現象（復習用）~n~n",
+                      [Port, Port]),
             {ok, Pid};
         {error, R} ->
             io:format(standard_error, "ポート ~p を開けません: ~p~n", [Port, R]),
@@ -76,6 +78,9 @@ stop() ->
 %%%===================================================================
 
 state(Sid, _Env, _In) -> json(Sid, gen_server:call(?MODULE, state, 30000)).
+
+%% 分散の現象を方式ごとに並べたもの。状態を持たないので gen_server を通さない。
+lab(Sid, _Env, _In) -> json(Sid, tether_lab:all()).
 
 act(Sid, _Env, In) when is_list(In) ->
     %% In は "client=alice&action=sell" 形式
