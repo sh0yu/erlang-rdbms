@@ -37,7 +37,7 @@
 
 -export([start_link/1, submit/3, submit_batch/3, read/1, size/0, keys/0]).
 -export([sessions/0, session/1]).
--export([checkpoint/0, entries/0, escrow_pool/1]).
+-export([checkpoint/0, entries/0, escrow_pool/1, resume/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([reply/0]).
@@ -133,6 +133,23 @@ checkpoint() -> gen_server:call(?MODULE, checkpoint, 60000).
 entries() -> gen_server:call(?MODULE, entries).
 
 %%----------------------------------------------------------------------
+%% @doc クライアントが自分の状態を取り戻すための問い合わせ。**読み取り。**
+%%
+%% クライアントが自分の通番を忘れた場合(端末の再インストール、
+%% ローカル保存前の強制終了)、どこまで届いているか分からなくなる。
+%% 適当な番号で送ると、二重発注か、拒否かのどちらかになる。
+%%
+%% FIX の Order Mass Status Request にあたる。ただし向こうは
+%% 別サブシステムへの問い合わせで、注文の記録と食い違いうる。
+%% ここではセッションの記憶と預かりが**同じログから復元されている**ので、
+%% 食い違いようがない。
+%%----------------------------------------------------------------------
+-spec resume(binary()) ->
+          #{last_seq := non_neg_integer(), last_reply := term(),
+            grants := [{binary(), non_neg_integer(), integer()}]}.
+resume(Client) -> gen_server:call(?MODULE, {resume, Client}).
+
+%%----------------------------------------------------------------------
 %% @doc 中央の残りと、配ってある量。**読み取りなのでログに載せない。**
 %% submit を通すと、ただの参照のたびに fsync することになる。
 %%----------------------------------------------------------------------
@@ -187,6 +204,14 @@ handle_call({session, C}, _From, #s{sessions = Sess} = S) ->
     {reply, maps:get(C, Sess, none), S};
 handle_call(entries, _From, #s{index = N} = S) ->
     {reply, N, S};
+handle_call({resume, Client}, _From, #s{db = Db, sessions = Sess} = S) ->
+    Now = erlang:system_time(millisecond),
+    {Last, Reply} = maps:get(Client, Sess, {0, undefined}),
+    Grants = [{Res, R, Exp}
+              || Res <- tether_escrow:holdings(Client, Db),
+                 {R, Exp} <- [tether_escrow:grant_view(Client, Res, Db)],
+                 Exp > Now],
+    {reply, #{last_seq => Last, last_reply => Reply, grants => Grants}, S};
 handle_call({escrow_pool, Res}, _From, #s{db = Db} = S) ->
     Ctx = #{now => 0, client => <<>>},
     {ok, {pool, A, G}, _} = tether_escrow:apply({pool_of, Res}, Ctx, Db),

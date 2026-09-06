@@ -44,9 +44,13 @@
 
 -export([apply/3, is_escrow_op/1, validate/1]).
 -export([pool_key/1, grant_key/2, decode_pool/1, decode_grant/1]).
+-export([holdings/2, grant_view/3]).
 
 -define(POOL,  <<"$pool">>).
 -define(GRANT, <<"$grant">>).
+%% クライアント → 預かっている資源の一覧。resume で引くための索引。
+%% 無いと「このクライアントの預かりを全部出せ」が全鍵の走査になる。
+-define(HELD,  <<"$held">>).
 
 %% 期限までに使い切る量の見積もりに掛ける安全率。
 %% 大きいほど協調が減り、在庫が遊ぶ。
@@ -71,6 +75,25 @@ pool_key(Res) -> {?POOL, Res}.
 %% クライアントと資源で1つ。NUL は鍵の中に現れない前提の区切り。
 -spec grant_key(binary(), binary()) -> tether_data:key().
 grant_key(Client, Res) -> {?GRANT, <<Client/binary, 0, Res/binary>>}.
+
+held_key(Client) -> {?HELD, Client}.
+
+%% @doc このクライアントが預かっている資源の一覧。
+-spec holdings(binary(), tether_data:db()) -> [binary()].
+holdings(Client, Db) ->
+    case maps:find(held_key(Client), Db) of
+        {ok, Bin} -> binary_to_term(Bin, [safe]);
+        error     -> []
+    end.
+
+%% @doc 預かりの中身を外から見る形にする。期限切れは none。
+-spec grant_view(binary(), binary(), tether_data:db()) ->
+          {non_neg_integer(), integer()} | none.
+grant_view(Client, Res, Db) ->
+    case grant(Client, Res, Db) of
+        undefined -> none;
+        G         -> {maps:get(remaining, G), maps:get(expires_at, G)}
+    end.
 
 %%%===================================================================
 %%% 判定と検査
@@ -231,7 +254,7 @@ reclaim(Res, Now, Db) ->
                       case expired(G, Now) of
                           false -> {A, [C | Hs], D};
                           true  -> {A + maps:get(remaining, G), Hs,
-                                    tether_data_remove(grant_key(C, Res), D)}
+                                    drop_grant(C, Res, D)}
                       end
               end
       end, {Avail, [], Db}, Holders).
@@ -248,7 +271,7 @@ return_grant(C, Res, G, Db) ->
     {Avail, Holders} = pool(Res, Db),
     Db1 = put_pool(Res, {Avail + maps:get(remaining, G),
                          lists:delete(C, Holders)}, Db),
-    tether_data_remove(grant_key(C, Res), Db1).
+    drop_grant(C, Res, Db1).
 
 pool(Res, Db) ->
     case maps:find(pool_key(Res), Db) of
@@ -270,9 +293,23 @@ grant(C, Res, Db) ->
     end.
 
 put_pool(Res, P, Db)     -> Db#{pool_key(Res) => term_to_binary(P)}.
-put_grant(C, Res, G, Db) -> Db#{grant_key(C, Res) => term_to_binary(G)}.
+
+put_grant(C, Res, G, Db) ->
+    Held = holdings(C, Db),
+    Db1  = case lists:member(Res, Held) of
+               true  -> Db;
+               false -> Db#{held_key(C) => term_to_binary([Res | Held])}
+           end,
+    Db1#{grant_key(C, Res) => term_to_binary(G)}.
+
+drop_grant(C, Res, Db) ->
+    Held = lists:delete(Res, holdings(C, Db)),
+    Db1  = case Held of
+               [] -> maps:remove(held_key(C), Db);
+               _  -> Db#{held_key(C) => term_to_binary(Held)}
+           end,
+    maps:remove(grant_key(C, Res), Db1).
 
 decode_pool(Bin)  -> binary_to_term(Bin, [safe]).
 decode_grant(Bin) -> binary_to_term(Bin, [safe]).
 
-tether_data_remove(K, Db) -> maps:remove(K, Db).

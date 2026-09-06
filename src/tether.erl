@@ -16,7 +16,7 @@
 -module(tether).
 
 -export([request/3, read/1, open/1, close/1, session_info/1]).
--export([stock/2, pool/1, request_batch/3]).
+-export([stock/2, pool/1, request_batch/3, resume/1]).
 -export([session_count/0, stat/0]).
 
 -spec open(binary()) -> {ok, pid()} | {error, term()}.
@@ -74,6 +74,19 @@ request_batch(Client, Seq, Groups) ->
 
 -spec read(tether_data:key()) -> {ok, tether_data:value()} | not_found.
 read(Key) -> tether_store:read(Key).
+
+%%----------------------------------------------------------------------
+%% @doc 「私はどこまで届いていて、何を預かっていますか」
+%%
+%% 自分の通番を忘れたクライアントの復帰路。返るのは
+%%   last_seq    最後に実行した通番。次に送るのは +1
+%%   last_reply  そのとき返した答え
+%%   grants      いま有効な預かり(期限切れは含まない)
+%%
+%% grants が返るので、**復帰した端末はすぐ圏外で動ける。**
+%%----------------------------------------------------------------------
+-spec resume(binary()) -> map().
+resume(Client) -> tether_store:resume(Client).
 
 %%----------------------------------------------------------------------
 %% @doc 中央在庫を増減する(管理操作)。

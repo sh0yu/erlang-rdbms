@@ -157,3 +157,65 @@ drain(C, Seq, N) when N < 500 ->
         {error, 1, sold_out} -> ok
     end;
 drain(_, _, _) -> error(drain_did_not_terminate).
+
+%%%===================================================================
+%%% resume — クライアントが自分の状態を忘れた場合
+%%%===================================================================
+
+%% 端末を作り直した(ローカルの通番を失った)クライアントが、
+%% 「どこまで届いていて、何を預かっているか」を聞き直す。
+resume_returns_position_and_grants_test() ->
+    with_db(fun(_) ->
+        {ok, _} = tether:stock(?SKU, 100),
+        {ok, [{granted, G, Exp}]} =
+            tether:request(<<"alice">>, 1, [{acquire, ?SKU, 5, 600000}]),
+        R2 = tether:request(<<"alice">>, 2, [{put, ?K("t", "a"), <<"1">>}]),
+
+        %% 端末を作り直した。手元には何も無い
+        #{last_seq := Last, last_reply := Reply, grants := Grants} =
+            tether:resume(<<"alice">>),
+
+        ?assertEqual(2, Last),
+        %% 記録されているのは束の結果。公開APIの形にほどけば一致する
+        ?assertEqual({ok, [R2]}, Reply),
+        ?assertEqual([{?SKU, G, Exp}], Grants),
+
+        %% 次に送るのは last_seq + 1。二重発注も拒否も起きない
+        ?assertMatch({ok, [ok]},
+                     tether:request(<<"alice">>, Last + 1,
+                                    [{put, ?K("t", "b"), <<"2">>}]))
+    end).
+
+%% 預かりが返るので、復帰した端末は**すぐ圏外で動ける**。
+resume_lets_client_go_offline_again_test() ->
+    with_db(fun(_) ->
+        {ok, _} = tether:stock(?SKU, 100),
+        {ok, [{granted, G, _}]} =
+            tether:request(<<"alice">>, 1, [{acquire, ?SKU, 5, 600000}]),
+        drain(<<"bob">>),                          % 中央は空になる
+
+        #{last_seq := L, grants := [{?SKU, Rem, _}]} = tether:resume(<<"alice">>),
+        ?assertEqual(G, Rem),
+
+        %% 中央が空でも、預かりの範囲では売れる
+        {ok, R} = tether:request_batch(<<"alice">>, L + 1,
+                    [[{consume, ?SKU, 1}], [{consume, ?SKU, 1}]]),
+        ?assert(lists:all(fun({ok, _}) -> true; (_) -> false end, R))
+    end).
+
+%% 期限切れの預かりは返らない。返すと、使えないものを使えると誤解する。
+resume_hides_expired_grants_test() ->
+    with_db(fun(_) ->
+        {ok, _} = tether:stock(?SKU, 100),
+        {ok, [{granted, _, _}]} =
+            tether:request(<<"alice">>, 1, [{acquire, ?SKU, 5, 1}]),
+        timer:sleep(20),
+        ?assertMatch(#{grants := []}, tether:resume(<<"alice">>))
+    end).
+
+%% 一度も来ていないクライアントにも答えられる
+resume_of_unknown_client_test() ->
+    with_db(fun(_) ->
+        ?assertEqual(#{last_seq => 0, last_reply => undefined, grants => []},
+                     tether:resume(<<"nobody">>))
+    end).

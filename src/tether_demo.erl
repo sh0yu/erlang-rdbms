@@ -28,7 +28,8 @@ run(Dir) ->
         %% (それ自体がこの筋書きの見せ場なので)ここでは使えない。
         Sent = scene_1() + scene_2() + scene_3() + scene_4() + scene_5()
              + summary(),
-        report(Dir, Sent)
+        report(Dir, Sent),
+        local_first()
     after
         application:stop(tether)
     end.
@@ -122,6 +123,67 @@ report(Dir, Sent) ->
     say("「入ったか分からない」が存在しない。"),
     io:format("~n"),
     ok.
+
+%%%===================================================================
+%%% 第二部 — 切断中も動ける
+%%%===================================================================
+
+local_first() ->
+    title("6. 圏外で売る — 預かり(escrow)"),
+    {ok, 100} = tether:stock(<<"sku:1">>, 100),
+    say("在庫を100個入れた。"),
+    say("alice が**あらかじめ持ち分を預かる**。"),
+    %% 第一部の続きなので、通番は resume で聞いて続ける
+    #{last_seq := L0} = tether:resume(<<"alice">>),
+    {ok, [{granted, G, _}]} =
+        tether:request(<<"alice">>, L0 + 1, [{acquire, <<"sku:1">>, 5, 600000}]),
+    result("alice が預かった量", G),
+    result("中央 / 配ってある量", tether:pool(<<"sku:1">>)),
+    say(""),
+    say("ここで alice が圏外になる。その間に bob が中央を売り切る。"),
+    drain(<<"bob">>, 1),
+    result("中央 / 配ってある量", tether:pool(<<"sku:1">>)),
+    say("中央は空。**普通のDBなら alice は何も売れない。**"),
+
+    title("7. 圏外で積んだ操作を、戻ってから流す"),
+    say("alice が圏外で積んだもの:"),
+    say("  カートに追加 / 引き当て+注文 ×3"),
+    Queued = [[{put, {<<"cart">>, <<"a1">>}, <<"item">>}],
+              [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o1">>}, <<"c">>}],
+              [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o2">>}, <<"c">>}],
+              [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o3">>}, <<"c">>}]],
+    {ok, R} = tether:request_batch(<<"alice">>, L0 + 2, Queued),
+    result("結果", [element(1, X) || X <- R]),
+    say(""),
+    say("**中央が空でも4件すべて通った。** 事前に権利を持っていたから。"),
+    say("CRDT なら統合はできるが在庫がマイナスになる。"),
+    say("同期エンジンなら competing write として弾かれる。"),
+    result("在庫の保存則 (中央+預かり+売れた=100)", conserved()),
+
+    title("8. 端末を作り直した — resume"),
+    say("alice が手元の通番を失った。次に何番を送ればいいか分からない。"),
+    #{last_seq := L, grants := Gr} = tether:resume(<<"alice">>),
+    result("last_seq", L),
+    result("いま有効な預かり", Gr),
+    say(""),
+    say("通番も預かりも返ってくるので、**そのまま圏外に戻れる。**"),
+    say("FIX の Order Mass Status Request にあたるが、向こうは"),
+    say("別サブシステムへの問い合わせで、注文の記録と食い違いうる。"),
+    say("ここでは記憶も預かりも同じログから復元されるので、食い違わない。"),
+    io:format("~n"),
+    ok.
+
+conserved() ->
+    {A, G} = tether:pool(<<"sku:1">>),
+    {A, G, 100 - A - G, 100 =:= A + G + (100 - A - G)}.
+
+drain(C, Seq) ->
+    case tether:request(C, Seq, [{acquire, <<"sku:1">>, 1000000, 600000}]) of
+        {ok, [{granted, G, _}]} ->
+            {ok, [{consumed, 0}]} = tether:request(C, Seq+1, [{consume, <<"sku:1">>, G}]),
+            drain(C, Seq + 2);
+        {error, 1, sold_out} -> ok
+    end.
 
 num(Label, N) ->
     L = unicode:characters_to_binary(Label),
