@@ -16,6 +16,7 @@
 -module(tether).
 
 -export([request/3, read/1, open/1, close/1, session_info/1]).
+-export([stock/2, pool/1]).
 -export([session_count/0, stat/0]).
 
 -spec open(binary()) -> {ok, pid()} | {error, term()}.
@@ -47,6 +48,21 @@ request(Client, Seq, Ops) ->
 
 -spec read(tether_data:key()) -> {ok, tether_data:value()} | not_found.
 read(Key) -> tether_store:read(Key).
+
+%%----------------------------------------------------------------------
+%% @doc 中央在庫を増減する(管理操作)。
+%% クライアントの通番とは無関係なので、専用のクライアントIDで通す。
+%%----------------------------------------------------------------------
+-spec stock(binary(), integer()) -> {ok, non_neg_integer()} | {error, term()}.
+stock(Resource, N) ->
+    case tether_store:submit(<<"$admin">>, 0, [{stock, Resource, N}]) of
+        {ok, [{pool, A, _}]} -> {ok, A};
+        Other                -> {error, Other}
+    end.
+
+%% @doc 中央の残りと、配ってある量。読み取り。
+-spec pool(binary()) -> {non_neg_integer(), non_neg_integer()}.
+pool(Resource) -> tether_store:escrow_pool(Resource).
 
 -spec close(binary()) -> ok.
 close(Client) -> tether_sessions:close(Client).

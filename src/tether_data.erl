@@ -20,26 +20,49 @@
 %%%-------------------------------------------------------------------
 -module(tether_data).
 
--export([new/0, apply_ops/2, get/2, size/1, keys/1, fold/3]).
+-export([new/0, apply_ops/3, get/2, size/1, keys/1, fold/3]).
 -export([validate/1, limits/0]).
 
--export_type([db/0, key/0, value/0, op/0, result/0]).
+-export_type([db/0, key/0, value/0, op/0, result/0, ctx/0]).
 
 -type key()    :: {binary(), binary()}.        % {コレクション, 鍵}
 -type value()  :: binary().
 -type db()     :: #{key() => value()}.
+
+%% 操作を評価する文脈。**環境から取ってはいけないものを、ここから渡す。**
+%% 時刻を関数の中で読むと、復旧の再実行で違う答えになる。
+-type ctx()    :: #{now := integer(), client := binary()}.
+
+-type resource() :: binary().
 
 -type op() :: {get, key()}
             | {put, key(), value()}
             | {delete, key()}
               %% 期待した値と一致したときだけ書く。undefined は「無いこと」を期待する。
               %% read-modify-write を1往復で書くための最小の道具。
-            | {cas, key(), value() | undefined, value()}.
+            | {cas, key(), value() | undefined, value()}
+              %% 預かり(escrow)。数値の下限を、協調なしで守るための道具。
+              %% 詳細は tether_escrow を参照。
+            | {stock,    resource(), integer()}
+            | {acquire,  resource(), pos_integer(), pos_integer()}
+            | {consume,  resource(), pos_integer()}
+            | {release,  resource()}
+            | {grant_of, resource()}
+            | {pool_of,  resource()}.
 
 -type result() :: ok
                 | {ok, value()}
                 | not_found
-                | {conflict, value() | undefined}.   % cas の期待外れ。実際の値を返す
+                | {conflict, value() | undefined}   % cas の期待外れ。実際の値を返す
+                | none
+                | {granted,   non_neg_integer(), integer()}
+                | {consumed,  non_neg_integer()}
+                | {released,  non_neg_integer()}
+                | {grant,     non_neg_integer(), integer()}
+                | {pool,      non_neg_integer(), non_neg_integer()}
+                | {insufficient, non_neg_integer()}
+                | sold_out
+                | expired.
 
 %%%===================================================================
 %%% 大きさの上限
@@ -87,6 +110,13 @@ validate_1([Op | T], N, Bytes) ->
         B -> validate_1(T, N + 1, Bytes + B)
     end.
 
+op_bytes(Op) when element(1, Op) =:= stock;   element(1, Op) =:= acquire;
+                  element(1, Op) =:= consume; element(1, Op) =:= release;
+                  element(1, Op) =:= grant_of; element(1, Op) =:= pool_of ->
+    case tether_escrow:validate(Op) of
+        ok -> byte_size(element(2, Op));
+        E  -> E
+    end;
 op_bytes({get, K})           -> key_bytes(K);
 op_bytes({delete, K})        -> key_bytes(K);
 op_bytes({put, K, V})        -> add(key_bytes(K), value_bytes(V));
@@ -141,32 +171,35 @@ fold(F, Acc0, Db) -> maps:fold(F, Acc0, Db).
 %% 1つでも失敗すれば、**何も適用しない**。返るのは元の db() であって、
 %% 途中まで適用したものではない。
 %%----------------------------------------------------------------------
--spec apply_ops([op()], db()) ->
+-spec apply_ops([op()], ctx(), db()) ->
           {ok, [result()], db()} | {error, pos_integer(), result(), db()}.
-apply_ops(Ops, Db) -> apply_ops(Ops, Db, 1, [], Db).
+apply_ops(Ops, Ctx, Db) -> apply_ops(Ops, Ctx, Db, 1, [], Db).
 
-apply_ops([], New, _N, Acc, _Orig) ->
+apply_ops([], _Ctx, New, _N, Acc, _Orig) ->
     {ok, lists:reverse(Acc), New};
-apply_ops([Op | T], Cur, N, Acc, Orig) ->
-    case apply_one(Op, Cur) of
+apply_ops([Op | T], Ctx, Cur, N, Acc, Orig) ->
+    case apply_one(Op, Ctx, Cur) of
         {ok, R, Next} ->
-            apply_ops(T, Next, N + 1, [R | Acc], Orig);
+            apply_ops(T, Ctx, Next, N + 1, [R | Acc], Orig);
         {error, R} ->
             %% ここが原子性の全て。作りかけの Cur を捨てて Orig を返す。
             {error, N, R, Orig}
     end.
 
-apply_one({get, K}, Db) ->
+apply_one({get, K}, _Ctx, Db) ->
     {ok, get(K, Db), Db};
-apply_one({put, K, V}, Db) when is_binary(V) ->
+apply_one({put, K, V}, _Ctx, Db) when is_binary(V) ->
     {ok, ok, Db#{K => V}};
-apply_one({delete, K}, Db) ->
+apply_one({delete, K}, _Ctx, Db) ->
     %% 無い鍵の削除は成功。冪等にしておく。
     {ok, ok, maps:remove(K, Db)};
-apply_one({cas, K, Expect, New}, Db) when is_binary(New) ->
+apply_one({cas, K, Expect, New}, _Ctx, Db) when is_binary(New) ->
     case {maps:find(K, Db), Expect} of
         {{ok, Expect}, _}       -> {ok, ok, Db#{K => New}};
         {error, undefined}      -> {ok, ok, Db#{K => New}};
         {{ok, Actual}, _}       -> {error, {conflict, Actual}};
         {error, _}              -> {error, {conflict, undefined}}
-    end.
+    end;
+apply_one(Op, Ctx, Db) ->
+    %% 預かりの操作。時刻とクライアントが要るので Ctx を渡す。
+    tether_escrow:apply(Op, Ctx, Db).

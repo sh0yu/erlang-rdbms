@@ -36,7 +36,7 @@
 -behaviour(gen_server).
 
 -export([start_link/1, submit/3, read/1, size/0, keys/0, sessions/0, session/1]).
--export([checkpoint/0, entries/0]).
+-export([checkpoint/0, entries/0, escrow_pool/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([reply/0]).
@@ -113,6 +113,13 @@ checkpoint() -> gen_server:call(?MODULE, checkpoint, 60000).
 -spec entries() -> non_neg_integer().
 entries() -> gen_server:call(?MODULE, entries).
 
+%%----------------------------------------------------------------------
+%% @doc 中央の残りと、配ってある量。**読み取りなのでログに載せない。**
+%% submit を通すと、ただの参照のたびに fsync することになる。
+%%----------------------------------------------------------------------
+-spec escrow_pool(binary()) -> {non_neg_integer(), non_neg_integer()}.
+escrow_pool(Resource) -> gen_server:call(?MODULE, {escrow_pool, Resource}).
+
 %%%===================================================================
 %%% gen_server
 %%%===================================================================
@@ -137,11 +144,15 @@ init(Dir) ->
     end.
 
 handle_call({submit, Client, Seq, Ops}, From, #s{db = Db, index = I} = S) ->
-    {Reply, Db1} = case tether_data:apply_ops(Ops, Db) of
+    %% 時計を読むのはここ**一箇所だけ**。読んだ値はログに載り、
+    %% 復旧の再実行では記録された方を使う。
+    Now = erlang:system_time(millisecond),
+    Ctx = #{now => Now, client => Client},
+    {Reply, Db1} = case tether_data:apply_ops(Ops, Ctx, Db) of
                        {ok, Results, D1} -> {{ok, Results}, D1};
                        {error, N, R, D1} -> {{error, N, R}, D1}
                    end,
-    Entry = tether_entry:new(I + 1, Client, Seq, Ops, Reply),
+    Entry = tether_entry:new(I + 1, Now, Client, Seq, Ops, Reply),
     ok = tether_log:commit(tether_entry:encode(Entry), From, Reply),
     %% 返答しない。永続化されたらログが From へ返す。
     {noreply, maybe_checkpoint(
@@ -159,6 +170,10 @@ handle_call({session, C}, _From, #s{sessions = Sess} = S) ->
     {reply, maps:get(C, Sess, none), S};
 handle_call(entries, _From, #s{index = N} = S) ->
     {reply, N, S};
+handle_call({escrow_pool, Res}, _From, #s{db = Db} = S) ->
+    Ctx = #{now => 0, client => <<>>},
+    {ok, {pool, A, G}, _} = tether_escrow:apply({pool_of, Res}, Ctx, Db),
+    {reply, {A, G}, S};
 handle_call(checkpoint, From, #s{checkpointing = true} = S) ->
     _ = From,
     {reply, {error, already_running}, S};

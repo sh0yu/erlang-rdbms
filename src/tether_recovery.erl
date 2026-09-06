@@ -81,7 +81,11 @@ replay(Payload, Lsn, {Upto, Db, Sess, Applied}) ->
     end.
 
 apply_entry(E, Lsn, {Db, Sess}) ->
-    {Reply, Db1} = tether_data_apply(tether_entry:ops(E), Db),
+    %% **記録された時刻とクライアントで再実行する。**
+    %% ここで時計を読み直すと、期限切れの判定が本番と変わり、
+    %% 直後の乖離検査で落ちる(落ちるだけましだが、そもそも読まない)。
+    Ctx = #{now => tether_entry:time(E), client => tether_entry:client(E)},
+    {Reply, Db1} = tether_data_apply(tether_entry:ops(E), Ctx, Db),
     case Reply =:= tether_entry:reply(E) of
         true -> ok;
         false ->
@@ -94,8 +98,8 @@ apply_entry(E, Lsn, {Db, Sess}) ->
     end,
     {Db1, Sess#{tether_entry:client(E) => {tether_entry:seq(E), Reply}}}.
 
-tether_data_apply(Ops, Db) ->
-    case tether_data:apply_ops(Ops, Db) of
+tether_data_apply(Ops, Ctx, Db) ->
+    case tether_data:apply_ops(Ops, Ctx, Db) of
         {ok, Results, Db1}   -> {{ok, Results}, Db1};
         {error, N, R, Db1}   -> {{error, N, R}, Db1}
     end.
