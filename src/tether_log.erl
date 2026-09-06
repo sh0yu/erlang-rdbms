@@ -35,7 +35,7 @@
 -module(tether_log).
 -behaviour(gen_server).
 
--export([start_link/1, write/1, write/2, commit/3, stat/0, path/1]).
+-export([start_link/1, write/1, write/2, commit/3, compact/1, stat/0, path/1]).
 -export([fold/3, repair/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -92,6 +92,18 @@ write(Payload, Timeout) when is_binary(Payload) ->
 -spec commit(binary(), gen_server:from(), term()) -> ok.
 commit(Payload, From, Reply) when is_binary(Payload) ->
     gen_server:cast(?MODULE, {commit, Payload, From, Reply}).
+
+%%----------------------------------------------------------------------
+%% @doc 先頭 N 件を捨てる。**スナップショットを永続化した後にだけ呼ぶ。**
+%%
+%% 呼ぶのはストア自身であること。別のプロセスから呼ぶと、
+%% ストアが送った追記(cast)とこの呼び出しの順序が保証されず、
+%% まだ届いていない分を「先頭N件」に数えてしまう。
+%%----------------------------------------------------------------------
+-spec compact(non_neg_integer()) -> {ok, #{dropped := non_neg_integer(),
+                                           kept := non_neg_integer()}}
+                                        | {error, term()}.
+compact(N) -> gen_server:call(?MODULE, {compact, N}, 60000).
 
 %% @doc 書き込み件数と fsync 回数。まとまり具合を測るため。
 -spec stat() -> #{writes := non_neg_integer(), syncs := non_neg_integer(),
@@ -196,6 +208,11 @@ open_at(P, Off) ->
 %% timeout 0 を返すのが要点。溜まってから1回だけ吐き出される。
 handle_call({write, Payload}, From, #s{pending = Ps} = S) ->
     {noreply, S#s{pending = [{Payload, From, lsn} | Ps]}, 0};
+handle_call({compact, N}, _From, S0) ->
+    %% 待っている追記を先に片付ける。捨てる範囲を数え間違えないため。
+    {noreply, S} = flush(S0),
+    {Reply, S1} = do_compact(N, S),
+    {reply, Reply, S1};
 handle_call(stat, _From, #s{writes = W, syncs = Sy, pos = Pos} = S) ->
     {reply, #{writes => W, syncs => Sy, bytes => Pos}, S};
 handle_call(_R, _From, S) ->
@@ -254,6 +271,60 @@ build([], Pos, IoAcc, LsnAcc) ->
 build([{P, _From, _Spec} | T], Pos, IoAcc, LsnAcc) ->
     Rec = tether_rec:encode(P),
     build(T, Pos + byte_size(Rec), [Rec | IoAcc], [Pos | LsnAcc]).
+
+%%----------------------------------------------------------------------
+%% 先頭 N 件を落として書き直す。
+%% 一時ファイルに書いて rename する。書きかけのログが
+%% 正規のものとして見えてはいけない。
+%%----------------------------------------------------------------------
+do_compact(N, #s{path = P} = S) ->
+    case read_all(P) of
+        {error, R} ->
+            {{error, R}, S};
+        {ok, Bin} ->
+            case tether_rec:scan(Bin) of
+                {_, _, {corrupt, Why}} ->
+                    {{error, {corrupt, Why}}, S};
+                {Recs, _, _} when length(Recs) < N ->
+                    {{error, {not_enough_records, length(Recs), N}}, S};
+                {Recs, _, _} ->
+                    replace_log(lists:nthtail(N, Recs), N, S)
+            end
+    end.
+
+replace_log(Keep, Dropped, #s{fd = Fd, path = P} = S) ->
+    New = tether_rec:encode_all(Keep),
+    case atomic_replace(iolist_to_binary([P, ".tmp"]), P, New) of
+        ok ->
+            _ = file:close(Fd),
+            case file:open(P, [read, write, raw, binary]) of
+                {ok, Fd1} ->
+                    {ok, _} = file:position(Fd1, eof),
+                    {{ok, #{dropped => Dropped, kept => length(Keep)}},
+                     S#s{fd = Fd1, pos = byte_size(New)}};
+                E ->
+                    %% 書き直しは成功したのに開き直せない。
+                    %% ここで生き延びると、以後の追記が全部消える。
+                    exit({log_reopen_failed, E})
+            end;
+        E ->
+            {E, S}
+    end.
+
+atomic_replace(Tmp, Dst, Bin) ->
+    case file:open(Tmp, [write, raw, binary]) of
+        {ok, Fd} ->
+            R = case file:write(Fd, Bin) of
+                    ok -> file:sync(Fd);
+                    E1 -> E1
+                end,
+            _ = file:close(Fd),
+            case R of
+                ok -> file:rename(Tmp, Dst);
+                E2 -> E2
+            end;
+        E -> E
+    end.
 
 read_all(P) ->
     case file:read_file(P) of

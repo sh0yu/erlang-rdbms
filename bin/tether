@@ -1,0 +1,23 @@
+#!/bin/sh
+# tether — セッションが接続より長生きするデータベース
+#
+#   bin/tether demo     exactly-once が効いていることを見せる
+#   bin/tether shell    対話シェル(rebar3 shell)
+#   bin/tether test     試験一式
+set -e
+cd "$(dirname "$0")/.."
+if [ -x "$HOME/.local/bin/rebar3" ]; then PATH="$HOME/.local/bin:$PATH"; export PATH; fi
+
+command -v erl >/dev/null 2>&1 || {
+    echo "erl が見つかりません: sudo apt install erlang-nox erlang-dev" >&2; exit 1; }
+
+EBIN=_build/default/lib/tether/ebin
+[ -f "$EBIN/tether.beam" ] || rebar3 compile >/dev/null
+
+case "${1:-demo}" in
+    demo)  exec erl -noshell +pc unicode -pa "$EBIN" \
+                -eval 'tether_demo:run(), halt().' ;;
+    shell) exec rebar3 shell ;;
+    test)  exec rebar3 eunit ;;
+    *)     echo "usage: bin/tether [demo|shell|test]" >&2; exit 1 ;;
+esac

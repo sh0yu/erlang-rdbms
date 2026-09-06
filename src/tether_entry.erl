@@ -5,6 +5,7 @@
 %%% 記録するのは「何をしたか」ではなく「何を頼まれたか」と
 %%% 「何を返したか」である。
 %%%
+%%%   index         ログ全体を通した番号。復旧の読み飛ばしに使う
 %%%   client, seq   誰の何番目の要求か。再送の判定に使う
 %%%   ops           頼まれた操作。決定的なので再実行すれば同じ状態になる
 %%%   reply         そのとき返した答え
@@ -16,12 +17,17 @@
 %%%-------------------------------------------------------------------
 -module(tether_entry).
 
--export([new/4, encode/1, decode/1]).
--export([client/1, seq/1, ops/1, reply/1]).
+-export([new/5, encode/1, decode/1]).
+-export([index/1, client/1, seq/1, ops/1, reply/1]).
 
 -export_type([entry/0]).
 
 -record(entry, {
+          %% ログ全体を通した番号。1から増え、**切り詰めても振り直さない**。
+          %% スナップショットは「どの番号まで反映しているか」を記録し、
+          %% 復旧はそれ以下の番号を読み飛ばす。件数で数えると、
+          %% 切り詰めの後に先頭がずれて破綻する(実際にそれで壊した)。
+          index  :: pos_integer(),
           client :: binary(),
           seq    :: non_neg_integer(),
           ops    :: [tether_data:op()],
@@ -30,9 +36,13 @@
 
 -type entry() :: #entry{}.
 
--spec new(binary(), non_neg_integer(), [tether_data:op()], term()) -> entry().
-new(Client, Seq, Ops, Reply) ->
-    #entry{client = Client, seq = Seq, ops = Ops, reply = Reply}.
+-spec new(pos_integer(), binary(), non_neg_integer(), [tether_data:op()], term()) ->
+          entry().
+new(Index, Client, Seq, Ops, Reply) ->
+    #entry{index = Index, client = Client, seq = Seq, ops = Ops, reply = Reply}.
+
+-spec index(entry()) -> pos_integer().
+index(#entry{index = I}) -> I.
 
 -spec client(entry()) -> binary().
 client(#entry{client = C}) -> C.
