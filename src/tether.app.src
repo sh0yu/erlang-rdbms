@@ -1,0 +1,9 @@
+{application, tether,
+ [{description, "セッションが接続より長生きするデータベース"},
+  {vsn, "0.1.0"},
+  {registered, [tether_sup]},
+  {mod, {tether_app, []}},
+  {applications, [kernel, stdlib]},
+  {env, [{dir, "data"}]},
+  {modules, []}
+ ]}.

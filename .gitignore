@@ -28,3 +28,7 @@ src/sql_parser.erl
 
 # シェルが作るデータ置き場
 data/
+_build/
+data/
+*.beam
+erl_crash.dump
