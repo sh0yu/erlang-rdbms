@@ -36,14 +36,14 @@
           time   :: integer(),
           client :: binary(),
           seq    :: non_neg_integer(),
-          ops    :: [tether_data:op()],
+          ops    :: [[tether_data:op()]],   % グループの列
           reply  :: term()
          }).
 
 -type entry() :: #entry{}.
 
 -spec new(pos_integer(), integer(), binary(), non_neg_integer(),
-          [tether_data:op()], term()) -> entry().
+          [[tether_data:op()]], term()) -> entry().
 new(Index, Time, Client, Seq, Ops, Reply) ->
     #entry{index = Index, time = Time, client = Client, seq = Seq,
            ops = Ops, reply = Reply}.
@@ -60,7 +60,7 @@ client(#entry{client = C}) -> C.
 -spec seq(entry()) -> non_neg_integer().
 seq(#entry{seq = S}) -> S.
 
--spec ops(entry()) -> [tether_data:op()].
+-spec ops(entry()) -> [[tether_data:op()]].
 ops(#entry{ops = O}) -> O.
 
 -spec reply(entry()) -> term().

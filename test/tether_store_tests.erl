@@ -62,8 +62,10 @@ sessions_survive_restart_test() ->
         {ok, [ok]} = tether_store:submit(<<"alice">>, 7, [{put, ?K("a"), <<"1">>}]),
         {ok, [ok]} = tether_store:submit(<<"bob">>,   3, [{put, ?K("b"), <<"2">>}]),
         restart(),
-        ?assertEqual(#{<<"alice">> => {7, {ok, [ok]}},
-                       <<"bob">>   => {3, {ok, [ok]}}},
+        %% 記録されているのは**束の結果**。submit/3 は1グループの束なので
+        %% {ok, [{ok, [ok]}]} になる。公開APIの側でほどいて返している。
+        ?assertEqual(#{<<"alice">> => {7, {ok, [{ok, [ok]}]}},
+                       <<"bob">>   => {3, {ok, [{ok, [ok]}]}}},
                      tether_store:sessions())
     end).
 
@@ -93,7 +95,7 @@ failed_request_is_logged_test() ->
                                   [{cas, ?K("x"), <<"ちがう">>, <<"9">>}]),
         ?assertMatch({error, _, _}, Err),
         restart(),
-        ?assertEqual(#{<<"c1">> => {2, Err}}, tether_store:sessions())
+        ?assertEqual(#{<<"c1">> => {2, {ok, [Err]}}}, tether_store:sessions())
     end).
 
 %%%===================================================================

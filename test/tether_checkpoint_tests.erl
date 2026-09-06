@@ -54,7 +54,7 @@ checkpoint_shrinks_log_and_keeps_state_test() ->
         restart(),
         ?assertEqual(100, tether_store:size()),
         ?assertEqual({ok, <<50:32>>}, tether:read({<<"t">>, <<50:32>>})),
-        ?assertEqual(#{<<"c">> => {100, {ok, [ok]}}}, tether_store:sessions()),
+        ?assertEqual(#{<<"c">> => {100, {ok, [{ok, [ok]}]}}}, tether_store:sessions()),
 
         %% 再送もちゃんと吸収される
         ?assertEqual({ok, [ok]},
@@ -74,7 +74,7 @@ writes_after_checkpoint_are_replayed_test() ->
         restart(),
         ?assertEqual(not_found, tether:read(?K("a"))),
         ?assertEqual({ok, <<"2">>}, tether:read(?K("b"))),
-        ?assertEqual(#{<<"c">> => {3, {ok, [ok]}}}, tether_store:sessions())
+        ?assertEqual(#{<<"c">> => {3, {ok, [{ok, [ok]}]}}}, tether_store:sessions())
     end).
 
 %% スナップショットは書けたが、ログを捨てる前に電源が落ちた場合。
@@ -93,7 +93,7 @@ crash_between_snapshot_and_truncate_test() ->
         %% 読み飛ばしが効いていれば n は "2"。
         %% 二重適用なら cas が conflict になって食い違う。
         ?assertEqual({ok, <<"2">>}, tether:read(?K("n"))),
-        ?assertEqual(#{<<"c">> => {2, {ok, [ok]}}}, tether_store:sessions())
+        ?assertEqual(#{<<"c">> => {2, {ok, [{ok, [ok]}]}}}, tether_store:sessions())
     end).
 
 snapshot_db() ->

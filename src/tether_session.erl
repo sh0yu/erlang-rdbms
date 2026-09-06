@@ -51,8 +51,7 @@
 
 -export_type([result/0]).
 
--type result() :: {ok, [tether_data:result()]}
-                | {error, pos_integer(), tether_data:result()}
+-type result() :: {ok, [tether_data:group_result()]}
                 | {error, {seq_too_old, non_neg_integer()}}
                 | {error, {seq_gap, non_neg_integer()}}.
 
@@ -81,8 +80,8 @@
 -spec start_link(binary()) -> {ok, pid()} | {error, term()}.
 start_link(Client) -> gen_server:start_link(?MODULE, Client, []).
 
--spec request(pid(), non_neg_integer(), [tether_data:op()]) -> result().
-request(Pid, Seq, Ops) -> gen_server:call(Pid, {request, Seq, Ops}, 10000).
+-spec request(pid(), non_neg_integer(), [[tether_data:op()]]) -> result().
+request(Pid, Seq, Groups) -> gen_server:call(Pid, {request, Seq, Groups}, 30000).
 
 -spec info(pid()) -> #{client := binary(), last := non_neg_integer(),
                        served := non_neg_integer(), deduped := non_neg_integer()}.
@@ -109,9 +108,9 @@ handle_call({request, Seq, _Ops}, _From, #s{last = Last, reply = R} = S)
     %% 再送。**実行しない。** 初回とまったく同じ答えを返す。
     %% 「コミットが失敗と返ったのに入っている」が消えるのは、この一行。
     {reply, R, S#s{deduped = S#s.deduped + 1}, ?IDLE_MS};
-handle_call({request, Seq, Ops}, _From, #s{last = Last, client = C} = S)
+handle_call({request, Seq, Groups}, _From, #s{last = Last, client = C} = S)
   when Seq =:= Last + 1 ->
-    Reply = tether_store:submit(C, Seq, Ops),
+    Reply = tether_store:submit_batch(C, Seq, Groups),
     {reply, Reply, S#s{last = Seq, reply = Reply, served = S#s.served + 1}, ?IDLE_MS};
 handle_call({request, Seq, _Ops}, _From, #s{last = Last} = S) when Seq =< Last ->
     {reply, {error, {seq_too_old, Last}}, S, ?IDLE_MS};

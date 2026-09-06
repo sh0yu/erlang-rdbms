@@ -35,7 +35,8 @@
 -module(tether_store).
 -behaviour(gen_server).
 
--export([start_link/1, submit/3, read/1, size/0, keys/0, sessions/0, session/1]).
+-export([start_link/1, submit/3, submit_batch/3, read/1, size/0, keys/0]).
+-export([sessions/0, session/1]).
 -export([checkpoint/0, entries/0, escrow_pool/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -72,7 +73,25 @@ start_link(Dir) -> gen_server:start_link({local, ?MODULE}, ?MODULE, Dir, []).
 -spec submit(binary(), non_neg_integer(), [tether_data:op()]) ->
           reply() | {error, term()}.
 submit(Client, Seq, Ops) ->
-    gen_server:call(?MODULE, {submit, Client, Seq, Ops}, 5000).
+    case submit_batch(Client, Seq, [Ops]) of
+        {ok, [R]} -> R;
+        Other     -> Other
+    end.
+
+%%----------------------------------------------------------------------
+%% @doc グループの列を1つの要求として実行する。
+%%
+%% **通番は1つ。** 溜めた操作の束ごと1件として扱う。だから
+%% 束の途中で接続が切れても、**同じ束をそのまま送り直せば**、
+%% 実行済みとして吸収され、初回とまったく同じ結果が返る。
+%% 各要素に別々の通番を振ると、覚えている答えが1件では足りなくなる。
+%%
+%% ログにも1レコード、fsync も1回で済む。
+%%----------------------------------------------------------------------
+-spec submit_batch(binary(), non_neg_integer(), [[tether_data:op()]]) ->
+          {ok, [tether_data:group_result()]} | {error, term()}.
+submit_batch(Client, Seq, Groups) ->
+    gen_server:call(?MODULE, {submit, Client, Seq, Groups}, 30000).
 
 -spec read(tether_data:key()) -> {ok, tether_data:value()} | not_found.
 read(Key) -> gen_server:call(?MODULE, {read, Key}).
@@ -143,16 +162,14 @@ init(Dir) ->
             {stop, {recovery_failed, R}}
     end.
 
-handle_call({submit, Client, Seq, Ops}, From, #s{db = Db, index = I} = S) ->
+handle_call({submit, Client, Seq, Groups}, From, #s{db = Db, index = I} = S) ->
     %% 時計を読むのはここ**一箇所だけ**。読んだ値はログに載り、
     %% 復旧の再実行では記録された方を使う。
     Now = erlang:system_time(millisecond),
     Ctx = #{now => Now, client => Client},
-    {Reply, Db1} = case tether_data:apply_ops(Ops, Ctx, Db) of
-                       {ok, Results, D1} -> {{ok, Results}, D1};
-                       {error, N, R, D1} -> {{error, N, R}, D1}
-                   end,
-    Entry = tether_entry:new(I + 1, Now, Client, Seq, Ops, Reply),
+    {Results, Db1} = tether_data:apply_batch(Groups, Ctx, Db),
+    Reply = {ok, Results},
+    Entry = tether_entry:new(I + 1, Now, Client, Seq, Groups, Reply),
     ok = tether_log:commit(tether_entry:encode(Entry), From, Reply),
     %% 返答しない。永続化されたらログが From へ返す。
     {noreply, maybe_checkpoint(

@@ -16,7 +16,7 @@
 -module(tether).
 
 -export([request/3, read/1, open/1, close/1, session_info/1]).
--export([stock/2, pool/1]).
+-export([stock/2, pool/1, request_batch/3]).
 -export([session_count/0, stat/0]).
 
 -spec open(binary()) -> {ok, pid()} | {error, term()}.
@@ -41,7 +41,33 @@ request(Client, Seq, Ops) ->
         {error, R} -> {error, R};
         ok ->
             case tether_sessions:ensure(Client) of
-                {ok, Pid} -> tether_session:request(Pid, Seq, Ops);
+                {ok, Pid} -> unwrap(tether_session:request(Pid, Seq, [Ops]));
+                E         -> E
+            end
+    end.
+
+%% 1グループだけの束なので、結果を1つに戻す
+unwrap({ok, [R]}) -> R;
+unwrap(Other)     -> Other.
+
+%%----------------------------------------------------------------------
+%% @doc オフライン中に溜めた操作の束を、まとめて流す。
+%%
+%% 各グループは原子的だが、束全体は原子的ではない。
+%% **最初の失敗で止まり、残りは実行されない。**
+%% 返り値でどこまで通ったかが分かる。
+%%
+%% 束全体で通番は1つなので、途中で切れても**同じ束を送り直せばよい**。
+%%----------------------------------------------------------------------
+-spec request_batch(binary(), non_neg_integer(), [[tether_data:op()]]) ->
+          {ok, [tether_data:group_result()]} | {error, term()}.
+request_batch(Client, Seq, Groups) ->
+    case lists:foldl(fun(G, ok) -> tether_data:validate(G); (_, E) -> E end,
+                     ok, Groups) of
+        {error, R} -> {error, R};
+        ok ->
+            case tether_sessions:ensure(Client) of
+                {ok, Pid} -> tether_session:request(Pid, Seq, Groups);
                 E         -> E
             end
     end.

@@ -85,7 +85,8 @@ apply_entry(E, Lsn, {Db, Sess}) ->
     %% ここで時計を読み直すと、期限切れの判定が本番と変わり、
     %% 直後の乖離検査で落ちる(落ちるだけましだが、そもそも読まない)。
     Ctx = #{now => tether_entry:time(E), client => tether_entry:client(E)},
-    {Reply, Db1} = tether_data_apply(tether_entry:ops(E), Ctx, Db),
+    {Results, Db1} = tether_data:apply_batch(tether_entry:ops(E), Ctx, Db),
+    Reply = {ok, Results},
     case Reply =:= tether_entry:reply(E) of
         true -> ok;
         false ->
@@ -98,8 +99,4 @@ apply_entry(E, Lsn, {Db, Sess}) ->
     end,
     {Db1, Sess#{tether_entry:client(E) => {tether_entry:seq(E), Reply}}}.
 
-tether_data_apply(Ops, Ctx, Db) ->
-    case tether_data:apply_ops(Ops, Ctx, Db) of
-        {ok, Results, Db1}   -> {{ok, Results}, Db1};
-        {error, N, R, Db1}   -> {{error, N, R}, Db1}
-    end.
+

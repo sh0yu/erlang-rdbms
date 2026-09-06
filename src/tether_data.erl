@@ -20,10 +20,10 @@
 %%%-------------------------------------------------------------------
 -module(tether_data).
 
--export([new/0, apply_ops/3, get/2, size/1, keys/1, fold/3]).
+-export([new/0, apply_ops/3, apply_batch/3, get/2, size/1, keys/1, fold/3]).
 -export([validate/1, limits/0]).
 
--export_type([db/0, key/0, value/0, op/0, result/0, ctx/0]).
+-export_type([db/0, key/0, value/0, op/0, result/0, ctx/0, group_result/0]).
 
 -type key()    :: {binary(), binary()}.        % {コレクション, 鍵}
 -type value()  :: binary().
@@ -63,6 +63,9 @@
                 | {insufficient, non_neg_integer()}
                 | sold_out
                 | expired.
+
+%% 1グループの結果。
+-type group_result() :: {ok, [result()]} | {error, pos_integer(), result()}.
 
 %%%===================================================================
 %%% 大きさの上限
@@ -171,6 +174,35 @@ fold(F, Acc0, Db) -> maps:fold(F, Acc0, Db).
 %% 1つでも失敗すれば、**何も適用しない**。返るのは元の db() であって、
 %% 途中まで適用したものではない。
 %%----------------------------------------------------------------------
+%%----------------------------------------------------------------------
+%% @doc グループの列を順に適用する。**オフラインで溜めた操作の流し込み。**
+%%
+%% 各グループは原子的。**グループ間は原子的ではない。**
+%% そして**最初の失敗で止め、残りは実行しない。**
+%%
+%% 止めるのが要点である。オフライン中に積んだ操作には順序の意味があり、
+%% 前提が崩れた後の操作を流すと、成立しない結果を作る。
+%%
+%%     seq n   在庫Aを1個引き当て   → 前提が変わっていて失敗
+%%     seq n+1 注文を確定           → **流してはいけない**
+%%
+%% 流し切る実装だと、在庫を確保できていないのに注文が確定する。
+%% どこで止まったかを返し、そこから先の判断はクライアント(あるいは人)に返す。
+%%----------------------------------------------------------------------
+-spec apply_batch([[op()]], ctx(), db()) -> {[group_result()], db()}.
+apply_batch(Groups, Ctx, Db) -> apply_batch(Groups, Ctx, Db, []).
+
+apply_batch([], _Ctx, Db, Acc) ->
+    {lists:reverse(Acc), Db};
+apply_batch([G | T], Ctx, Db, Acc) ->
+    case apply_ops(G, Ctx, Db) of
+        {ok, R, Db1} ->
+            apply_batch(T, Ctx, Db1, [{ok, R} | Acc]);
+        {error, N, R, Db1} ->
+            %% ここで止める。T は実行しない。
+            {lists:reverse([{error, N, R} | Acc]), Db1}
+    end.
+
 -spec apply_ops([op()], ctx(), db()) ->
           {ok, [result()], db()} | {error, pos_integer(), result(), db()}.
 apply_ops(Ops, Ctx, Db) -> apply_ops(Ops, Ctx, Db, 1, [], Db).
