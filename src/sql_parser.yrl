@@ -288,11 +288,10 @@ join_kw -> 'join'                   : inner.
 join_kw -> 'inner' 'join'           : inner.
 join_kw -> 'left' 'join'            : left.
 join_kw -> 'left' 'outer' 'join'    : left.
-%% 未実装だが、黙って別の意味に取られるよりは理由を言って落ちる方がよい。
-join_kw -> 'right' 'join'           : unsupported_join('$1', "RIGHT JOIN").
-join_kw -> 'right' 'outer' 'join'   : unsupported_join('$1', "RIGHT OUTER JOIN").
-join_kw -> 'full' 'join'            : unsupported_join('$1', "FULL JOIN").
-join_kw -> 'full' 'outer' 'join'    : unsupported_join('$1', "FULL OUTER JOIN").
+join_kw -> 'right' 'join'           : right.
+join_kw -> 'right' 'outer' 'join'   : right.
+join_kw -> 'full' 'join'            : full.
+join_kw -> 'full' 'outer' 'join'    : full.
 
 table_ref -> identifier opt_alias :
     #table_ref{name = value_of('$1'), alias = '$2'}.
@@ -412,10 +411,6 @@ Erlang code.
 
 %% leexのトークンは {Type, Line, Value} または {Type, Line}
 value_of({_Type, _Line, Value}) -> Value.
-
--spec unsupported_join(tuple(), string()) -> no_return().
-unsupported_join({_Tok, Line}, What) ->
-    return_error(Line, What ++ " is not supported").
 
 %% 末尾の ORDER BY / LIMIT を問い合わせ式に付ける。
 %% 単一のSELECTなら #select_stmt{} に、集合演算なら #set_op_stmt{} に付く。

@@ -101,12 +101,15 @@ rewrite(#lp_scan{} = N)               -> N.
 %%     Aへ落とすと消えてしまう
 %%     ⇒ 押し込めない
 %%
-%% 表にすると:
+%% RIGHT / FULL も同じ理屈で決まる。RIGHT は LEFT の鏡像で、
+%% FULL は両側が「NULLを供給する側」なので何も落とせない。
 %%
 %%              WHEREの条件      ONの条件
 %%              左側  右側       左側  右側
 %%   inner/cross ○    ○          ○    ○
 %%   left        ○    ×          ×    ○
+%%   right       ×    ○          ○    ×
+%%   full        ×    ×          ×    ×
 %%----------------------------------------------------------------------
 push(Preds, #lp_join{type = Ty, pred = On, left = L, right = R} = J) ->
     LW = width(L),
@@ -116,10 +119,11 @@ push(Preds, #lp_join{type = Ty, pred = On, left = L, right = R} = J) ->
     %% 結合後の行では右のカラムが LW だけずれているため。
     %% 内部結合では ON と WHERE は等価なので、両側にまたがる条件は
     %% 結合の ON にまとめる。選択の節点が1つ減る。
-    %% **LEFT JOIN ではまとめられない**(意味が変わる)。
+    %% **外部結合ではまとめられない**(意味が変わる)。
     {Keep, Above} = case Ty of
-                        left -> {OnKeep, WhKeep};
-                        _    -> {OnKeep ++ WhKeep, []}
+                        inner -> {OnKeep ++ WhKeep, []};
+                        cross -> {OnKeep ++ WhKeep, []};
+                        _     -> {OnKeep, WhKeep}
                     end,
     J1 = J#lp_join{pred = conj(Keep),
                    left  = push(OnL ++ WhL, L),
@@ -138,11 +142,27 @@ classify(Conjs, LW, Kind, Ty) ->
     lists:foldr(
       fun(E, {AccL, AccR, AccK}) ->
               case side(E, LW) of
-                  left  when Ty =/= left; Kind =:= where -> {[E | AccL], AccR, AccK};
-                  right when Ty =/= left; Kind =:= on    -> {AccL, [E | AccR], AccK};
-                  _ -> {AccL, AccR, [E | AccK]}
+                  left  -> case can_push(left, Kind, Ty) of
+                               true  -> {[E | AccL], AccR, AccK};
+                               false -> {AccL, AccR, [E | AccK]}
+                           end;
+                  right -> case can_push(right, Kind, Ty) of
+                               true  -> {AccL, [E | AccR], AccK};
+                               false -> {AccL, AccR, [E | AccK]}
+                           end;
+                  both  -> {AccL, AccR, [E | AccK]}
               end
       end, {[], [], []}, Conjs).
+
+%% 上の表をそのまま書いたもの。
+%% 「保存される側の WHERE」と「NULLを供給する側の ON」だけが落とせる。
+can_push(_Side, _Kind, inner) -> true;
+can_push(_Side, _Kind, cross) -> true;
+can_push(left,  where, left)  -> true;    % 左が保存される側
+can_push(right, on,    left)  -> true;    % 右がNULLを供給する側
+can_push(right, where, right) -> true;
+can_push(left,  on,    right) -> true;
+can_push(_Side, _Kind, _Ty)   -> false.   % full は何も落とせない
 
 %% その条件がどちら側のカラムだけを見ているか。
 %% 参照が読めない式は both 扱いにする(押し込まない)。安全側に倒す。
@@ -262,19 +282,21 @@ physical(#lp_filter{pred = P, input = In}, Cat) ->
 %% 入れ子ループは |左|×|右| 回の比較をする。等値の条件が1つでもあれば
 %% ハッシュ表で |左|+|右| に落ちる。右側はどちらの方式でも
 %% メモリに載せるので、使うメモリは変わらない。
-physical(#lp_join{type = Ty, pred = P, left = L, right = R, right_width = W}, Cat) ->
+physical(#lp_join{type = Ty, pred = P, left = L, right = R,
+                  left_width = LW0, right_width = W}, Cat) ->
     PL = physical(L, Cat),
     PR = physical(R, Cat),
     case split_equijoin(conjuncts(P), width(L)) of
         {[], _} ->
             #p_nl_join{type = Ty, pred = pexpr(P, Cat), left = PL, right = PR,
-                       right_width = W};
+                       left_width = LW0, right_width = W};
         {Eqs, Rest} ->
             #p_hash_join{type = Ty,
                          left_keys  = [LE || {LE, _} <- Eqs],
                          right_keys = [RE || {_, RE} <- Eqs],
                          pred = pexpr(conj(Rest), Cat),
-                         left = PL, right = PR, right_width = W}
+                         left = PL, right = PR,
+                         left_width = LW0, right_width = W}
     end;
 physical(#lp_agg{group_by = G, aggs = A, having = H, input = In}, Cat) ->
     #p_agg{group_by = [pexpr(E, Cat) || E <- G],

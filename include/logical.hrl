@@ -46,7 +46,8 @@
     pred = undefined,
     left,
     right,
-    right_width = 0     % LEFT JOIN で埋めるNULLの個数
+    left_width = 0,     % RIGHT/FULL JOIN で左側を埋めるNULLの個数
+    right_width = 0     % LEFT/FULL JOIN で右側を埋めるNULLの個数
 }).
 
 %% 集約1つ分。func は count_star|count|sum|avg|min|max。

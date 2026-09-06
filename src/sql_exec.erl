@@ -148,7 +148,8 @@ open(#p_distinct{input = Input}, Ctx) ->
 %% 入れ子ループ結合。
 %% 右側は左の行ごとに読み直すので、開始時にメモリへ載せる
 %% (走査カーソルは一度しか流せないため)。
-open(#p_nl_join{type = Type, pred = Pred, left = L, right = R, right_width = W}, Ctx) ->
+open(#p_nl_join{type = Type, pred = Pred, left = L, right = R,
+                left_width = LW, right_width = W}, Ctx) ->
     case open(L, Ctx) of
         {error, Reason} ->
             {error, Reason};
@@ -160,15 +161,13 @@ open(#p_nl_join{type = Type, pred = Pred, left = L, right = R, right_width = W},
                     {ok, Rows} = collect(Right, []),
                     close(Right),
                     #op{kind = nl_join,
-                        st = #{type => Type, pred => Pred, left => Left,
-                               rows => Rows, rest => [], cur => undefined,
-                               matched => false, width => W}}
+                        st = join_state(Type, Pred, Left, Rows, LW, W)}
             end
     end;
 %% 集約もブロッキング演算子。入力を読み切ってグループごとにまとめる。
 %% ハッシュ結合。右側でハッシュ表を作り、左側で引く。
 open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
-                  left = L, right = R, right_width = W}, Ctx) ->
+                  left = L, right = R, left_width = LW, right_width = W}, Ctx) ->
     case open(L, Ctx) of
         {error, Reason} ->
             {error, Reason};
@@ -179,11 +178,10 @@ open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
                 Right ->
                     {ok, Rows} = collect(Right, []),
                     close(Right),
+                    St = join_state(Type, Pred, Left, Rows, LW, W),
                     #op{kind = hash_join,
-                        st = #{type => Type, pred => Pred, left => Left,
-                               table => build_hash(Rows, RK), lkeys => LK,
-                               rest => [], cur => undefined,
-                               matched => false, width => W}}
+                        st = St#{table => build_hash(maps:get(rows, St), RK),
+                                 lkeys => LK}}
             end
     end;
 %% 導出表。子が出すリストの行をタプルに直して流す。
@@ -331,27 +329,65 @@ next(#op{kind = project, st = {Exprs, Child}} = Op) ->
             {row, Out, Op#op{st = {Exprs, Child2}}}
     end.
 
+%%----------------------------------------------------------------------
+%% 結合の状態。入れ子ループとハッシュ結合で共通。
+%%
+%% 右側の行に添字を振るのは、**どれが一致したかを覚えるため**である。
+%% RIGHT / FULL では、左を全部見終わったあとに一致しなかった右の行を
+%% 左をNULLで埋めて出す必要がある。
+%%
+%%   stage = probe  左を1行ずつ見て、右の候補と突き合わせる
+%%   stage = drain  左を読み切った。未一致の右の行を出す(RIGHT/FULLのみ)
+%%----------------------------------------------------------------------
+join_state(Type, Pred, Left, Rows, LW, RW) ->
+    #{type => Type, pred => Pred, left => Left,
+      rows => lists:zip(lists:seq(1, length(Rows)), Rows),
+      rest => [], cur => undefined, matched => false,
+      seen => #{}, stage => probe, lwidth => LW, rwidth => RW}.
+
+%% 未一致の右の行。
+unmatched(#{rows := Rows, seen := Seen}) ->
+    [P || {I, _} = P <- Rows, not maps:is_key(I, Seen)].
+
+%% 左をNULLで埋める(RIGHT/FULL)。
+pad_left(R, LW) ->
+    list_to_tuple(lists:duplicate(LW, null) ++ tuple_to_list(R)).
+
+%% 右をNULLで埋める(LEFT/FULL)。
+pad_right(L, RW) ->
+    list_to_tuple(tuple_to_list(L) ++ lists:duplicate(RW, null)).
+
+outer_right(T) -> T =:= right orelse T =:= full.
+
 %% 右側を出し切ったら次の左の行へ。
-%% LEFT JOIN で1件も一致しなかった左の行は、右をNULLで埋めて返す。
-nl_next(Op, #{cur := undefined, left := Left} = St) ->
+%% 1件も一致しなかった左の行は、LEFT/FULL なら右をNULLで埋めて返す。
+%% 左を読み切ったら、RIGHT/FULL なら未一致の右の行を出す。
+nl_next(Op, #{stage := drain, rest := []} = St) ->
+    {eof, Op#op{st = St}};
+nl_next(Op, #{stage := drain, rest := [{_I, R} | Rest], lwidth := LW} = St) ->
+    {row, pad_left(R, LW), Op#op{st = St#{rest => Rest}}};
+nl_next(Op, #{cur := undefined, left := Left, type := Type} = St) ->
     case next(Left) of
         {eof, Left2} ->
-            {eof, Op#op{st = St#{left => Left2}}};
+            St1 = St#{left => Left2},
+            case outer_right(Type) of
+                true  -> nl_next(Op, St1#{stage => drain, rest => unmatched(St1)});
+                false -> {eof, Op#op{st = St1}}
+            end;
         {row, Row, Left2} ->
             nl_next(Op, St#{left => Left2, cur => Row,
                             rest => maps:get(rows, St), matched => false})
     end;
-nl_next(Op, #{rest := [], type := left, matched := false,
-              cur := Cur, width := W} = St) ->
-    %% 一致が無かったので NULL で埋めて1行返す
-    Padded = list_to_tuple(tuple_to_list(Cur) ++ lists:duplicate(W, null)),
-    {row, Padded, Op#op{st = St#{cur => undefined, matched => true}}};
+nl_next(Op, #{rest := [], type := Type, matched := false,
+              cur := Cur, rwidth := RW} = St) when Type =:= left; Type =:= full ->
+    {row, pad_right(Cur, RW), Op#op{st = St#{cur => undefined, matched => true}}};
 nl_next(Op, #{rest := []} = St) ->
     nl_next(Op, St#{cur => undefined});
-nl_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
+nl_next(Op, #{rest := [{I, R} | Rest], cur := Cur, pred := Pred, seen := Seen} = St) ->
     Joined = concat_rows(Cur, R),
     case sql_expr:eval_pred(Pred, Joined) of
-        true -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true}}};
+        true  -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true,
+                                              seen => Seen#{I => []}}}};
         false -> nl_next(Op, St#{rest => Rest})
     end.
 
@@ -514,11 +550,11 @@ to_tuple(Row) when is_tuple(Row) -> Row.
 %% 一致してしまう。
 build_hash(Rows, Keys) ->
     Table = lists:foldl(
-              fun(Row, Acc) ->
+              fun({_I, Row} = P, Acc) ->
                       case join_key(Keys, Row) of
                           null -> Acc;
-                          K    -> maps:update_with(K, fun(L) -> [Row | L] end,
-                                                   [Row], Acc)
+                          K    -> maps:update_with(K, fun(L) -> [P | L] end,
+                                                   [P], Acc)
                       end
               end, #{}, Rows),
     %% 入れ子ループと同じ順序で返すために積み直す
@@ -540,11 +576,23 @@ join_key([E | T], Row, Acc) ->
 
 %% 状態遷移は入れ子ループと同じ。違うのは、右側の候補を
 %% 全件ではなくハッシュ表から取ってくるところだけ。
-hj_next(Op, #{cur := undefined, left := Left, lkeys := LK, table := Tab} = St) ->
+hj_next(Op, #{stage := drain, rest := []} = St) ->
+    {eof, Op#op{st = St}};
+hj_next(Op, #{stage := drain, rest := [{_I, R} | Rest], lwidth := LW} = St) ->
+    {row, pad_left(R, LW), Op#op{st = St#{rest => Rest}}};
+hj_next(Op, #{cur := undefined, left := Left, lkeys := LK, table := Tab,
+              type := Type} = St) ->
     case next(Left) of
         {eof, Left2} ->
-            {eof, Op#op{st = St#{left => Left2}}};
+            St1 = St#{left => Left2},
+            case outer_right(Type) of
+                true  -> hj_next(Op, St1#{stage => drain, rest => unmatched(St1)});
+                false -> {eof, Op#op{st = St1}}
+            end;
         {row, Row, Left2} ->
+            %% 鍵がNULLの左の行は決して一致しない。
+            %% 右側も、鍵がNULLの行はハッシュ表に入っていないので
+            %% 未一致として drain で出る
             Matches = case join_key(LK, Row) of
                           null -> [];
                           K    -> maps:get(K, Tab, [])
@@ -552,16 +600,16 @@ hj_next(Op, #{cur := undefined, left := Left, lkeys := LK, table := Tab} = St) -
             hj_next(Op, St#{left => Left2, cur => Row,
                             rest => Matches, matched => false})
     end;
-hj_next(Op, #{rest := [], type := left, matched := false,
-              cur := Cur, width := W} = St) ->
-    Padded = list_to_tuple(tuple_to_list(Cur) ++ lists:duplicate(W, null)),
-    {row, Padded, Op#op{st = St#{cur => undefined, matched => true}}};
+hj_next(Op, #{rest := [], type := Type, matched := false,
+              cur := Cur, rwidth := RW} = St) when Type =:= left; Type =:= full ->
+    {row, pad_right(Cur, RW), Op#op{st = St#{cur => undefined, matched => true}}};
 hj_next(Op, #{rest := []} = St) ->
     hj_next(Op, St#{cur => undefined});
-hj_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
+hj_next(Op, #{rest := [{I, R} | Rest], cur := Cur, pred := Pred, seen := Seen} = St) ->
     Joined = concat_rows(Cur, R),
     case sql_expr:eval_pred(Pred, Joined) of
-        true  -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true}}};
+        true  -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true,
+                                              seen => Seen#{I => []}}}};
         false -> hj_next(Op, St#{rest => Rest})
     end.
 

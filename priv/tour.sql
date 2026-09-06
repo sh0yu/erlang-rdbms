@@ -150,6 +150,12 @@ SELECT COUNT(*) FROM fruit f JOIN box b ON f.name = b.fruit;
 
 -- 修飾しないと決まらない名前は弾かれる
 SELECT name FROM fruit f JOIN box b ON f.name = b.fruit;
+
+-- 外部結合。LEFT / RIGHT / FULL
+SELECT f.name, b.qty FROM fruit f LEFT  JOIN box b ON f.name = b.fruit ORDER BY f.name;
+SELECT f.name, b.qty FROM fruit f RIGHT JOIN box b ON f.name = b.fruit ORDER BY b.fruit;
+SELECT f.name, b.qty FROM fruit f FULL OUTER JOIN box b ON f.name = b.fruit
+  ORDER BY f.name, b.fruit;
 COMMIT;
 
 DROP TABLE box;
@@ -225,9 +231,7 @@ COMMIT;
 
 -- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
 SELECT * FROM fruit WHERE price BETWEEN 1 AND 2;
--- RIGHT/FULL は予約語にしてある。さもないと「right という別名の内部結合」
--- として黙って通ってしまう
-SELECT * FROM fruit RIGHT JOIN fruit f2 ON 1 = 1;
+SELECT CAST(price AS VARCHAR) FROM fruit;
 
 -- ============ DDLはトランザクションの中では実行できない ============
 BEGIN;

@@ -266,6 +266,7 @@ build_from(#join{type = Type, left = L, right = R, on = On}) ->
                         {ok, Pred} ->
                             {ok, Scope, #lp_join{type = Type, pred = Pred,
                                                    left = LNode, right = RNode,
+                                                   left_width = length(LScope),
                                                    right_width = length(RScope)}}
                     end
             end
