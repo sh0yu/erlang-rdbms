@@ -29,9 +29,12 @@
 -record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex,
                 queryId = [],
                 %% 読み取り専用トランザクションかどうか。
-                %% true のとき tx_mng の直列化の列に並ばず、
-                %% commit_latch の共有ラッチだけを持つ。
-                readonly = false}).
+                %% true のとき tx_mng の直列化の列に並ばない。
+                readonly = false,
+                %% 読み取り専用トランザクションが見る版。
+                %% これがあると、コミットの適用を待たずに
+                %% 開始時点の状態を読める。
+                snapshot = undefined}).
 
 %% トランザクションから見えるテーブル走査の状態。
 %% base   : 共有ページの走査カーソル
@@ -102,20 +105,22 @@ handle_call({exec_query, {begin_tx}}, _From, State) ->
 %%----------------------------------------------------------------------
 %% 読み取り専用トランザクション。
 %%
-%% tx_mng の直列化の列に**並ばない**。代わりに commit_latch の共有
-%% ラッチを、トランザクションの間じゅう持つ。したがって
+%% tx_mng の直列化の列に**並ばない**。代わりに開始時点の版
+%% (スナップショット)を取る。読むときは、その後のコミットの
+%% 変更前の値(undo)を重ねて巻き戻す。
 %%
-%%   * 読み手同士は並行に走る(いまは互いに待っている)
-%%   * 読み手が動いている間、どのコミットも適用されない
-%%   * 読み手はコミットの全部を見るか全部を見ないか
+%%   * 読み手同士は並行に走る
+%%   * **読み手は書き手を待たせない**(ここが段階1からの前進)
+%%   * 読み手は開始時点の状態を一貫して見る
 %%
-%% 直列化可能性は保たれる。書き手の変更は適用まで共有データに
-%% 現れず、その適用が読み手の終わりまで待つため、読み手は
-%% その書き手の前か後ろのどちらかに並べられる。
+%% 読み取り専用のスナップショット分離は**直列化可能**である。
+%% スナップショット分離が許す異常(ライトスキューなど)は書き込みが
+%% 絡んで初めて起きるので、書かないトランザクションには現れない。
 %%----------------------------------------------------------------------
 handle_call({exec_query, {begin_read_only}}, _From, #state{txid = undefined} = State) ->
-    ok = commit_latch:read_lock(),
-    {reply, ok, State#state{txid = readonly, readonly = true, queryId = []}};
+    Snap = snapshot_mng:acquire(),
+    {reply, ok, State#state{txid = readonly, readonly = true,
+                            snapshot = Snap, queryId = []}};
 handle_call({exec_query, {begin_read_only}}, _From, State) ->
     {reply, {error, transaction_already_started}, State};
 
@@ -315,7 +320,7 @@ run_sql(State, {select, Plan}) ->
 run_sql(State, {explain, Logical}) ->
     %% 実行するときと同じカタログを渡す。違うものを渡すと、
     %% 表示された計画と実際に走る計画がずれる。
-    Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun())),
+    Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun(use_index(State)))),
     {reply, {ok, ['QUERY PLAN'], [[L] || L <- Lines]}, State};
 run_sql(State, {insert, Table, Row}) ->
     with_write_transaction(State, fun() -> do_insert(State, Table, Row) end);
@@ -327,11 +332,25 @@ run_sql(State, {delete, Table, Pred}) ->
 do_sql_select(State, Logical) ->
     %% 論理プランから物理プランを作る。実行方法(全表走査か索引か、
     %% どの結合アルゴリズムか)がここで決まる。
-    Plan = sql_planner:plan(Logical, catalog_fun()),
+    Plan = sql_planner:plan(Logical, catalog_fun(use_index(State))),
     %% 実行器にはストレージへの入口を関数で渡す。
     %% こうしておくと実行器がquery_execの内部状態に触らずに済み、
     %% かつ走査がこのトランザクションの未コミット変更を見られる。
-    {reply, sql_exec:run(Plan, exec_ctx(State)), State}.
+    {reply, run_plan(State, Plan), State}.
+
+%% 読み取り専用トランザクションは tx_mng の順番待ちに並ばないので、
+%% DDL と鉢合わせしうる。走査の間だけ共有ラッチを持って、
+%% 表が消えたり索引が作り直されたりするのを待たせる。
+%%
+%% 共有ラッチどうしは互いを待たないので、読み手が読み手を止めることはない。
+%% コミットの適用はスナップショットが吸収するので、もうラッチは要らない。
+run_plan(#state{readonly = true} = State, Plan) ->
+    commit_latch:with_read(fun() -> sql_exec:run(Plan, exec_ctx(State)) end);
+run_plan(State, Plan) ->
+    sql_exec:run(Plan, exec_ctx(State)).
+
+use_index(#state{readonly = true}) -> false;
+use_index(#state{})                -> true.
 
 exec_ctx(State) ->
     #{scan_open    => fun(T) -> tx_scan_open(State, T) end,
@@ -345,13 +364,31 @@ exec_ctx(State) ->
 %% 出ることを保てるようにするためと、試験で偽のカタログを渡して
 %% 索引がある場合と無い場合を書き分けられるようにするため。
 %%----------------------------------------------------------------------
-catalog_fun() ->
+%% 引数は「索引を使ってよいか」。スナップショットで読むときは使えない。
+%%
+%% 索引は**いまの値**で引かれる。ある行の索引付き列が更新されると、
+%% その行は古い鍵では引けなくなり、新しい鍵で引けるようになる。
+%% undo は行の中身しか戻せないので、
+%%   - 昔その値だった行 → 索引に無く、見落とす
+%%   - いまその値の行   → 引けるが、戻すと条件に合わない行になる
+%% どちらも直せない。索引そのものを版管理していないため。
+%%
+%% よってスナップショットの読み手には索引を見せない。全表走査になるが、
+%% 走査した行は undo で正しく戻せるし、条件はその後に評価される。
+catalog_fun(false) ->
+    catalog_fun(true, fun(_Sys, _Table) -> [] end);
+catalog_fun(true) ->
+    catalog_fun(true, fun(Sys, Table) ->
+                              case sys_tbl_mng:get_index_column_list(Sys, Table) of
+                                  {ok, Cols} -> Cols;
+                                  {error, _} -> []
+                              end
+                      end).
+
+catalog_fun(true, IndexedFun) ->
     Sys = whereis(sys_tbl_mng),
     fun(Table) ->
-            Indexed = case sys_tbl_mng:get_index_column_list(Sys, Table) of
-                          {ok, Cols} -> Cols;
-                          {error, _} -> []
-                      end,
+            Indexed = IndexedFun(Sys, Table),
             Stats = case sys_tbl_mng:get_stats(Sys, Table) of
                         {ok, S} -> S;
                         none    -> none
@@ -365,6 +402,9 @@ catalog_fun() ->
 %% 実行器から索引を直接引かせると、自分がさっき入れた行が見えない。
 %% 重ね合わせはタプルAPIのSELECTと同じ経路を使う。
 %%----------------------------------------------------------------------
+%% スナップショットの読み手はここへ来ない(catalog_fun/1 が索引を隠す)ので、
+%% 巻き戻しは要らない。読み書きトランザクションは直列なので、
+%% 見えているのは常に最新のコミット済みの状態。
 tx_index_lookup(State, Table, ColName, Val) ->
     QueryIdList = get_query_id_list(State),
     OidList = select_object_id_list(State, Table, ColName, Val, QueryIdList),
@@ -571,10 +611,24 @@ tx_scan_open(State, TableName) ->
         {error, Reason} ->
             {error, Reason};
         {ok, Base} ->
-            Delta = build_delta(State, TableName),
-            {ok, #tx_scan{base = Base, delta = Delta,
-                          pending = local_only_rows(TableName, Delta)}}
+            case snapshot_overlay(State, TableName) of
+                {error, Reason} ->
+                    {error, Reason};
+                {ok, Snap} ->
+                    %% 自分の未コミット変更はスナップショットより優先する。
+                    %% maps:merge/2 は後の引数が勝つ
+                    Delta = maps:merge(Snap, build_delta(State, TableName)),
+                    {ok, #tx_scan{base = Base, delta = Delta,
+                                  pending = local_only_rows(TableName, Delta)}}
+            end
     end.
+
+%% 読み取り専用トランザクションだけがスナップショットを持つ。
+%% 読み書きトランザクションは直列化されているので巻き戻しは要らない。
+snapshot_overlay(#state{snapshot = undefined}, _TableName) ->
+    {ok, #{}};
+snapshot_overlay(#state{snapshot = Snap}, TableName) ->
+    snapshot_mng:overlay(Snap, TableName).
 
 tx_scan_next(#tx_scan{stage = base, base = Base, delta = Delta} = S) ->
     case simple_db_server:scan_next(Base) of
@@ -666,29 +720,27 @@ do_commit(State) ->
             {reply, {error, Reason}, State2};
         ok ->
             ok = write_redo_log(Txid, Changes),
-            %% 適用は排他ラッチの下で行う。
+            %% 変更前の値を undo として積む。**適用の前**に積むのが要点。
             %%
-            %% apply_changes/1 は1行ずつ書き、走査は data_buffer への
-            %% 呼び出しを繰り返すので、その隙間に適用が挟まると
-            %% **読み手がコミットの途中を見る**。ラッチで囲えば、
-            %% 読み手から見て適用は不可分になる。
+            %% 適用は1行ずつ進むので、その途中を読み手が見ることがある。
+            %% 先に undo があれば、
+            %%   適用済みの行 → undo が古い値へ戻す
+            %%   未適用の行   → もともと古い値
+            %% となって、どちらも同じ値に見える。逆順にすると、その隙間に
+            %% 読んだ行だけが新しい値に見えてしまう。
+            Seq = snapshot_mng:commit(undo_for(Changes)),
+            ok = apply_changes(Changes),
+            %% チェックポイントを書く前にディスクへ落とす。
             %%
-            %% REDOログの書き込みはラッチの外に置く。ここが一番長く
-            %% かかる(fsyncを含む)ので、読み手を待たせる区間は
-            %% メモリ上の反映だけに絞る。
-            commit_latch:with_write(
-              fun() ->
-                      ok = apply_changes(Changes),
-                      %% チェックポイントを書く前にディスクへ落とす。
-                      %%
-                      %% リカバリは最後のチェックポイント以降しか再実行しない。
-                      %% よってチェックポイントは「これより前は永続化済み」という
-                      %% 宣言になる。ページキャッシュに置いただけの状態でこれを
-                      %% 書くと、電源断のときにデータは失われるのにリカバリは
-                      %% 再実行せず、黙って消える。
-                      ok = sync_for_commit(),
-                      ok = log_util:redo_log_put_checkpoint()
-              end),
+            %% リカバリは最後のチェックポイント以降しか再実行しない。
+            %% よってチェックポイントは「これより前は永続化済み」という
+            %% 宣言になる。ページキャッシュに置いただけの状態でこれを
+            %% 書くと、電源断のときにデータは失われるのにリカバリは
+            %% 再実行せず、黙って消える。
+            ok = sync_for_commit(),
+            ok = log_util:redo_log_put_checkpoint(),
+            %% 適用が終わったので、この版を見えるようにする
+            ok = snapshot_mng:publish(Seq),
             clear_local(State, QueryIdList),
             Rep = tx_mng:commit_tx(TPid, Txid),
             {reply, Rep, State#state{txid = undefined, queryId = []}}
@@ -710,10 +762,12 @@ validate_changes([{_QId, del, TableName, _Oid, _Val} | T]) ->
 
 %% ロールバックはローカル領域を捨てるだけでよい。
 %% 共有データにはまだ何も書いていない。
-%% 読み取り専用は共有データに何も書いていないので、ラッチを外すだけ。
-do_rollback(#state{readonly = true} = State) ->
-    ok = commit_latch:read_unlock(),
-    {reply, ok, State#state{txid = undefined, readonly = false, queryId = []}};
+%% 読み取り専用は共有データに何も書いていないので、
+%% スナップショットを手放すだけ。
+do_rollback(#state{readonly = true, snapshot = Snap} = State) ->
+    ok = snapshot_mng:release(Snap),
+    {reply, ok, State#state{txid = undefined, readonly = false,
+                            snapshot = undefined, queryId = []}};
 do_rollback(State) ->
     TPid = get_tx_mng_pid(State),
     Txid = get_txid(State),
@@ -751,6 +805,29 @@ apply_changes([{_QId, del, TableName, Oid, _Val} | T]) ->
 apply_changes([{_QId, ins, TableName, Oid, Val} | T]) ->
     ok = ensure_ok(simple_db_server:insert_data(simple_db_server, TableName, Oid, Val)),
     apply_changes(T).
+
+%%----------------------------------------------------------------------
+%% 変更する行の**変更前の値**を集める。
+%%
+%% 同じ行が同じコミットの中で複数回変わることがある(del→ins)。
+%% 欲しいのは「このコミットが始まる前の値」なので、
+%% **最初に見たものを残す**。
+%%----------------------------------------------------------------------
+undo_for(Changes) ->
+    lists:foldl(
+      fun({_QId, _Act, TableName, Oid, _Val}, Acc) ->
+              Key = {TableName, Oid},
+              case maps:is_key(Key, Acc) of
+                  true  -> Acc;
+                  false -> Acc#{Key => before_value(TableName, Oid)}
+              end
+      end, #{}, Changes).
+
+before_value(TableName, Oid) ->
+    case simple_db_server:read_data_oid(TableName, Oid) of
+        not_found -> absent;
+        Val       -> {row, Val}
+    end.
 
 %% ここに来る変更は validate_changes/1 を通っている。
 %% それでも失敗するなら想定外なので、握り潰さずに落とす

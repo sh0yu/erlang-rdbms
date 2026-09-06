@@ -7,7 +7,10 @@
 %%% 緩めるための前提は「コミットの適用を読み手から見て原子的にすること」。
 %%% apply_changes/1 は1行ずつ書き、走査は data_buffer への呼び出しを
 %%% 繰り返すので、その隙間に適用が挟まると読み手がコミットの途中を見る。
-%%% commit_latch がその区間を囲う。
+%%%
+%%% はじめはラッチで囲っていたが、それだと長い読み手がコミットを止める。
+%%% いまは snapshot_mng が変更前の値(undo)を持ち、読み手は自分が始めた
+%%% 時点の値へ巻き戻して見る。**読み手と書き手は互いを待たない。**
 %%%-------------------------------------------------------------------
 -module(tx_readonly_tests).
 
@@ -20,10 +23,13 @@ readonly_test_() ->
       fun ddl_is_rejected/1,
       fun readers_do_not_block_each_other/1,
       fun writer_blocks_readers_out/1,
-      fun commit_waits_for_readers/1,
+      fun commit_does_not_wait_for_readers/1,
       fun reader_sees_all_or_nothing_of_a_commit/1,
-      fun latch_is_released_on_commit_and_rollback/1,
-      fun latch_is_released_when_connection_dies/1,
+      fun reader_sees_old_values_after_update/1,
+      fun reader_sees_deleted_rows/1,
+      fun reader_does_not_use_index/1,
+      fun snapshot_is_released_on_commit_and_rollback/1,
+      fun snapshot_is_released_when_connection_dies/1,
       fun nested_begin_is_rejected/1]}.
 
 select_works_in_read_only(_) ->
@@ -85,9 +91,9 @@ readers_do_not_block_each_other(_) ->
                           q(C2, "ROLLBACK")
                   end),
         ?assertEqual({ok, ok}, await(R, 1000)),
-        ?assertMatch(#{readers := 1}, commit_latch:status()),
+        ?assertMatch(#{snapshots := 1}, snapshot_mng:status()),
         ok = q(C1, "COMMIT"),
-        ?assertMatch(#{readers := 0}, commit_latch:status())
+        ?assertMatch(#{snapshots := 0}, snapshot_mng:status())
     end.
 
 %% 読み書きトランザクションはこれまでどおり直列。
@@ -106,9 +112,10 @@ writer_blocks_readers_out(_) ->
         ?assertMatch({ok, {ok, _, _}}, await(Done, 5000))
     end.
 
-%% 読み手が動いている間、コミットの適用は待つ。
-%% 待たないと、読み手がコミットの途中を見る。
-commit_waits_for_readers(_) ->
+%% **これがスナップショットにした目的。** 読み手が開いていても
+%% コミットは通る。以前はここでラッチ待ちになり、長い照会がある間
+%% 書き込みが一切進まなかった。
+commit_does_not_wait_for_readers(_) ->
     fun() ->
         C1 = seeded(),
         C2 = connect(),
@@ -117,16 +124,13 @@ commit_waits_for_readers(_) ->
 
         ok = q(C2, "BEGIN"),
         {ok, _} = q(C2, "INSERT INTO t VALUES (3)"),
-
-        %% COMMIT はラッチ待ちで止まる。
-        %% **呼び出し元を殺しても止まらない**(サーバ側の handle_call は
-        %% 進み続ける)ので、終わったかどうかは合図で見る
         Done = async(fun() -> q(C2, "COMMIT") end),
-        ?assertEqual(timeout, await(Done, 300)),
-
-        %% 読み手が終われば通る
-        ok = q(C1, "COMMIT"),
         ?assertEqual({ok, ok}, await(Done, 5000)),
+
+        %% コミットは済んでいるが、開いたままの読み手には見えない
+        ?assertEqual(2, count_in(C1)),
+        ok = q(C1, "COMMIT"),
+        %% 閉じて開き直せば見える
         ?assertEqual(3, count(C1))
     end.
 
@@ -139,7 +143,7 @@ reader_sees_all_or_nothing_of_a_commit(_) ->
         ok = q(C1, "BEGIN READ ONLY"),
         ?assertEqual(2, count_in(C1)),
 
-        %% 別の接続が3行入れてコミットしようとする(ラッチ待ちで止まる)
+        %% 別の接続が3行入れてコミットする(もう待たされない)
         Parent = self(),
         spawn(fun() ->
                       ok = q(C2, "BEGIN"),
@@ -158,33 +162,86 @@ reader_sees_all_or_nothing_of_a_commit(_) ->
         ok = q(C1, "COMMIT"),
 
         receive committed -> ok after 5000 -> error(commit_stuck) end,
+        %% 読んでいる間にコミットは済んでいたが、見えていたのは2行のまま
         ?assertEqual(5, count(C1))
     end.
 
-latch_is_released_on_commit_and_rollback(_) ->
+%% 更新は「消して入れ直す」ではなく値の巻き戻しで見える。
+reader_sees_old_values_after_update(_) ->
+    fun() ->
+        C1 = seeded(),
+        C2 = connect(),
+        ok = q(C1, "BEGIN READ ONLY"),
+        ?assertMatch({ok, _, [[1], [2]]}, q(C1, "SELECT id FROM t ORDER BY id")),
+
+        ok = q(C2, "BEGIN"),
+        {ok, _} = q(C2, "UPDATE t SET id = 99 WHERE id = 1"),
+        ok = q(C2, "COMMIT"),
+
+        %% 読み手には昔の値のまま
+        ?assertMatch({ok, _, [[1], [2]]}, q(C1, "SELECT id FROM t ORDER BY id")),
+        ok = q(C1, "COMMIT"),
+        ?assertMatch({ok, _, [[2], [99]]}, one_shot(C1, "SELECT id FROM t ORDER BY id"))
+    end.
+
+%% 消された行も、スナップショットの時点では在ったので見える。
+reader_sees_deleted_rows(_) ->
+    fun() ->
+        C1 = seeded(),
+        C2 = connect(),
+        ok = q(C1, "BEGIN READ ONLY"),
+        ?assertEqual(2, count_in(C1)),
+
+        ok = q(C2, "BEGIN"),
+        {ok, _} = q(C2, "DELETE FROM t WHERE id = 1"),
+        ok = q(C2, "COMMIT"),
+
+        ?assertEqual(2, count_in(C1)),
+        ?assertMatch({ok, _, [[1], [2]]}, q(C1, "SELECT id FROM t ORDER BY id")),
+        ok = q(C1, "COMMIT"),
+        ?assertEqual(1, count(C1))
+    end.
+
+%% 索引は現在の値で引かれるので、巻き戻せない。
+%% スナップショットの読み手には索引を見せず、全表走査にする。
+reader_does_not_use_index(_) ->
+    fun() ->
+        C = seeded(),
+        ok = q(C, "CREATE INDEX t_id ON t (id)"),
+        Sql = "EXPLAIN SELECT id FROM t WHERE id = 1",
+        %% 通常のトランザクションなら索引を使う
+        ?assert(uses_index(one_shot(C, Sql))),
+        %% 読み取り専用では使わない
+        ok = q(C, "BEGIN READ ONLY"),
+        ?assertNot(uses_index(q(C, Sql))),
+        ok = q(C, "COMMIT")
+    end.
+
+snapshot_is_released_on_commit_and_rollback(_) ->
     fun() ->
         C = seeded(),
         ok = q(C, "BEGIN READ ONLY"),
-        ?assertMatch(#{readers := 1}, commit_latch:status()),
+        ?assertMatch(#{snapshots := 1}, snapshot_mng:status()),
         ok = q(C, "COMMIT"),
-        ?assertMatch(#{readers := 0}, commit_latch:status()),
+        ?assertMatch(#{snapshots := 0}, snapshot_mng:status()),
         ok = q(C, "BEGIN READ ONLY"),
-        ?assertMatch(#{readers := 1}, commit_latch:status()),
+        ?assertMatch(#{snapshots := 1}, snapshot_mng:status()),
         ok = q(C, "ROLLBACK"),
-        ?assertMatch(#{readers := 0}, commit_latch:status())
+        ?assertMatch(#{snapshots := 0}, snapshot_mng:status())
     end.
 
-%% ラッチを持ったまま接続が死んでも、書き手が永久に待たされない。
-latch_is_released_when_connection_dies(_) ->
+%% スナップショットを持ったまま接続が死んでも、undo が溜まり続けない。
+%% 誰も外さないと、その版より新しい undo を永久に捨てられなくなる。
+snapshot_is_released_when_connection_dies(_) ->
     fun() ->
         C1 = seeded(),
         C2 = connect(),
         ok = q(C2, "BEGIN READ ONLY"),
-        ?assertMatch(#{readers := 1}, commit_latch:status()),
+        ?assertMatch(#{snapshots := 1}, snapshot_mng:status()),
         Ref = erlang:monitor(process, C2),
         exit(C2, kill),
         receive {'DOWN', Ref, _, _, _} -> ok after 1000 -> error(timeout) end,
-        ok = wait_until(fun() -> maps:get(readers, commit_latch:status()) =:= 0 end),
+        ok = wait_until(fun() -> maps:get(snapshots, snapshot_mng:status()) =:= 0 end),
         %% 書き手が通ること
         W = async(fun() ->
                           ok = q(C1, "BEGIN"),
@@ -217,6 +274,16 @@ wait_until(F, N) ->
         true  -> ok;
         false -> timer:sleep(10), wait_until(F, N - 1)
     end.
+
+uses_index({ok, _, Lines}) ->
+    lists:any(fun([L]) -> binary:match(L, <<"Index Scan">>) =/= nomatch end, Lines).
+
+%% トランザクションの外で1文だけ実行する
+one_shot(C, Sql) ->
+    ok = q(C, "BEGIN"),
+    R = q(C, Sql),
+    ok = q(C, "COMMIT"),
+    R.
 
 count(C) ->
     ok = q(C, "BEGIN READ ONLY"),

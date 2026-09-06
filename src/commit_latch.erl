@@ -39,7 +39,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, read_lock/0, read_unlock/0, write_lock/0, write_unlock/0]).
--export([with_write/1, status/0]).
+-export([with_write/1, with_read/1, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TIMEOUT, infinity).
@@ -77,6 +77,17 @@ with_write(Fun) ->
     ok = write_lock(),
     try Fun()
     after write_unlock()
+    end.
+
+%%----------------------------------------------------------------------
+%% @doc 共有ラッチの下で実行する。文の実行を DDL から守るために使う。
+%% 例外が出ても必ず外す。
+%%----------------------------------------------------------------------
+-spec with_read(fun(() -> T)) -> T.
+with_read(Fun) ->
+    ok = read_lock(),
+    try Fun()
+    after read_unlock()
     end.
 
 -spec status() -> #{readers := non_neg_integer(), writer := boolean(),
