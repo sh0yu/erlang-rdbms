@@ -65,6 +65,11 @@
 %%% FROM句
 %%%===================================================================
 
+%% ANALYZE [table]。table が undefined なら全テーブル。
+-record(analyze_stmt, {
+    table
+}).
+
 %% CREATE INDEX name ON table (column)
 -record(create_index_stmt, {
     name,

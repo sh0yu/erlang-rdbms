@@ -161,6 +161,7 @@ CREATE TABLE t (a VARCHAR, b INTEGER, c BOOLEAN);
 DROP TABLE t;
 CREATE INDEX i ON t (a);
 DROP INDEX i;
+ANALYZE [t];
 EXPLAIN SELECT ...;
 INSERT INTO t [(c, ...)] VALUES (v, ...);
 UPDATE t SET c = expr, ... [WHERE expr];
@@ -337,6 +338,26 @@ application:set_env(transaction_db, index_module, index).
 索引の定義は `ms_indexes.sys`(DETS)に永続化される。テーブルの行の形
 `{Name, Columns}` を変えると既存のデータファイルとの互換が切れるので、
 別のDETSに分けてある。
+
+### 統計
+
+`ANALYZE` で採る。1回走査して、行数と各カラムの異なり値・NULL数・
+最小最大を数え、`ms_stats.sys`(DETS)に置く。
+
+```sql
+ANALYZE fruit;   -- 1テーブル
+ANALYZE;         -- 全テーブル
+```
+
+**挿入・削除では更新しない。** 更新すると1行ごとにDETSへの書き込みが増え、
+ロールバックで戻す必要も出る。統計は古くてよい。見積もりが外れても
+**結果は変わらず、遅くなるだけ**である(PostgreSQLの `ANALYZE` と同じ割り切り)。
+
+採っていないテーブルは既定値(1000行)で見積もる。「統計が無いから
+最適化しない」ではなく「分からないなりに見積もる」。
+
+異なり値の計数は10000で打ち切る。全行ぶんの集合を持つと大きな表で
+メモリを食う。選択率の見積もりに要るのは桁であって正確な値ではない。
 
 ## 設定
 

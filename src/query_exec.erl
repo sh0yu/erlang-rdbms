@@ -260,6 +260,9 @@ run_sql(State, {create_index, Name, Table, Column}) ->
     with_ddl(State, fun() ->
                             simple_db_server:create_index(get_db_pid(State), Name, Table, Column)
                     end);
+%% ANALYZE はカタログを書き換えるのでDDLと同じ扱い。
+run_sql(State, {analyze, Table}) ->
+    with_ddl(State, fun() -> simple_db_server:analyze(get_db_pid(State), Table) end);
 run_sql(State, {drop_index, Name}) ->
     with_ddl(State, fun() -> simple_db_server:drop_index(get_db_pid(State), Name) end);
 

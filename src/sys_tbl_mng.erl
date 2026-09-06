@@ -14,6 +14,7 @@
 %% Public API
 -export([start_link/0, stop/1]).
 -export([create_index/4, drop_index/2, get_indexes/2, list_indexes/1]).
+-export([put_stats/3, get_stats/2]).
 -export([create_table/3, drop_table/2, exist_table/2,
          get_column_list/2, get_index_column_list/2, list_tables/1,
          get_columns/2]).
@@ -27,7 +28,8 @@
 
 -record(st, {
     ms_tables,
-    ms_indexes
+    ms_indexes,
+    ms_stats
 }).
 
 %%%===================================================================
@@ -114,6 +116,17 @@ get_indexes(Pid, TableName) ->
 list_indexes(Pid) ->
     gen_server:call(Pid, list_indexes).
 
+%%----------------------------------------------------------------------
+%% @doc 統計を書く / 読む。
+%% 採取していないテーブルは none を返す。プランナは既定値で見積もる。
+%%----------------------------------------------------------------------
+put_stats(Pid, TableName, Stats) ->
+    gen_server:call(Pid, {put_stats, TableName, Stats}).
+
+-spec get_stats(pid() | atom(), atom()) -> {ok, #table_stats{}} | none.
+get_stats(Pid, TableName) ->
+    gen_server:call(Pid, {get_stats, TableName}).
+
 exist_table(Pid, TableName) ->
     gen_server:call(Pid, {exist_table, TableName}).
 
@@ -132,7 +145,9 @@ init([]) ->
     %% 変えると、既存のデータファイルとの互換が切れる。
     {ok, IdxName} = dets:open_file(ms_indexes,
                                    [{file, filename:join(DataDir, "ms_indexes.sys")}]),
-    {ok, #st{ms_tables = Name, ms_indexes = IdxName}}.
+    {ok, StatName} = dets:open_file(ms_stats,
+                                    [{file, filename:join(DataDir, "ms_stats.sys")}]),
+    {ok, #st{ms_tables = Name, ms_indexes = IdxName, ms_stats = StatName}}.
 
 handle_call({create_table, TableName, ColumnList}, _From, #st{ms_tables = MsTables} = State) ->
     Reply = case validate(TableName, ColumnList) of
@@ -161,6 +176,7 @@ handle_call({drop_table, TableName}, _From,
                     %% 実体の無い索引があることになる。
                     _ = [dets:delete(MsIdx, I#index.name)
                          || I <- indexes_of(MsIdx, TableName)],
+                    ok = dets:delete(State#st.ms_stats, TableName),
                     ok = dets:delete(MsTables, TableName),
                     ok = dets:sync(MsTables),
                     ok = dets:sync(MsIdx),
@@ -219,6 +235,18 @@ handle_call({get_indexes, TableName}, _From,
             end,
     {reply, Reply, State};
 
+handle_call({put_stats, TableName, Stats}, _From, #st{ms_stats = MsStat} = State) ->
+    ok = dets:insert(MsStat, {TableName, Stats}),
+    ok = dets:sync(MsStat),
+    {reply, ok, State};
+
+handle_call({get_stats, TableName}, _From, #st{ms_stats = MsStat} = State) ->
+    Reply = case dets:lookup(MsStat, TableName) of
+                [{TableName, Stats}] -> {ok, Stats};
+                []                   -> none
+            end,
+    {reply, Reply, State};
+
 handle_call(list_indexes, _From, #st{ms_indexes = MsIdx} = State) ->
     All = dets:foldl(fun({_N, I}, Acc) -> [I | Acc] end, [], MsIdx),
     {reply, {ok, lists:keysort(#index.name, All)}, State};
@@ -256,7 +284,9 @@ handle_cast(_Msg, State) ->
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-terminate(_Reason, #st{ms_tables = MsTables, ms_indexes = MsIdx}) ->
+terminate(_Reason, #st{ms_tables = MsTables, ms_indexes = MsIdx, ms_stats = MsStat}) ->
+    _ = dets:sync(MsStat),
+    _ = dets:close(MsStat),
     _ = dets:sync(MsIdx),
     _ = dets:close(MsIdx),
     _ = dets:close(MsTables),

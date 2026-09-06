@@ -46,6 +46,11 @@ analyze(#create_table_stmt{table = TableStr, columns = Defs}) ->
         Dups -> {error, {duplicate_columns, Dups}}
     end;
 
+analyze(#analyze_stmt{table = undefined}) ->
+    {ok, {analyze, all}};
+analyze(#analyze_stmt{table = TableStr}) ->
+    with_table(TableStr, fun(Table, _Columns) -> {ok, {analyze, Table}} end);
+
 %% CREATE INDEX。索引名は新しい名前なので list_to_atom で作る。
 %% テーブル名・カラム名はカタログに載っているものだけを解決する。
 analyze(#create_index_stmt{name = NameStr, table = TableStr, column = ColStr}) ->

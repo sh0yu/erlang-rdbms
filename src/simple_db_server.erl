@@ -26,12 +26,14 @@
 -export([convert_set_query/2, build_new_val/2, get_tab_column_key/2]).
 -export([index_module/0]).
 -export([create_index/4, drop_index/2, list_indexes/1]).
+-export([analyze/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
 -include("../include/simple_db_server.hrl").
+-include("../include/catalog.hrl").
 
 %%%===================================================================
 %%% DB Server APIs
@@ -177,6 +179,9 @@ handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
                     end
             end,
     {reply, Reply, State};
+
+handle_call({analyze, {TableName}}, _From, State) ->
+    {reply, do_analyze(TableName), State};
 
 handle_call({create_index, {IndexName, TableName, ColumnName}}, _From, State) ->
     {reply, do_create_index(IndexName, TableName, ColumnName), State};
@@ -457,6 +462,34 @@ position_of(_Name, [], _N)       -> not_found;
 position_of(Name, [Name | _], N) -> N;
 position_of(Name, [_ | T], N)    -> position_of(Name, T, N + 1).
 
+%%----------------------------------------------------------------------
+%% ANALYZE。1回走査して行数と各カラムの異なり値・NULL数・最小最大を採る。
+%% all を渡すと全テーブル。
+%%----------------------------------------------------------------------
+do_analyze(all) ->
+    {ok, Tables} = sys_tbl_mng:list_tables(whereis(sys_tbl_mng)),
+    Results = [{T, do_analyze(T)} || T <- Tables],
+    case [R || {_T, {error, _} = R} <- Results] of
+        []      -> {ok, length(Results)};
+        [E | _] -> E
+    end;
+do_analyze(TableName) ->
+    case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Columns} ->
+            {Count, Acc} =
+                scan_fold(TableName,
+                          fun({_Oid, Row}, {N, A}) ->
+                                  {N + 1, sql_stats:accumulate(Row, A)}
+                          end, {0, sql_stats:empty(Columns)}),
+            Stats = (sql_stats:finish(Columns, Count, Acc))#table_stats{
+                      table = TableName,
+                      analyzed = erlang:system_time(second)},
+            ok = sys_tbl_mng:put_stats(whereis(sys_tbl_mng), TableName, Stats),
+            {ok, Count}
+    end.
+
 %% CREATE INDEX。定義を登録してから、既存の行で索引を作り直す。
 do_create_index(IndexName, TableName, ColumnName) ->
     case sys_tbl_mng:create_index(whereis(sys_tbl_mng), IndexName, TableName, ColumnName) of
@@ -544,6 +577,10 @@ rebuild_table_index(TableName) ->
 %%----------------------------------------------------------------------
 %% @doc 索引を作る / 落とす / 一覧する。
 %%----------------------------------------------------------------------
+%% @doc 統計を採る。TableName に all を渡すと全テーブル。
+analyze(Pid, TableName) ->
+    gen_server:call(Pid, {analyze, {TableName}}, infinity).
+
 create_index(Pid, IndexName, TableName, ColumnName) ->
     gen_server:call(Pid, {create_index, {IndexName, TableName, ColumnName}}, infinity).
 
