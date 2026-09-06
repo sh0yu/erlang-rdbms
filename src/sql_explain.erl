@@ -194,6 +194,14 @@ expr({is_not_null, E}, S)    -> [expr(E, S), " IS NOT NULL"];
 expr({in, A, Es}, S)         -> ["(", expr(A, S), " IN (",
                                 commas([expr(E, S) || E <- Es]), "))"];
 expr({in_subquery, A, _}, S) -> ["(", expr(A, S), " IN (subquery))"];
+expr({func, N, Args}, S)     -> [string:uppercase(N), "(",
+                                commas([expr(A, S) || A <- Args]), ")"];
+expr({like, A, P}, S)        -> ["(", expr(A, S), " LIKE ", expr(P, S), ")"];
+expr({'case', Ws, E}, S)     ->
+    ["CASE",
+     [[" WHEN ", expr(C, S), " THEN ", expr(V, S)] || {C, V} <- Ws],
+     case E of undefined -> ""; _ -> [" ELSE ", expr(E, S)] end,
+     " END"];
 expr({scalar_subquery, _}, _S) -> "(subquery)";
 expr({exists_subquery, _}, _S) -> "EXISTS (subquery)";
 expr(Other, _S)              -> io_lib:format("~p", [Other]).

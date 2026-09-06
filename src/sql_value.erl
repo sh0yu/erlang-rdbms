@@ -18,7 +18,7 @@
 
 -export([compare/2, order_compare/4]).
 -export([truth_and/2, truth_or/2, truth_not/1, keep/1]).
--export([is_null/1, group_key/1, arith/3]).
+-export([is_null/1, group_key/1, arith/3, like/2]).
 
 -type value() :: term().
 -type truth() :: true | false | null.
@@ -148,3 +148,29 @@ group_key(V) when is_float(V) ->
         false -> V
     end;
 group_key(V) -> V.
+
+%%%===================================================================
+%%% LIKE
+%%%===================================================================
+
+%%----------------------------------------------------------------------
+%% @doc SQL の LIKE。`%` は任意の並び(空も可)、`_` は任意の1文字。
+%% どちらかが NULL なら結果は NULL(3値論理)。
+%%
+%% 文字単位で照合する。バイト単位だと多バイト文字で `_` が
+%% 1文字ぶんにならない。
+%%----------------------------------------------------------------------
+-spec like(value(), value()) -> truth().
+like(null, _) -> null;
+like(_, null) -> null;
+like(S, P) when is_binary(S), is_binary(P) ->
+    match(unicode:characters_to_list(P), unicode:characters_to_list(S));
+like(_, _) ->
+    null.
+
+match([], [])                -> true;
+match([$% | P], S)           -> match(P, S) orelse
+                                (S =/= [] andalso match([$% | P], tl(S)));
+match([$_ | P], [_ | S])     -> match(P, S);
+match([C | P], [C | S])      -> match(P, S);
+match(_, _)                  -> false.

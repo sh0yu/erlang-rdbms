@@ -25,6 +25,8 @@ Rules.
 %% 「左の expr を還元するか not を読み進めるか」が1トークン先読みでは
 %% 決まらず、yecc が shift/reduce 衝突を出す。
 [Nn][Oo][Tt]{WS}+[Ii][Nn]  : {token, {'not_in', TokenLine}}.
+%% NOT LIKE も同じ理由で1トークンにする。
+[Nn][Oo][Tt]{WS}+[Ll][Ii][Kk][Ee] : {token, {'not_like', TokenLine}}.
 {L}{A}*             : {token, keyword_or_identifier(TokenChars, TokenLine)}.
 ,                   : {token, {',', TokenLine}}.
 \*                  : {token, {'*', TokenLine}}.
@@ -71,6 +73,7 @@ keywords() ->
      %% さもないと `t RIGHT JOIN u` が「t に right という別名を付けた
      %% 内部結合」として黙って通り、意味が変わったことに気づけない。
      "right", "full",
+     "case", "when", "then", "else", "end", "like",
      "join", "inner", "left", "outer", "cross", "on", "as"].
 
 keyword_or_identifier(Chars, Line) ->

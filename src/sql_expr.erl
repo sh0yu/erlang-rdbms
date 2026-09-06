@@ -46,6 +46,19 @@ eval({arith, Op, L, R}, Row) ->
 %%   一致がある         → true
 %%   一致が無くNULL有り → unknown(そのNULLが x かもしれない)
 %%   一致が無くNULL無し → false
+%% CASE。条件が **true** の最初の枝を採る。null と false は等しく飛ばす。
+eval({'case', Whens, Else}, Row) ->
+    case first_true(Whens, Row) of
+        {ok, V}   -> V;
+        not_found -> case Else of
+                         undefined -> null;
+                         _         -> eval(Else, Row)
+                     end
+    end;
+eval({like, A, P}, Row) ->
+    sql_value:like(eval(A, Row), eval(P, Row));
+eval({func, Name, Args}, Row) ->
+    sql_func:apply(Name, [eval(A, Row) || A <- Args]);
 eval({in, A, Exprs}, Row) ->
     case eval(A, Row) of
         null -> null;
@@ -67,6 +80,14 @@ eval({is_not_null, E}, Row) ->
 %% @doc 述語として評価し、行を通すかどうかを返す。
 %% NULL(unknown)は false と同じく通さない。
 %%----------------------------------------------------------------------
+first_true([], _Row) ->
+    not_found;
+first_true([{C, V} | T], Row) ->
+    case sql_value:keep(eval(C, Row)) of
+        true  -> {ok, eval(V, Row)};
+        false -> first_true(T, Row)
+    end.
+
 in_truth(_V, []) ->
     false;
 in_truth(V, Vals) ->
@@ -119,6 +140,12 @@ map_subqueries(F, {exists_subquery, _} = E) -> F(E);
 map_subqueries(F, {in_subquery, A, P})      -> F({in_subquery, map_subqueries(F, A), P});
 map_subqueries(F, {in, A, Es})              -> {in, map_subqueries(F, A),
                                                 [map_subqueries(F, E) || E <- Es]};
+map_subqueries(F, {func, N, Args})          -> {func, N, [map_subqueries(F, A) || A <- Args]};
+map_subqueries(F, {like, A, P})             -> {like, map_subqueries(F, A),
+                                                map_subqueries(F, P)};
+map_subqueries(F, {'case', Ws, E})          ->
+    {'case', [{map_subqueries(F, C), map_subqueries(F, V)} || {C, V} <- Ws],
+     case E of undefined -> undefined; _ -> map_subqueries(F, E) end};
 map_subqueries(F, {comp, Op, L, R})         -> {comp, Op, map_subqueries(F, L),
                                                 map_subqueries(F, R)};
 map_subqueries(F, {arith, Op, L, R})        -> {arith, Op, map_subqueries(F, L),

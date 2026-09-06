@@ -191,9 +191,28 @@ BEGIN;  BEGIN READ ONLY;  COMMIT;  ROLLBACK;
 | 集合 | `IN (v, ...)` `NOT IN (...)` `IN (SELECT ...)` |
 | 副問い合わせ | `(SELECT ...)`(スカラー) `EXISTS (SELECT ...)` |
 | 集約 | `COUNT(*)` `COUNT(x)` `COUNT(DISTINCT x)` `SUM` `AVG` `MIN` `MAX` |
+| 文字列 | `LIKE` `NOT LIKE`(`%` は任意の並び、`_` は任意の1文字) |
+| 条件 | `CASE WHEN ... THEN ... [ELSE ...] END` |
+| 関数 | 下記のスカラー関数 |
 
 比較の一方がNULLなら結果はNULLになり、`WHERE` は通らない。
 `NOT` をつけても通らない(3値論理)。
+
+スカラー関数:
+
+| | |
+| --- | --- |
+| 数値 | `ABS` `CEIL`/`CEILING` `FLOOR` `ROUND(x[,n])` `MOD` `POWER` `GREATEST` `LEAST` |
+| 文字列 | `UPPER` `LOWER` `LENGTH` `SUBSTR(s,from[,len])` `TRIM` `LTRIM` `RTRIM` `CONCAT` `REPLACE` |
+| NULL | `COALESCE(...)` `NULLIF(a,b)` |
+
+**引数のどれかが NULL なら結果も NULL**が既定。例外は `COALESCE` と
+`NULLIF` で、この2つは NULL を見て分岐するのが仕事。
+型が合わないものは落とさず NULL にする(算術・比較と揃える)。
+
+`GREATEST` / `LEAST` と `LIKE` は SQL の順序・文字単位で比べる。
+Erlang の項順序だと `100 < <<"a">>` が通り、バイト単位だと多バイト文字で
+`_` が1文字ぶんにならない。
 
 タプルAPI(内部向け):
 
@@ -655,6 +674,12 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
   外側の1行ごとに実行し直す必要があり、別の仕組みになる。
   相関しないものだけを、本体の実行前に1回だけ評価して定数に畳む
 - ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
+- **`BETWEEN` は未実装。** `x BETWEEN a AND b` の規則は最後の終端記号が
+  `AND` になり、yecc は規則の優先順位を最後の終端記号から取る
+  (`%prec` に相当する指定が無い)。その結果 BETWEEN の `AND` が論理演算の
+  `AND` と同じ優先度になり、`x BETWEEN 1 AND 2 AND y > 3` の切り方が
+  決まらず衝突する。糖衣なので `x >= a AND x <= b` と書けばよい
+- `CAST` は未実装
 - 導出表の列の型は `any` になる(射影の式から型を推論しない)
 - 列別名の `AS` は省略できない。省略を許すと `SELECT a b` が
   別名なのかカンマの書き忘れなのか区別できない

@@ -171,6 +171,15 @@ refs({'not', E})          -> refs(E);
 refs({neg, E})            -> refs(E);
 refs({is_null, E})        -> refs(E);
 refs({is_not_null, E})    -> refs(E);
+refs({func, _, Args})     -> lists:foldl(fun(E, A) -> merge(refs(E), A) end, [], Args);
+refs({like, A, P})        -> merge(refs(A), refs(P));
+refs({in, A, Es})         -> lists:foldl(fun(E, Acc) -> merge(refs(E), Acc) end,
+                                         refs(A), Es);
+refs({'case', Ws, E})     ->
+    Base = case E of undefined -> []; _ -> refs(E) end,
+    lists:foldl(fun({C, V}, Acc) -> merge(refs(C), merge(refs(V), Acc)) end, Base, Ws);
+%% 副問い合わせを含む式は動かさない。中のプランの位置まで
+%% 面倒を見る必要が出るので、安全側に倒す。
 refs(_)                   -> unknown.
 
 merge(unknown, _) -> unknown;
@@ -187,7 +196,13 @@ shift({'or', Es}, D)       -> {'or', [shift(E, D) || E <- Es]};
 shift({'not', E}, D)       -> {'not', shift(E, D)};
 shift({neg, E}, D)         -> {neg, shift(E, D)};
 shift({is_null, E}, D)     -> {is_null, shift(E, D)};
-shift({is_not_null, E}, D) -> {is_not_null, shift(E, D)}.
+shift({is_not_null, E}, D) -> {is_not_null, shift(E, D)};
+shift({func, N, Args}, D)  -> {func, N, [shift(E, D) || E <- Args]};
+shift({like, A, P}, D)     -> {like, shift(A, D), shift(P, D)};
+shift({in, A, Es}, D)      -> {in, shift(A, D), [shift(E, D) || E <- Es]};
+shift({'case', Ws, E}, D)  ->
+    {'case', [{shift(C, D), shift(V, D)} || {C, V} <- Ws],
+     case E of undefined -> undefined; _ -> shift(E, D) end}.
 
 %% その部分木が出す行の幅。FROM句の中には走査・結合・選択しか現れない。
 width(#lp_scan{schema = S})          -> length(S);

@@ -29,6 +29,7 @@ Nonterminals
     explain_stmt create_index_stmt drop_index_stmt analyze_stmt
     select_list select_item table_ref opt_where expr literal
     query set_expr set_term select_core opt_all
+    case_expr when_list when_item opt_else
     neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
     opt_group opt_having expr_list func_call
     from_item join_kw opt_alias
@@ -52,6 +53,7 @@ Terminals
     'group' 'having' 'explain' 'index' 'analyze' 'read' 'only'
     'union' 'intersect' 'except' 'all' 'in' 'exists' 'not_in'
     'right' 'full'
+    'case' 'when' 'then' 'else' 'end' 'like' 'not_like'
     'join' 'inner' 'left' 'outer' 'cross' 'on' 'as' '.'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
@@ -77,7 +79,7 @@ Left  100 'or'.
 Left  200 'and'.
 Unary 300 'not'.
 Nonassoc 400 'is'.
-Nonassoc 450 'in' 'not_in'.
+Nonassoc 450 'in' 'not_in' 'like' 'not_like'.
 Nonassoc 500 '=' '<>' '<' '<=' '>' '>='.
 Left  600 '+' '-'.
 Left  700 '*' '/'.
@@ -320,6 +322,16 @@ opt_where -> where expr  : '$2'.
 %%% `(` の後に select が来るかどうかで、括弧つきの式と区別できる。
 %%%-------------------------------------------------------------------
 expr -> '(' query ')' : #scalar_subquery{query = '$2'}.
+expr -> case_expr : '$1'.
+%% BETWEEN は入れていない。
+%%
+%% `x BETWEEN a AND b` の規則は最後の終端記号が 'and' になる。yecc は
+%% 規則の優先順位を最後の終端記号から取り、`%prec` に相当する指定が無いので、
+%% BETWEEN の AND が論理演算の AND と同じ優先度(200)になってしまう。
+%% その結果 `x BETWEEN 1 AND 2 AND y > 3` の切り方が決まらず衝突する。
+%% 糖衣なので `x >= a AND x <= b` と書けばよい。
+expr -> expr 'like' expr     : #like_expr{arg = '$1', pattern = '$3'}.
+expr -> expr 'not_like' expr : #like_expr{arg = '$1', pattern = '$3', negated = true}.
 expr -> 'exists' '(' query ')' : #exists_expr{query = '$3'}.
 expr -> expr 'in' '(' expr_list ')' : #in_expr{arg = '$1', values = '$4'}.
 expr -> expr 'in' '(' query ')' : #in_expr{arg = '$1', query = '$4'}.
@@ -358,8 +370,9 @@ expr -> neg expr      : #unop{op = '-', arg = '$2'}.
 %% 予約語を減らすほど、count や order という名前のカラムが作れる。
 func_call -> identifier '(' '*' ')' :
     #func{name = value_of('$1'), args = star}.
-func_call -> identifier '(' expr ')' :
-    #func{name = value_of('$1'), args = ['$3']}.
+%% 引数は1つとは限らない。ROUND(x, 2) や COALESCE(a, b, c) がある。
+func_call -> identifier '(' expr_list ')' :
+    #func{name = value_of('$1'), args = '$3'}.
 func_call -> identifier '(' 'distinct' expr ')' :
     #func{name = value_of('$1'), args = ['$4'], distinct = true}.
 expr -> '(' expr ')'  : '$2'.
@@ -367,6 +380,18 @@ expr -> identifier                  : #col_ref{name = value_of('$1')}.
 expr -> identifier '.' identifier   : #col_ref{table = value_of('$1'),
                                                name = value_of('$3')}.
 expr -> literal       : '$1'.
+
+%% CASE WHEN ... THEN ... [ELSE ...] END
+case_expr -> 'case' when_list opt_else 'end' :
+    #case_expr{whens = '$2', else_ = '$3'}.
+
+when_list -> when_item           : ['$1'].
+when_list -> when_list when_item : '$1' ++ ['$2'].
+
+when_item -> 'when' expr 'then' expr : {'$2', '$4'}.
+
+opt_else -> '$empty'    : undefined.
+opt_else -> 'else' expr : '$2'.
 
 neg -> '-' : '-'.
 

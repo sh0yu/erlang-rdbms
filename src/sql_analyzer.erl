@@ -561,6 +561,12 @@ rewrite_having(Expr, Ctx) ->
 %%   集約呼び出し  -> 集約結果の位置への参照
 %%   GROUP BY のキーと一致する式 -> キーの位置への参照
 %%   それ以外のカラム参照 -> エラー(どの行の値か決まらない)
+rewrite(#func{name = N, args = Args} = F, Ctx) when is_list(Args) ->
+    case sql_func:is_scalar(string:lowercase(N))
+        andalso not is_aggregate_name(string:lowercase(N)) of
+        true  -> rewrite_children(F, undefined, Ctx);
+        false -> rewrite_agg(F, Ctx)
+    end;
 rewrite(#func{} = F, Ctx) ->
     add_aggregate(F, Ctx);
 rewrite(#const{value = V}, Ctx) ->
@@ -606,13 +612,36 @@ rewrite_children(#unop{op = Op, arg = A}, _Bound, Ctx) ->
         {ok, BA, Ctx2} when Op =:= 'not' -> {ok, {'not', BA}, Ctx2};
         {ok, BA, Ctx2} -> {ok, {neg, BA}, Ctx2}
     end;
+rewrite_children(#func{name = N, args = Args}, _Bound, Ctx) ->
+    case rewrite_list(Args, Ctx, []) of
+        {error, Reason}      -> {error, Reason};
+        {ok, BArgs, Ctx1}    -> {ok, {func, string:lowercase(N), BArgs}, Ctx1}
+    end;
 rewrite_children(#col_ref{name = Name}, _Bound, _Ctx) ->
     {error, {not_grouped, Name}};
 rewrite_children(_Expr, _Bound, _Ctx) ->
     {error, not_grouped}.
 
+rewrite_list([], Ctx, Acc) ->
+    {ok, lists:reverse(Acc), Ctx};
+rewrite_list([E | T], Ctx, Acc) ->
+    case rewrite(E, Ctx) of
+        {error, Reason}   -> {error, Reason};
+        {ok, B, Ctx1}     -> rewrite_list(T, Ctx1, [B | Acc])
+    end.
+
+bind_whens([], _Columns, Acc) ->
+    {ok, lists:reverse(Acc)};
+bind_whens([{C, V} | T], Columns, Acc) ->
+    case bind_pair(C, V, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, BC, BV}    -> bind_whens(T, Columns, [{BC, BV} | Acc])
+    end.
+
 %% 集約を登録して、その結果を指す参照を返す。
 %% 同じ集約が複数回出てきたら1つにまとめる。
+rewrite_agg(F, Ctx) -> add_aggregate(F, Ctx).
+
 add_aggregate(#func{name = NameStr, args = Args, distinct = Dist},
               #{keys := Keys, aggs := Aggs, columns := Columns} = Ctx) ->
     case agg_func(string:lowercase(NameStr), Args) of
@@ -690,11 +719,43 @@ with_ok([F | T], Acc, Cont) ->
 has_aggregate(Items) ->
     lists:any(fun contains_func/1, Items).
 
-contains_func(#func{}) -> true;
+%%----------------------------------------------------------------------
+%% 式に**集約**が含まれるか。
+%%
+%% 関数呼び出しが全部集約だった頃の名残で contains_func という名前だが、
+%% 見ているのは集約だけである。スカラー関数(UPPER など)は普通の式として
+%% 束縛されるので、ここで true を返してはいけない。
+%%
+%% 別名(#aliased{})を見落とすと `SELECT COUNT(*) AS n FROM t` が
+%% 集約プランに載らず、bind_expr が #func{} を知らないので落ちる。
+%%
+%% 副問い合わせの中は見ない。その中の集約は副問い合わせのものである。
+%%----------------------------------------------------------------------
+contains_func(#func{name = N, args = Args}) ->
+    is_aggregate_name(string:lowercase(N))
+        orelse lists:any(fun contains_func/1, func_args(Args));
+contains_func(#aliased{expr = E}) -> contains_func(E);
 contains_func(#binop{left = L, right = R}) -> contains_func(L) orelse contains_func(R);
 contains_func(#unop{arg = A}) -> contains_func(A);
 contains_func(#is_null{arg = A}) -> contains_func(A);
+contains_func(#case_expr{whens = Ws, else_ = E}) ->
+    lists:any(fun({C, V}) -> contains_func(C) orelse contains_func(V) end, Ws)
+        orelse (E =/= undefined andalso contains_func(E));
+contains_func(#like_expr{arg = A, pattern = P}) ->
+    contains_func(A) orelse contains_func(P);
+contains_func(#in_expr{arg = A, values = Vs}) ->
+    contains_func(A) orelse lists:any(fun contains_func/1, values_or_empty(Vs));
 contains_func(_) -> false.
+
+func_args(star) -> [];
+func_args(L) when is_list(L) -> L;
+func_args(_) -> [].
+
+values_or_empty(undefined) -> [];
+values_or_empty(L) -> L.
+
+is_aggregate_name(N) ->
+    lists:member(N, ["count", "sum", "avg", "min", "max"]).
 
 wrap_filter(undefined, Node) -> Node;
 wrap_filter(Pred, Node) -> #lp_filter{pred = Pred, input = Node}.
@@ -915,6 +976,48 @@ bind_expr(#unop{op = '-', arg = A}, Columns) ->
 %% 外を参照していれば「そんな列は無い」で落ちる。相関副問い合わせは
 %% 外側の1行ごとに実行し直す必要があり、別の仕組みになる。
 %%----------------------------------------------------------------------
+bind_expr(#case_expr{whens = Whens, else_ = Else}, Columns) ->
+    case bind_whens(Whens, Columns, []) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, BWhens} ->
+            case Else of
+                undefined ->
+                    {ok, {'case', BWhens, undefined}};
+                _ ->
+                    case bind_expr(Else, Columns) of
+                        {error, Reason} -> {error, Reason};
+                        {ok, BElse}     -> {ok, {'case', BWhens, BElse}}
+                    end
+            end
+    end;
+bind_expr(#like_expr{arg = A, pattern = P, negated = Neg}, Columns) ->
+    case bind_pair(A, P, Columns) of
+        {error, Reason} -> {error, Reason};
+        {ok, BA, BP} when Neg -> {ok, {'not', {like, BA, BP}}};
+        {ok, BA, BP}          -> {ok, {like, BA, BP}}
+    end;
+%% スカラー関数。集約とは別物で、1行の中で値から値を作る。
+bind_expr(#func{name = NameStr, args = Args, distinct = Dist}, Columns) ->
+    Name = string:lowercase(NameStr),
+    case {sql_func:is_scalar(Name), Dist, Args} of
+        {false, _, _} ->
+            {error, {unknown_function, NameStr}};
+        {true, true, _} ->
+            {error, {distinct_not_allowed, NameStr}};
+        {true, _, star} ->
+            {error, {star_not_allowed, NameStr}};
+        {true, _, _} ->
+            case sql_func:arity_ok(Name, length(Args)) of
+                false ->
+                    {error, {wrong_number_of_arguments, NameStr, length(Args)}};
+                true ->
+                    case bind_all(Args, Columns) of
+                        {error, Reason} -> {error, Reason};
+                        {ok, BArgs}     -> {ok, {func, Name, BArgs}}
+                    end
+            end
+    end;
 bind_expr(#scalar_subquery{query = Q}, _Columns) ->
     with_subplan(Q, 1, fun(Sub) -> {scalar_subquery, Sub} end);
 bind_expr(#exists_expr{query = Q}, _Columns) ->

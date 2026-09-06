@@ -131,6 +131,19 @@
 %% SELECT * の *
 -record(star, {}).
 
+%% CASE WHEN cond THEN val ... [ELSE val] END
+-record(case_expr, {
+    whens = [],   % [{Cond, Val}]
+    else_          % 省略時は undefined(結果は NULL)
+}).
+
+%% x LIKE 'pat'。`%` は任意の並び、`_` は任意の1文字。
+-record(like_expr, {
+    arg,
+    pattern,
+    negated = false
+}).
+
 %% 式の中の副問い合わせ。いずれも**相関しない**ものだけを扱う。
 %% 外側の行を参照する副問い合わせは、外側の1行ごとに実行し直す必要があり、
 %% それは別の仕組みになる。

@@ -186,6 +186,18 @@ DROP INDEX fruit_price;
 
 DROP TABLE box;
 
+-- ============ 式 ============
+BEGIN READ ONLY;
+-- スカラー関数。引数に NULL があれば結果も NULL
+SELECT UPPER(name) AS u, LENGTH(name) AS n FROM fruit ORDER BY name;
+SELECT COALESCE(name, 'none') AS c, NULLIF(price, 100) AS p FROM fruit ORDER BY name;
+-- CASE。条件が真の最初の枝を採る。どれも真でなく ELSE も無ければ NULL
+SELECT name, CASE WHEN price < 150 THEN 'cheap' ELSE 'dear' END AS band
+  FROM fruit ORDER BY name;
+-- LIKE。% は任意の並び、_ は任意の1文字
+SELECT name FROM fruit WHERE name LIKE 'a%' ORDER BY name;
+COMMIT;
+
 -- ============ 副問い合わせ ============
 BEGIN READ ONLY;
 -- スカラー副問い合わせ
