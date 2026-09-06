@@ -188,6 +188,8 @@ BEGIN;  BEGIN READ ONLY;  COMMIT;  ROLLBACK;
 | 論理 | `AND` `OR` `NOT` `( )` |
 | 算術 | `+` `-` `*` `/`(ゼロ除算はNULL) |
 | NULL | `IS NULL` `IS NOT NULL` |
+| 集合 | `IN (v, ...)` `NOT IN (...)` `IN (SELECT ...)` |
+| 副問い合わせ | `(SELECT ...)`(スカラー) `EXISTS (SELECT ...)` |
 | 集約 | `COUNT(*)` `COUNT(x)` `COUNT(DISTINCT x)` `SUM` `AVG` `MIN` `MAX` |
 
 比較の一方がNULLなら結果はNULLになり、`WHERE` は通らない。
@@ -406,6 +408,32 @@ a = [1, 2, 2, 3]、b = [2] のとき
 NULL 同士は等しいとみなす**(標準SQLの "not distinct from")。
 `=` をそのまま使うと、NULL の行が `UNION` で重複除去されずに残る。
 
+### 副問い合わせ
+
+```sql
+SELECT name FROM emp WHERE sal = (SELECT MAX(sal) FROM emp);
+SELECT name FROM emp WHERE dept IN (SELECT id FROM dept);
+SELECT name FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE id = 10);
+SELECT name FROM emp WHERE dept IN (10, 20);
+```
+
+**相関しないものだけ**を扱う。外側の行に依存しないので、本体を動かす前に
+1回だけ実行して定数へ畳む。外側を参照すると「そんな列は無い」で落ちる。
+
+スカラー副問い合わせは1行1列を要求する。0行なら NULL(標準SQL)、
+2行以上はエラー。
+
+`IN` は3値論理で評価する。
+
+```
+x が NULL          → unknown
+一致がある         → true
+一致が無くNULL有り → unknown(そのNULLが x かもしれない)
+一致が無くNULL無し → false
+```
+
+だから `x NOT IN (10, NULL)` は決して真にならない。
+
 ### 導出表
 
 ```sql
@@ -623,8 +651,9 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
 - 索引は単一カラムのみ。複合索引・一意索引は未実装
-- 副問い合わせは `FROM` の導出表のみ。`IN (SELECT ...)` / `EXISTS` /
-  スカラー副問い合わせ・相関副問い合わせは未実装
+- **相関副問い合わせは未実装。** 外側の行を参照する副問い合わせは、
+  外側の1行ごとに実行し直す必要があり、別の仕組みになる。
+  相関しないものだけを、本体の実行前に1回だけ評価して定数に畳む
 - ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
 - 導出表の列の型は `any` になる(射影の式から型を推論しない)
 - 列別名の `AS` は省略できない。省略を許すと `SELECT a b` が

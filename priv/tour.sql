@@ -186,10 +186,36 @@ DROP INDEX fruit_price;
 
 DROP TABLE box;
 
--- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
-BEGIN;
-SELECT * FROM fruit WHERE price = (SELECT price FROM fruit);
+-- ============ 副問い合わせ ============
+BEGIN READ ONLY;
+-- スカラー副問い合わせ
+SELECT name FROM fruit WHERE price = (SELECT MAX(price) FROM fruit);
+-- IN / NOT IN。値の並びでも副問い合わせでもよい
+SELECT name FROM fruit WHERE price IN (100, 150);
+-- 候補に NULL があると NOT IN は決して真にならない(3値論理)
+SELECT name FROM fruit WHERE price NOT IN (100, null);
+-- 1行1列でなければエラー
+SELECT name FROM fruit WHERE price = (SELECT price FROM fruit);
 COMMIT;
+
+-- 導出表。別名は必須
+BEGIN READ ONLY;
+SELECT d.name FROM (SELECT name, price FROM fruit WHERE price > 100) AS d
+  ORDER BY d.name;
+COMMIT;
+SELECT * FROM (SELECT name FROM fruit);
+
+-- ============ 集合演算 ============
+BEGIN READ ONLY;
+SELECT name FROM fruit UNION SELECT name FROM fruit ORDER BY 1;
+SELECT price FROM fruit EXCEPT SELECT 100 FROM fruit;
+COMMIT;
+
+-- ============ まだ書けない構文(黙って無視せず構文エラーになる) ============
+SELECT * FROM fruit WHERE price BETWEEN 1 AND 2;
+-- RIGHT/FULL は予約語にしてある。さもないと「right という別名の内部結合」
+-- として黙って通ってしまう
+SELECT * FROM fruit RIGHT JOIN fruit f2 ON 1 = 1;
 
 -- ============ DDLはトランザクションの中では実行できない ============
 BEGIN;

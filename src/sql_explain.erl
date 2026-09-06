@@ -26,7 +26,41 @@ explain(Plan) ->
 
 lines(Node, Depth) ->
     Pad = lists:duplicate(Depth * 2, $\s),
-    [[Pad, label(Node)] | lists:append([lines(C, Depth + 1) || C <- children(Node)])].
+    %% 式の中の副問い合わせも木として出す。出さないと
+    %% 「(subquery)」とだけ書かれて中身が分からない。
+    Kids = children(Node) ++ subplans(Node),
+    [[Pad, label(Node)] | lists:append([lines(C, Depth + 1) || C <- Kids])].
+
+%% その節点の式に埋まっている副問い合わせのプラン。
+subplans(Node) ->
+    lists:append([collect_subplans(E) || E <- node_exprs(Node)]).
+
+node_exprs(#p_filter{pred = P})                 -> [P];
+node_exprs(#p_nl_join{pred = P})                -> [P];
+node_exprs(#p_hash_join{pred = P})              -> [P];
+node_exprs(#p_agg{group_by = G, aggs = A, having = H}) ->
+    G ++ [Ag#agg.arg || Ag <- A] ++ [H];
+node_exprs(#p_sort{keys = K})                   -> [E || {E, _, _} <- K];
+node_exprs(#p_project{exprs = E})               -> E;
+node_exprs(_Other)                              -> [].
+
+collect_subplans(E) ->
+    lists:reverse(fold_subplans(E, [])).
+
+fold_subplans({scalar_subquery, P}, Acc)  -> [P | Acc];
+fold_subplans({exists_subquery, P}, Acc)  -> [P | Acc];
+fold_subplans({in_subquery, A, P}, Acc)   -> [P | fold_subplans(A, Acc)];
+fold_subplans({in, A, Es}, Acc)           -> lists:foldl(fun fold_subplans/2,
+                                                         fold_subplans(A, Acc), Es);
+fold_subplans({comp, _, L, R}, Acc)       -> fold_subplans(R, fold_subplans(L, Acc));
+fold_subplans({arith, _, L, R}, Acc)      -> fold_subplans(R, fold_subplans(L, Acc));
+fold_subplans({'and', Es}, Acc)           -> lists:foldl(fun fold_subplans/2, Acc, Es);
+fold_subplans({'or', Es}, Acc)            -> lists:foldl(fun fold_subplans/2, Acc, Es);
+fold_subplans({'not', E}, Acc)            -> fold_subplans(E, Acc);
+fold_subplans({neg, E}, Acc)              -> fold_subplans(E, Acc);
+fold_subplans({is_null, E}, Acc)          -> fold_subplans(E, Acc);
+fold_subplans({is_not_null, E}, Acc)      -> fold_subplans(E, Acc);
+fold_subplans(_E, Acc)                    -> Acc.
 
 children(#p_seq_scan{})                    -> [];
 children(#p_index_scan{})                  -> [];
@@ -157,6 +191,11 @@ expr({'not', E}, S)          -> ["NOT ", expr(E, S)];
 expr({neg, E}, S)            -> ["-", expr(E, S)];
 expr({is_null, E}, S)        -> [expr(E, S), " IS NULL"];
 expr({is_not_null, E}, S)    -> [expr(E, S), " IS NOT NULL"];
+expr({in, A, Es}, S)         -> ["(", expr(A, S), " IN (",
+                                commas([expr(E, S) || E <- Es]), "))"];
+expr({in_subquery, A, _}, S) -> ["(", expr(A, S), " IN (subquery))"];
+expr({scalar_subquery, _}, _S) -> "(subquery)";
+expr({exists_subquery, _}, _S) -> "EXISTS (subquery)";
 expr(Other, _S)              -> io_lib:format("~p", [Other]).
 
 op('=')  -> "=";

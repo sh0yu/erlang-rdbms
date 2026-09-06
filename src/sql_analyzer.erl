@@ -136,6 +136,23 @@ analyze(#select_stmt{from = From} = Stmt) ->
     end.
 
 %%%===================================================================
+%%% 副問い合わせ
+%%%===================================================================
+
+%% 副問い合わせを解析して論理プランにする。Arity が 1 なら1列であることを要求する。
+with_subplan(Q, Arity, Wrap) ->
+    case analyze(Q) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, {select, Sub}} ->
+            N = length(output_names(Sub)),
+            case Arity =:= any orelse N =:= Arity of
+                false -> {error, {subquery_must_return_one_column, N}};
+                true  -> {ok, Wrap(Sub)}
+            end
+    end.
+
+%%%===================================================================
 %%% 集合演算
 %%%===================================================================
 
@@ -890,6 +907,30 @@ bind_expr(#unop{op = '-', arg = A}, Columns) ->
         %% 型検査で「integerでない」と誤判定してしまう。
         {ok, {const, V}} when is_number(V) -> {ok, {const, -V}};
         {ok, BA} -> {ok, {neg, BA}}
+    end;
+%%----------------------------------------------------------------------
+%% 副問い合わせ。**相関しないものだけ**を扱う。
+%%
+%% 中は独立した問い合わせとして解析する。外側の列は見えないので、
+%% 外を参照していれば「そんな列は無い」で落ちる。相関副問い合わせは
+%% 外側の1行ごとに実行し直す必要があり、別の仕組みになる。
+%%----------------------------------------------------------------------
+bind_expr(#scalar_subquery{query = Q}, _Columns) ->
+    with_subplan(Q, 1, fun(Sub) -> {scalar_subquery, Sub} end);
+bind_expr(#exists_expr{query = Q}, _Columns) ->
+    %% EXISTS は列数を問わない
+    with_subplan(Q, any, fun(Sub) -> {exists_subquery, Sub} end);
+bind_expr(#in_expr{arg = A, values = Vs, query = undefined}, Columns) when Vs =/= undefined ->
+    case bind_all([A | Vs], Columns) of
+        {error, Reason}    -> {error, Reason};
+        {ok, [BA | BVs]}   -> {ok, {in, BA, BVs}}
+    end;
+bind_expr(#in_expr{arg = A, query = Q}, Columns) ->
+    case bind_expr(A, Columns) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, BA} ->
+            with_subplan(Q, 1, fun(Sub) -> {in_subquery, BA, Sub} end)
     end;
 bind_expr(#is_null{arg = A, negated = Neg}, Columns) ->
     case bind_expr(A, Columns) of

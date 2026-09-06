@@ -230,18 +230,18 @@ physical(#lp_filter{pred = P, input = #lp_scan{table = T, schema = Sch}}, Cat) -
     Conjs = conjuncts(P),
     case best_index_path(Conjs, Sch, Indexed, Stats) of
         none ->
-            #p_filter{pred = P, input = #p_seq_scan{table = T, schema = Sch}};
+            #p_filter{pred = pexpr(P, Cat), input = #p_seq_scan{table = T, schema = Sch}};
         {Col, Val, Rest} ->
             %% 索引で使わなかった条件は選択として残す。
             %% **物理の選択を作ること。** 論理の wrap/2 を使うと
             %% 実行器が知らない節点が物理プランに混ざる
-            wrap_phys(conj(Rest),
+            wrap_phys(pexpr(conj(Rest), Cat),
                       #p_index_scan{table = T, schema = Sch, column = Col, value = Val})
     end;
 physical(#lp_scan{table = T, schema = S}, _Cat) ->
     #p_seq_scan{table = T, schema = S};
 physical(#lp_filter{pred = P, input = In}, Cat) ->
-    #p_filter{pred = P, input = physical(In, Cat)};
+    #p_filter{pred = pexpr(P, Cat), input = physical(In, Cat)};
 %% 等値で結べるならハッシュ結合。結べないなら入れ子ループ。
 %%
 %% 入れ子ループは |左|×|右| 回の比較をする。等値の条件が1つでもあれば
@@ -252,18 +252,22 @@ physical(#lp_join{type = Ty, pred = P, left = L, right = R, right_width = W}, Ca
     PR = physical(R, Cat),
     case split_equijoin(conjuncts(P), width(L)) of
         {[], _} ->
-            #p_nl_join{type = Ty, pred = P, left = PL, right = PR, right_width = W};
+            #p_nl_join{type = Ty, pred = pexpr(P, Cat), left = PL, right = PR,
+                       right_width = W};
         {Eqs, Rest} ->
             #p_hash_join{type = Ty,
                          left_keys  = [LE || {LE, _} <- Eqs],
                          right_keys = [RE || {_, RE} <- Eqs],
-                         pred = conj(Rest),
+                         pred = pexpr(conj(Rest), Cat),
                          left = PL, right = PR, right_width = W}
     end;
 physical(#lp_agg{group_by = G, aggs = A, having = H, input = In}, Cat) ->
-    #p_agg{group_by = G, aggs = A, having = H, input = physical(In, Cat)};
+    #p_agg{group_by = [pexpr(E, Cat) || E <- G],
+           aggs = [Ag#agg{arg = pexpr(Ag#agg.arg, Cat)} || Ag <- A],
+           having = pexpr(H, Cat), input = physical(In, Cat)};
 physical(#lp_sort{keys = K, limit = L, input = In}, Cat) ->
-    #p_sort{keys = K, limit = L, input = physical(In, Cat)};
+    #p_sort{keys = [{pexpr(E, Cat), D, N} || {E, D, N} <- K],
+            limit = L, input = physical(In, Cat)};
 physical(#lp_limit{count = C, offset = O, input = In}, Cat) ->
     #p_limit{count = C, offset = O, input = physical(In, Cat)};
 physical(#lp_distinct{input = In}, Cat) ->
@@ -273,7 +277,18 @@ physical(#lp_derived{input = In, schema = S}, Cat) ->
 physical(#lp_setop{op = Op, all = All, left = L, right = R}, Cat) ->
     #p_setop{op = Op, all = All, left = physical(L, Cat), right = physical(R, Cat)};
 physical(#lp_project{exprs = E, names = N, input = In}, Cat) ->
-    #p_project{exprs = E, names = N, input = physical(In, Cat)}.
+    #p_project{exprs = [pexpr(X, Cat) || X <- E], names = N,
+               input = physical(In, Cat)}.
+
+%% 式の中の副問い合わせも物理プランへ変換する。
+%% 変換しないと、実行器が論理プランを渡されて動けない。
+pexpr(E, Cat) ->
+    sql_expr:map_subqueries(
+      fun({scalar_subquery, P})  -> {scalar_subquery, plan(P, Cat)};
+         ({exists_subquery, P})  -> {exists_subquery, plan(P, Cat)};
+         ({in_subquery, A, P})   -> {in_subquery, A, plan(P, Cat)}
+      end, E).
+
 
 %%%===================================================================
 %%% 結合アルゴリズムの選択

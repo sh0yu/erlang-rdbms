@@ -131,6 +131,23 @@
 %% SELECT * の *
 -record(star, {}).
 
+%% 式の中の副問い合わせ。いずれも**相関しない**ものだけを扱う。
+%% 外側の行を参照する副問い合わせは、外側の1行ごとに実行し直す必要があり、
+%% それは別の仕組みになる。
+
+%% スカラー副問い合わせ。(SELECT ...) が1行1列を返すことを要求する。
+-record(scalar_subquery, {query}).
+
+%% EXISTS (SELECT ...)
+-record(exists_expr, {query}).
+
+%% expr IN (v, ...) または expr IN (SELECT ...)
+-record(in_expr, {
+    arg,
+    values,       % [expr()] | undefined
+    query         % 副問い合わせ | undefined
+}).
+
 %% 選択リストの項目に付けた別名。SELECT expr AS name
 -record(aliased, {
     expr,

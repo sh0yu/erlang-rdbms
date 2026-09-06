@@ -288,6 +288,19 @@ format_error(index_already_exists) ->
     "an index with that name already exists";
 format_error(already_indexed) ->
     "that column is already indexed";
+format_error({subquery_must_return_one_column, N}) ->
+    io_lib:format("subquery must return exactly one column, got ~p", [N]);
+format_error({scalar_subquery_returned_rows, N}) ->
+    io_lib:format("scalar subquery returned ~p rows, expected at most one", [N]);
+format_error(derived_table_requires_alias) ->
+    "a derived table needs an alias: FROM (SELECT ...) AS name";
+format_error({set_op_arity_mismatch, L, R}) ->
+    io_lib:format("UNION/INTERSECT/EXCEPT need the same number of columns (~p vs ~p)",
+                  [L, R]);
+format_error(set_op_order_by_must_be_column_or_position) ->
+    "ORDER BY on a set operation must name a result column or its position";
+format_error({order_by_position_out_of_range, N, Max}) ->
+    io_lib:format("ORDER BY ~p is out of range (1..~p)", [N, Max]);
 format_error(explain_requires_select) ->
     "EXPLAIN only works on SELECT";
 format_error({type_mismatch, Col, Type, Value}) ->

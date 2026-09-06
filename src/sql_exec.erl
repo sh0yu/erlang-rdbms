@@ -47,9 +47,18 @@
 %% カラム名を一緒に返すのは、結果セットが「名前つきの列の並び」だから。
 %% クライアントが見出しを出すのに要る。
 %%----------------------------------------------------------------------
-run(Plan, #{scan_open := ScanOpen, scan_next := ScanNext} = Fns) ->
+run(Plan0, #{scan_open := ScanOpen, scan_next := ScanNext} = Fns) ->
     Ctx = #ctx{scan_open = ScanOpen, scan_next = ScanNext,
                index_lookup = maps:get(index_lookup, Fns, undefined)},
+    %% 相関しない副問い合わせは、本体を動かす前に1回だけ実行して
+    %% 定数へ畳む。行ごとに実行し直す必要が無いので。
+    try resolve_subqueries(Plan0, Ctx) of
+        Plan -> run_1(Plan, Ctx)
+    catch
+        throw:{subquery_error, Reason} -> {error, Reason}
+    end.
+
+run_1(Plan, Ctx) ->
     case open(Plan, Ctx) of
         {error, Reason} ->
             {error, Reason};
@@ -348,6 +357,79 @@ nl_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
 
 concat_rows(A, B) ->
     list_to_tuple(tuple_to_list(A) ++ tuple_to_list(B)).
+
+%%%===================================================================
+%%% 副問い合わせの畳み込み
+%%%
+%%% 相関しない副問い合わせは本体の行に依存しないので、1回実行して
+%%% 定数に置き換える。行ごとに実行し直す必要が無い。
+%%%===================================================================
+
+resolve_subqueries(Node, Ctx) ->
+    map_node_exprs(fun(E) -> resolve_expr(E, Ctx) end, Node, Ctx).
+
+resolve_expr(E, Ctx) ->
+    sql_expr:map_subqueries(
+      fun({scalar_subquery, P})  -> {const, scalar_value(P, Ctx)};
+         ({exists_subquery, P})  -> {const, sub_rows(P, Ctx) =/= []};
+         ({in_subquery, A, P})   -> {in, A, [{const, V} || [V] <- sub_lists(P, Ctx)]}
+      end, E).
+
+%% スカラー副問い合わせは1行1列でなければならない。
+%% 0行なら NULL(標準SQL)。2行以上はエラー。
+scalar_value(P, Ctx) ->
+    case sub_lists(P, Ctx) of
+        []       -> null;
+        [[V]]    -> V;
+        Rows     -> throw({subquery_error, {scalar_subquery_returned_rows, length(Rows)}})
+    end.
+
+sub_rows(P, Ctx) -> sub_lists(P, Ctx).
+
+sub_lists(P, Ctx) ->
+    %% 副問い合わせの中にも副問い合わせがありうる
+    Plan = resolve_subqueries(P, Ctx),
+    case open(Plan, Ctx) of
+        {error, Reason} ->
+            throw({subquery_error, Reason});
+        Op ->
+            try
+                {ok, Rows} = drain(Op, []),
+                [to_list(R) || R <- Rows]
+            after
+                close(Op)
+            end
+    end.
+
+%% プランの各節点が持つ式に F を当てる。副問い合わせが現れうるのは
+%% WHERE / ON / HAVING / GROUP BY / ORDER BY / 選択リスト。
+map_node_exprs(F, #p_filter{pred = P, input = In} = N, Ctx) ->
+    N#p_filter{pred = F(P), input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_nl_join{pred = P, left = L, right = R} = N, Ctx) ->
+    N#p_nl_join{pred = F(P), left = map_node_exprs(F, L, Ctx),
+                right = map_node_exprs(F, R, Ctx)};
+map_node_exprs(F, #p_hash_join{pred = P, left = L, right = R} = N, Ctx) ->
+    N#p_hash_join{pred = F(P), left = map_node_exprs(F, L, Ctx),
+                  right = map_node_exprs(F, R, Ctx)};
+map_node_exprs(F, #p_agg{group_by = G, aggs = A, having = H, input = In} = N, Ctx) ->
+    N#p_agg{group_by = [F(E) || E <- G],
+            aggs = [Ag#agg{arg = F(Ag#agg.arg)} || Ag <- A],
+            having = F(H), input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_sort{keys = K, input = In} = N, Ctx) ->
+    N#p_sort{keys = [{F(E), D, Nu} || {E, D, Nu} <- K],
+             input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_limit{input = In} = N, Ctx) ->
+    N#p_limit{input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_distinct{input = In} = N, Ctx) ->
+    N#p_distinct{input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_project{exprs = E, input = In} = N, Ctx) ->
+    N#p_project{exprs = [F(X) || X <- E], input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_derived{input = In} = N, Ctx) ->
+    N#p_derived{input = map_node_exprs(F, In, Ctx)};
+map_node_exprs(F, #p_setop{left = L, right = R} = N, Ctx) ->
+    N#p_setop{left = map_node_exprs(F, L, Ctx), right = map_node_exprs(F, R, Ctx)};
+map_node_exprs(_F, Leaf, _Ctx) ->
+    Leaf.
 
 %%%===================================================================
 %%% 集合演算

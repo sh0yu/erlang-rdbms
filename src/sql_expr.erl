@@ -20,7 +20,7 @@
 %%%-------------------------------------------------------------------
 -module(sql_expr).
 
--export([eval/2, eval_pred/2]).
+-export([eval/2, eval_pred/2, map_subqueries/2]).
 
 %%----------------------------------------------------------------------
 %% @doc 式を1行に対して評価する。Row は行タプル。
@@ -41,6 +41,23 @@ eval({neg, E}, Row) ->
     sql_value:arith('-', 0, eval(E, Row));
 eval({arith, Op, L, R}, Row) ->
     sql_value:arith(Op, eval(L, Row), eval(R, Row));
+%% x IN (...) の3値論理。
+%%   x が NULL          → unknown
+%%   一致がある         → true
+%%   一致が無くNULL有り → unknown(そのNULLが x かもしれない)
+%%   一致が無くNULL無し → false
+eval({in, A, Exprs}, Row) ->
+    case eval(A, Row) of
+        null -> null;
+        V    -> in_truth(V, [eval(E, Row) || E <- Exprs])
+    end;
+%% 副問い合わせは実行前に定数へ畳まれている。ここに来たら組み立ての誤り。
+eval({scalar_subquery, _}, _Row) ->
+    error(unresolved_subquery);
+eval({exists_subquery, _}, _Row) ->
+    error(unresolved_subquery);
+eval({in_subquery, _, _}, _Row) ->
+    error(unresolved_subquery);
 eval({is_null, E}, Row) ->
     sql_value:is_null(eval(E, Row));
 eval({is_not_null, E}, Row) ->
@@ -50,6 +67,19 @@ eval({is_not_null, E}, Row) ->
 %% @doc 述語として評価し、行を通すかどうかを返す。
 %% NULL(unknown)は false と同じく通さない。
 %%----------------------------------------------------------------------
+in_truth(_V, []) ->
+    false;
+in_truth(V, Vals) ->
+    case lists:any(fun(X) -> sql_value:compare(V, X) =:= eq end, Vals) of
+        true ->
+            true;
+        false ->
+            case lists:member(null, Vals) of
+                true  -> null;
+                false -> false
+            end
+    end.
+
 eval_pred(undefined, _Row) ->
     true;
 eval_pred(Expr, Row) ->
@@ -70,3 +100,33 @@ comp_result('>',  gt) -> true;
 comp_result('>',  _)  -> false;
 comp_result('>=', lt) -> false;
 comp_result('>=', _)  -> true.
+
+
+%%%===================================================================
+%%% 副問い合わせ節点の走査
+%%%
+%%% プランナ(論理→物理の変換)と実行器(定数への畳み込み)の両方が
+%%% 式の中の副問い合わせを触る。式の形を知っているのはこのモジュールなので、
+%%% 走査だけをここに置いて共有する。
+%%%===================================================================
+
+%%----------------------------------------------------------------------
+%% @doc 式の中の副問い合わせ節点に F を当てる。
+%% F は節点を受け取り、置き換える式を返す。
+%%----------------------------------------------------------------------
+map_subqueries(F, {scalar_subquery, _} = E) -> F(E);
+map_subqueries(F, {exists_subquery, _} = E) -> F(E);
+map_subqueries(F, {in_subquery, A, P})      -> F({in_subquery, map_subqueries(F, A), P});
+map_subqueries(F, {in, A, Es})              -> {in, map_subqueries(F, A),
+                                                [map_subqueries(F, E) || E <- Es]};
+map_subqueries(F, {comp, Op, L, R})         -> {comp, Op, map_subqueries(F, L),
+                                                map_subqueries(F, R)};
+map_subqueries(F, {arith, Op, L, R})        -> {arith, Op, map_subqueries(F, L),
+                                                map_subqueries(F, R)};
+map_subqueries(F, {'and', Es})              -> {'and', [map_subqueries(F, E) || E <- Es]};
+map_subqueries(F, {'or', Es})               -> {'or', [map_subqueries(F, E) || E <- Es]};
+map_subqueries(F, {'not', E})               -> {'not', map_subqueries(F, E)};
+map_subqueries(F, {neg, E})                 -> {neg, map_subqueries(F, E)};
+map_subqueries(F, {is_null, E})             -> {is_null, map_subqueries(F, E)};
+map_subqueries(F, {is_not_null, E})         -> {is_not_null, map_subqueries(F, E)};
+map_subqueries(_F, E)                       -> E.

@@ -20,6 +20,11 @@ Rules.
 {D}+\.{D}+          : {token, {float_lit, TokenLine, list_to_float(TokenChars)}}.
 {D}+                : {token, {int_lit, TokenLine, list_to_integer(TokenChars)}}.
 '([^']|'')*'        : {token, {string_lit, TokenLine, unquote(TokenChars)}}.
+%% NOT IN は1つのトークンにする。
+%% 2語のままだと、`expr` の後に `not` が来たときに
+%% 「左の expr を還元するか not を読み進めるか」が1トークン先読みでは
+%% 決まらず、yecc が shift/reduce 衝突を出す。
+[Nn][Oo][Tt]{WS}+[Ii][Nn]  : {token, {'not_in', TokenLine}}.
 {L}{A}*             : {token, keyword_or_identifier(TokenChars, TokenLine)}.
 ,                   : {token, {',', TokenLine}}.
 \*                  : {token, {'*', TokenLine}}.
@@ -61,6 +66,11 @@ keywords() ->
      "group", "having",
      "explain", "index", "analyze", "read", "only",
      "union", "intersect", "except", "all",
+     "in", "exists",
+     %% RIGHT / FULL は未実装だが予約語にしておく。
+     %% さもないと `t RIGHT JOIN u` が「t に right という別名を付けた
+     %% 内部結合」として黙って通り、意味が変わったことに気づけない。
+     "right", "full",
      "join", "inner", "left", "outer", "cross", "on", "as"].
 
 keyword_or_identifier(Chars, Line) ->

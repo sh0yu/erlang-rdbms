@@ -126,9 +126,18 @@ string_literal_does_not_match_atom(_) ->
 unsupported_syntax_is_reported(_) ->
     fun() ->
         C = fixture(),
-        %% 副問い合わせ
+        %% BETWEEN
         ?assertMatch({error, {syntax_error, _, _}},
-                     q(C, "SELECT * FROM fruit WHERE price = (SELECT price FROM fruit)"))
+                     q(C, "SELECT * FROM fruit WHERE price BETWEEN 1 AND 2")),
+        %% ALTER TABLE
+        ?assertMatch({error, {syntax_error, _, _}},
+                     q(C, "ALTER TABLE fruit ADD COLUMN c INTEGER")),
+        %% RIGHT / FULL OUTER JOIN。予約語にしてあるので、
+        %% 「right という別名の内部結合」として黙って通らない
+        ?assertEqual({error, {syntax_error, 1, "RIGHT JOIN is not supported"}},
+                     q(C, "SELECT * FROM fruit RIGHT JOIN fruit f2 ON 1 = 1")),
+        ?assertEqual({error, {syntax_error, 1, "FULL OUTER JOIN is not supported"}},
+                     q(C, "SELECT * FROM fruit FULL OUTER JOIN fruit f2 ON 1 = 1"))
     end.
 
 %%%===================================================================

@@ -50,7 +50,8 @@ Terminals
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
     'group' 'having' 'explain' 'index' 'analyze' 'read' 'only'
-    'union' 'intersect' 'except' 'all'
+    'union' 'intersect' 'except' 'all' 'in' 'exists' 'not_in'
+    'right' 'full'
     'join' 'inner' 'left' 'outer' 'cross' 'on' 'as' '.'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
@@ -76,6 +77,7 @@ Left  100 'or'.
 Left  200 'and'.
 Unary 300 'not'.
 Nonassoc 400 'is'.
+Nonassoc 450 'in' 'not_in'.
 Nonassoc 500 '=' '<>' '<' '<=' '>' '>='.
 Left  600 '+' '-'.
 Left  700 '*' '/'.
@@ -284,6 +286,11 @@ join_kw -> 'join'                   : inner.
 join_kw -> 'inner' 'join'           : inner.
 join_kw -> 'left' 'join'            : left.
 join_kw -> 'left' 'outer' 'join'    : left.
+%% 未実装だが、黙って別の意味に取られるよりは理由を言って落ちる方がよい。
+join_kw -> 'right' 'join'           : unsupported_join('$1', "RIGHT JOIN").
+join_kw -> 'right' 'outer' 'join'   : unsupported_join('$1', "RIGHT OUTER JOIN").
+join_kw -> 'full' 'join'            : unsupported_join('$1', "FULL JOIN").
+join_kw -> 'full' 'outer' 'join'    : unsupported_join('$1', "FULL OUTER JOIN").
 
 table_ref -> identifier opt_alias :
     #table_ref{name = value_of('$1'), alias = '$2'}.
@@ -306,6 +313,20 @@ opt_where -> where expr  : '$2'.
 %%%===================================================================
 %%% 式
 %%%===================================================================
+
+%%%-------------------------------------------------------------------
+%%% 副問い合わせを含む式。
+%%%
+%%% `(` の後に select が来るかどうかで、括弧つきの式と区別できる。
+%%%-------------------------------------------------------------------
+expr -> '(' query ')' : #scalar_subquery{query = '$2'}.
+expr -> 'exists' '(' query ')' : #exists_expr{query = '$3'}.
+expr -> expr 'in' '(' expr_list ')' : #in_expr{arg = '$1', values = '$4'}.
+expr -> expr 'in' '(' query ')' : #in_expr{arg = '$1', query = '$4'}.
+expr -> expr 'not_in' '(' expr_list ')' :
+    #unop{op = 'not', arg = #in_expr{arg = '$1', values = '$4'}}.
+expr -> expr 'not_in' '(' query ')' :
+    #unop{op = 'not', arg = #in_expr{arg = '$1', query = '$4'}}.
 
 expr -> expr 'or' expr   : #binop{op = 'or',  left = '$1', right = '$3'}.
 expr -> expr 'and' expr  : #binop{op = 'and', left = '$1', right = '$3'}.
@@ -366,6 +387,10 @@ Erlang code.
 
 %% leexのトークンは {Type, Line, Value} または {Type, Line}
 value_of({_Type, _Line, Value}) -> Value.
+
+-spec unsupported_join(tuple(), string()) -> no_return().
+unsupported_join({_Tok, Line}, What) ->
+    return_error(Line, What ++ " is not supported").
 
 %% 末尾の ORDER BY / LIMIT を問い合わせ式に付ける。
 %% 単一のSELECTなら #select_stmt{} に、集合演算なら #set_op_stmt{} に付く。
