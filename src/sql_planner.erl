@@ -234,9 +234,24 @@ physical(#lp_scan{table = T, schema = S}, _Cat) ->
     #p_seq_scan{table = T, schema = S};
 physical(#lp_filter{pred = P, input = In}, Cat) ->
     #p_filter{pred = P, input = physical(In, Cat)};
+%% 等値で結べるならハッシュ結合。結べないなら入れ子ループ。
+%%
+%% 入れ子ループは |左|×|右| 回の比較をする。等値の条件が1つでもあれば
+%% ハッシュ表で |左|+|右| に落ちる。右側はどちらの方式でも
+%% メモリに載せるので、使うメモリは変わらない。
 physical(#lp_join{type = Ty, pred = P, left = L, right = R, right_width = W}, Cat) ->
-    #p_nl_join{type = Ty, pred = P, left = physical(L, Cat), right = physical(R, Cat),
-               right_width = W};
+    PL = physical(L, Cat),
+    PR = physical(R, Cat),
+    case split_equijoin(conjuncts(P), width(L)) of
+        {[], _} ->
+            #p_nl_join{type = Ty, pred = P, left = PL, right = PR, right_width = W};
+        {Eqs, Rest} ->
+            #p_hash_join{type = Ty,
+                         left_keys  = [LE || {LE, _} <- Eqs],
+                         right_keys = [RE || {_, RE} <- Eqs],
+                         pred = conj(Rest),
+                         left = PL, right = PR, right_width = W}
+    end;
 physical(#lp_agg{group_by = G, aggs = A, having = H, input = In}, Cat) ->
     #p_agg{group_by = G, aggs = A, having = H, input = physical(In, Cat)};
 physical(#lp_sort{keys = K, limit = L, input = In}, Cat) ->
@@ -247,6 +262,35 @@ physical(#lp_distinct{input = In}, Cat) ->
     #p_distinct{input = physical(In, Cat)};
 physical(#lp_project{exprs = E, names = N, input = In}, Cat) ->
     #p_project{exprs = E, names = N, input = physical(In, Cat)}.
+
+%%%===================================================================
+%%% 結合アルゴリズムの選択
+%%%===================================================================
+
+%%----------------------------------------------------------------------
+%% 条件を「等値で左右を結ぶもの」と「それ以外」に分ける。
+%%
+%% 右側の式は右側単体の位置に直す。結合後の行では右のカラムが
+%% 左の幅だけずれているが、ハッシュ表を作るときに評価するのは
+%% **右側だけの行**なので、そのままでは別のカラムを見る。
+%%----------------------------------------------------------------------
+split_equijoin(Conjs, LW) ->
+    lists:foldr(
+      fun(C, {Eqs, Rest}) ->
+              case equijoin(C, LW) of
+                  {ok, LE, RE} -> {[{LE, RE} | Eqs], Rest};
+                  no           -> {Eqs, [C | Rest]}
+              end
+      end, {[], []}, Conjs).
+
+equijoin({comp, '=', A, B}, LW) ->
+    case {side(A, LW), side(B, LW)} of
+        {left, right} -> {ok, A, shift(B, -LW)};
+        {right, left} -> {ok, B, shift(A, -LW)};
+        _             -> no
+    end;
+equijoin(_Other, _LW) ->
+    no.
 
 %%%===================================================================
 %%% アクセスパスの選択

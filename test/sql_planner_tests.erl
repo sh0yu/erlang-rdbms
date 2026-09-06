@@ -15,7 +15,8 @@ planner_test_() ->
     {foreach, fun db_test_helper:start_db/0, fun db_test_helper:stop_db/1,
      [fun scan_maps_to_seq_scan/1,
       fun filter_and_project_pass_through/1,
-      fun join_maps_to_nested_loop/1,
+      fun equijoin_maps_to_hash_join/1,
+      fun non_equijoin_maps_to_nested_loop/1,
       fun agg_sort_limit_distinct_pass_through/1,
       fun single_table_filter_is_unchanged/1,
       fun pushdown_splits_across_inner_join/1,
@@ -56,14 +57,27 @@ filter_and_project_pass_through(_) ->
                      plan("SELECT name FROM emp WHERE id = 1"))
     end.
 
-join_maps_to_nested_loop(_) ->
+%% 等値で結べるならハッシュ結合。|左|×|右| が |左|+|右| に落ちる。
+equijoin_maps_to_hash_join(_) ->
     fun() ->
         seed(),
         P = plan("SELECT e.name, d.dname FROM emp e JOIN dept d ON e.dept = d.id"),
-        ?assertMatch(#p_project{input = #p_nl_join{type = inner,
-                                                   left = #p_seq_scan{table = emp},
-                                                   right = #p_seq_scan{table = dept}}},
-                     P)
+        ?assertMatch(#p_project{input = #p_hash_join{type = inner,
+                                                     left = #p_seq_scan{table = emp},
+                                                     right = #p_seq_scan{table = dept}}},
+                     P),
+        #p_project{input = HJ} = P,
+        %% 右側の鍵は右側単体の位置。結合後の位置(4)ではなく 1
+        ?assertEqual([{ref, 3}], HJ#p_hash_join.left_keys),
+        ?assertEqual([{ref, 1}], HJ#p_hash_join.right_keys)
+    end.
+
+%% 等値でなければ入れ子ループのまま。
+non_equijoin_maps_to_nested_loop(_) ->
+    fun() ->
+        seed2(),
+        P = plan("SELECT e.name FROM emp e JOIN dept d ON e.sal < d.budget"),
+        ?assertMatch(#p_project{input = #p_nl_join{type = inner}}, P)
     end.
 
 agg_sort_limit_distinct_pass_through(_) ->
@@ -93,7 +107,7 @@ pushdown_splits_across_inner_join(_) ->
     fun() ->
         seed2(),
         ?assertEqual([<<"Project (name, dname)">>,
-                      <<"  Nested Loop INNER Join on (dept = id)">>,
+                      <<"  Hash INNER Join on dept = id">>,
                       <<"    Filter (sal > 100)">>,
                       <<"      Seq Scan on emp">>,
                       <<"    Filter (budget < 900)">>,
@@ -109,7 +123,7 @@ pushdown_shifts_positions_to_right_side(_) ->
         seed2(),
         P = plan("SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id "
                  "WHERE d.budget < 900"),
-        #p_project{input = #p_nl_join{right = Right}} = P,
+        #p_project{input = #p_hash_join{right = Right}} = P,
         %% dept の budget は dept 単体では3番目。結合後は 4+3=7番目。
         ?assertMatch(#p_filter{pred = {comp, '<', {ref, 3}, {const, 900}}}, Right)
     end.
@@ -121,7 +135,7 @@ left_join_where_on_null_side_stays_above(_) ->
         seed2(),
         ?assertEqual([<<"Project (name, dname)">>,
                       <<"  Filter (budget < 900)">>,
-                      <<"    Nested Loop LEFT Join on (dept = id)">>,
+                      <<"    Hash LEFT Join on dept = id">>,
                       <<"      Seq Scan on emp">>,
                       <<"      Seq Scan on dept">>],
                      lines("SELECT e.name, d.dname FROM emp e LEFT JOIN dept d "
@@ -134,7 +148,7 @@ left_join_on_condition_on_null_side_is_pushed(_) ->
     fun() ->
         seed2(),
         ?assertEqual([<<"Project (name)">>,
-                      <<"  Nested Loop LEFT Join on (dept = id)">>,
+                      <<"  Hash LEFT Join on dept = id">>,
                       <<"    Seq Scan on emp">>,
                       <<"    Filter (budget < 900)">>,
                       <<"      Seq Scan on dept">>],
@@ -148,7 +162,7 @@ left_join_on_condition_on_preserved_side_stays(_) ->
     fun() ->
         seed2(),
         ?assertEqual([<<"Project (name)">>,
-                      <<"  Nested Loop LEFT Join on ((dept = id) AND (sal > 100))">>,
+                      <<"  Hash LEFT Join on dept = id filter (sal > 100)">>,
                       <<"    Seq Scan on emp">>,
                       <<"    Seq Scan on dept">>],
                      lines("SELECT e.name FROM emp e LEFT JOIN dept d "
@@ -163,7 +177,7 @@ cross_predicate_joins_the_on_clause(_) ->
         L = lines("SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id "
                   "WHERE e.sal < d.budget"),
         ?assertEqual([<<"Project (name)">>,
-                      <<"  Nested Loop INNER Join on ((dept = id) AND (sal < budget))">>,
+                      <<"  Hash INNER Join on dept = id filter (sal < budget)">>,
                       <<"    Seq Scan on emp">>,
                       <<"    Seq Scan on dept">>], L)
     end.

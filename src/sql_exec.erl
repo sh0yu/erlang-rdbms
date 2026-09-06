@@ -155,6 +155,26 @@ open(#p_nl_join{type = Type, pred = Pred, left = L, right = R, right_width = W},
             end
     end;
 %% 集約もブロッキング演算子。入力を読み切ってグループごとにまとめる。
+%% ハッシュ結合。右側でハッシュ表を作り、左側で引く。
+open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
+                  left = L, right = R, right_width = W}, Ctx) ->
+    case open(L, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        Left ->
+            case open(R, Ctx) of
+                {error, Reason} ->
+                    {error, Reason};
+                Right ->
+                    {ok, Rows} = collect(Right, []),
+                    close(Right),
+                    #op{kind = hash_join,
+                        st = #{type => Type, pred => Pred, left => Left,
+                               table => build_hash(Rows, RK), lkeys => LK,
+                               rest => [], cur => undefined,
+                               matched => false, width => W}}
+            end
+    end;
 open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} ->
@@ -229,6 +249,9 @@ next(#op{kind = filter, st = {Pred, Child}} = Op) ->
 next(#op{kind = nl_join, st = St} = Op) ->
     nl_next(Op, St);
 
+next(#op{kind = hash_join, st = St} = Op) ->
+    hj_next(Op, St);
+
 %% 並べ替え済みの行を1件ずつ返す
 next(#op{kind = sorted, st = []} = Op) ->
     {eof, Op};
@@ -290,6 +313,68 @@ nl_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
 
 concat_rows(A, B) ->
     list_to_tuple(tuple_to_list(A) ++ tuple_to_list(B)).
+
+%%%===================================================================
+%%% ハッシュ結合
+%%%===================================================================
+
+%% 右側の行を鍵で束ねる。
+%%
+%% **鍵にNULLを含む行は入れない。** NULL = NULL は unknown なので
+%% 決して一致しない。ハッシュ表に入れると NULL 同士が衝突して
+%% 一致してしまう。
+build_hash(Rows, Keys) ->
+    Table = lists:foldl(
+              fun(Row, Acc) ->
+                      case join_key(Keys, Row) of
+                          null -> Acc;
+                          K    -> maps:update_with(K, fun(L) -> [Row | L] end,
+                                                   [Row], Acc)
+                      end
+              end, #{}, Rows),
+    %% 入れ子ループと同じ順序で返すために積み直す
+    maps:map(fun(_K, V) -> lists:reverse(V) end, Table).
+
+%% 鍵の値。NULLが1つでもあれば null(一致しない)。
+%%
+%% 値は sql_value:group_key/1 で正規化する。素の項を鍵にすると
+%% 100 と 100.0 が別の鍵になるが、SQLの `=` では等しい。
+join_key(Exprs, Row) -> join_key(Exprs, Row, []).
+
+join_key([], _Row, Acc) ->
+    lists:reverse(Acc);
+join_key([E | T], Row, Acc) ->
+    case sql_expr:eval(E, Row) of
+        null -> null;
+        V    -> join_key(T, Row, [sql_value:group_key(V) | Acc])
+    end.
+
+%% 状態遷移は入れ子ループと同じ。違うのは、右側の候補を
+%% 全件ではなくハッシュ表から取ってくるところだけ。
+hj_next(Op, #{cur := undefined, left := Left, lkeys := LK, table := Tab} = St) ->
+    case next(Left) of
+        {eof, Left2} ->
+            {eof, Op#op{st = St#{left => Left2}}};
+        {row, Row, Left2} ->
+            Matches = case join_key(LK, Row) of
+                          null -> [];
+                          K    -> maps:get(K, Tab, [])
+                      end,
+            hj_next(Op, St#{left => Left2, cur => Row,
+                            rest => Matches, matched => false})
+    end;
+hj_next(Op, #{rest := [], type := left, matched := false,
+              cur := Cur, width := W} = St) ->
+    Padded = list_to_tuple(tuple_to_list(Cur) ++ lists:duplicate(W, null)),
+    {row, Padded, Op#op{st = St#{cur => undefined, matched => true}}};
+hj_next(Op, #{rest := []} = St) ->
+    hj_next(Op, St#{cur => undefined});
+hj_next(Op, #{rest := [R | Rest], cur := Cur, pred := Pred} = St) ->
+    Joined = concat_rows(Cur, R),
+    case sql_expr:eval_pred(Pred, Joined) of
+        true  -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true}}};
+        false -> hj_next(Op, St#{rest => Rest})
+    end.
 
 limit_next(#op{st = {0, _Offset, _Child}} = Op) ->
     {eof, Op};
@@ -404,6 +489,8 @@ close(#op{kind = limit, st = {_C, _O, Child}}) ->
 close(#op{kind = distinct, st = {_Seen, Child}}) ->
     close(Child);
 close(#op{kind = nl_join, st = #{left := Left}}) ->
+    close(Left);
+close(#op{kind = hash_join, st = #{left := Left}}) ->
     close(Left);
 close({error, _}) ->
     ok.

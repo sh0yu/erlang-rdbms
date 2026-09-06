@@ -46,6 +46,24 @@
     right_width = 0     % LEFT JOIN で埋めるNULLの個数
 }).
 
+%% ハッシュ結合(⋈)。等値で結べるときに使う。
+%%
+%% 右側でハッシュ表を作り、左側で引く。入れ子ループが
+%% |左|×|右| 回の比較をするのに対し、|左|+|右| で済む。
+%%
+%% left_keys / right_keys は、それぞれの側の**行に対して**評価する式。
+%% right_keys は右側単体の位置に直してある(結合後の位置ではない)。
+%% pred は等値以外の残りの条件で、一致した組に対して評価する。
+-record(p_hash_join, {
+    type = inner,
+    left_keys = [],
+    right_keys = [],
+    pred = undefined,
+    left,
+    right,
+    right_width = 0
+}).
+
 %% 集約(γ)。
 %% 出力行は [グループキー..., 集約結果...] の順に並ぶ。
 %% having は集約後の行に対する述語。

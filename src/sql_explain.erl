@@ -32,6 +32,7 @@ children(#p_seq_scan{})                    -> [];
 children(#p_index_scan{})                  -> [];
 children(#p_filter{input = In})            -> [In];
 children(#p_nl_join{left = L, right = R})  -> [L, R];
+children(#p_hash_join{left = L, right = R}) -> [L, R];
 children(#p_agg{input = In})               -> [In];
 children(#p_sort{input = In})              -> [In];
 children(#p_limit{input = In})             -> [In];
@@ -54,6 +55,16 @@ label(#p_nl_join{type = Ty, pred = P, left = L, right = R}) ->
      case P of
          undefined -> "";
          _ -> [" on ", expr(P, S)]
+     end];
+label(#p_hash_join{type = Ty, left_keys = LK, right_keys = RK, pred = P,
+                   left = L, right = R}) ->
+    LS = schema(L),
+    RS = schema(R),
+    Keys = [[expr(LE, LS), " = ", expr(RE, RS)] || {LE, RE} <- lists:zip(LK, RK)],
+    ["Hash ", string:uppercase(atom_to_list(Ty)), " Join on ", commas(Keys),
+     case P of
+         undefined -> "";
+         _ -> [" filter ", expr(P, LS ++ RS)]
      end];
 label(#p_agg{group_by = G, aggs = A, having = H, input = In}) ->
     S = schema(In),
@@ -108,6 +119,7 @@ schema(#p_seq_scan{schema = S})                -> S;
 schema(#p_index_scan{schema = S})              -> S;
 schema(#p_filter{input = In})                  -> schema(In);
 schema(#p_nl_join{left = L, right = R})        -> schema(L) ++ schema(R);
+schema(#p_hash_join{left = L, right = R})      -> schema(L) ++ schema(R);
 schema(#p_agg{group_by = G, aggs = A, input = In}) -> group_schema(G, A, schema(In));
 schema(#p_sort{input = In})                    -> schema(In);
 schema(#p_limit{input = In})                   -> schema(In);

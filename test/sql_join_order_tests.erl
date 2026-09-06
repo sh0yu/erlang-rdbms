@@ -23,9 +23,10 @@ smallest_table_goes_first(_) ->
     fun() ->
         C = seeded(),
         {ok, _} = q(C, "ANALYZE"),
+        %% 鍵の左右も入れ替わる(左が small/mid 側になるため)
         ?assertEqual([<<"Project (id)">>,
-                      <<"  Nested Loop INNER Join on (m = id)">>,
-                      <<"    Nested Loop INNER Join on (s = id)">>,
+                      <<"  Hash INNER Join on id = m">>,
+                      <<"    Hash INNER Join on id = s">>,
                       <<"      Seq Scan on small">>,
                       <<"      Seq Scan on mid">>,
                       <<"    Seq Scan on big">>],
@@ -39,8 +40,8 @@ written_order_is_kept_without_stats(_) ->
     fun() ->
         C = seeded(),
         ?assertEqual([<<"Project (id)">>,
-                      <<"  Nested Loop INNER Join on (s = id)">>,
-                      <<"    Nested Loop INNER Join on (m = id)">>,
+                      <<"  Hash INNER Join on s = id">>,
+                      <<"    Hash INNER Join on m = id">>,
                       <<"      Seq Scan on big">>,
                       <<"      Seq Scan on mid">>,
                       <<"    Seq Scan on small">>],
@@ -67,7 +68,7 @@ two_tables_are_not_reordered(_) ->
         C = seeded(),
         {ok, _} = q(C, "ANALYZE"),
         ?assertEqual([<<"Project (id)">>,
-                      <<"  Nested Loop INNER Join on (m = id)">>,
+                      <<"  Hash INNER Join on m = id">>,
                       <<"    Seq Scan on big">>,
                       <<"    Seq Scan on mid">>],
                      plan(C, "SELECT big.id FROM big JOIN mid ON big.m = mid.id"))
