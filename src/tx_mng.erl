@@ -2,10 +2,17 @@
 %%% @doc
 %%% トランザクション管理。
 %%%
-%%% 直列化の方針: 同時にactiveになれるトランザクションは1つだけ。
-%%% begin_txした順(タイムスタンプ順)に1つずつactiveにしていき、
-%%% activeでないトランザクションからのallow_txは、自分の順番が来るまで
-%%% ブロックする。これにより全トランザクションが直列に実行される。
+%%% トランザクションは**並行に走る**。分離は tx_mng ではなく、
+%%%   * 読み: snapshot_mng のスナップショットと undo
+%%%   * 書き: lock_mng の行ロックと、コミット直前の衝突検査
+%%% が担う。
+%%%
+%%% 以前はここが同時に1本しか active にせず、全トランザクションを
+%%% 直列に実行していた。読みロックを取らない走査でも安全だったのは
+%%% その直列化のおかげで、スナップショットが入るまでは外せなかった。
+%%%
+%%% DDL だけは今も直列で、`commit_latch` の排他ラッチで囲う。
+%%% カタログの UNDO が無く、走査中に表が落ちると読み手が壊れるため。
 %%%
 %%% トランザクションを開始したプロセスはmonitorする。異常終了した場合は
 %%% そのトランザクションをabortして次のトランザクションに順番を渡す。
@@ -48,7 +55,10 @@ commit_tx(Pid, Txid) ->
     gen_server:call(Pid, {commit_tx, Txid}).
 
 %%----------------------------------------------------------------------
-%% @doc 自分のトランザクションの順番が来るまで待つ。
+%% @doc 自分のトランザクションがまだ生きているかを確かめる。
+%%
+%% 直列だった頃は「順番が来るまで待つ」関数だった。いまは待たない。
+%% 名前と戻り値は呼び出し側の都合で残してある。
 %% Returns: ok | transaction_not_found
 %%----------------------------------------------------------------------
 allow_tx(Pid, Txid) ->
@@ -149,28 +159,11 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Transaction mng functions
 %%%===================================================================
 
-%% 新規トランザクションを登録して、可能ならactiveにする。
+%% 新規トランザクションを登録する。順番待ちは無く、すぐ active。
 register_tx(Txid, Owner) ->
     Ref = monitor(process, Owner),
-    ets:insert(ms_tx_mng, {Txid, db_id:timestamp(Txid), inactive, Owner, Ref}),
-    activate_tx().
-
-%% activeなトランザクションが1つもない場合に限り、
-%% inactiveのうち一番古いものをactiveにして、待っているプロセスに通知する。
-activate_tx() ->
-    case ets:match_object(ms_tx_mng, {'_', '_', active, '_', '_'}) of
-        [] ->
-            case ets:match_object(ms_tx_mng, {'_', '_', inactive, '_', '_'}) of
-                [] ->
-                    no_transaction_waiting;
-                InactiveTxList ->
-                    {OldestTxid, Timestamp, _Status, Owner, Ref} = get_oldest_tx(InactiveTxList),
-                    ets:insert(ms_tx_mng, {OldestTxid, Timestamp, active, Owner, Ref}),
-                    notify_tx_active(OldestTxid)
-            end;
-        _ ->
-            transaction_not_acquired
-    end.
+    ets:insert(ms_tx_mng, {Txid, db_id:timestamp(Txid), active, Owner, Ref}),
+    notify_tx_active(Txid).
 
 %% トランザクションを終了させ、次のトランザクションに順番を渡す。
 %% 終了したトランザクションは管理表から消す。残しておくと
@@ -178,7 +171,6 @@ activate_tx() ->
 finish_tx(Txid, _Status) ->
     case ets:lookup(ms_tx_mng, Txid) of
         [] ->
-            _ = activate_tx(),
             transaction_not_found;
         [{Txid, _Timestamp, _OldStatus, _Owner, Ref}] ->
             _ = demonitor(Ref, [flush]),
@@ -191,22 +183,11 @@ finish_tx(Txid, _Status) ->
                 [] ->
                     ok
             end,
-            %% このトランザクションが握っていたロックを解放する
+            %% このトランザクションが握っていたロックを解放する。
+            %% 待っている書き手はここで進む。
             _ = lock_mng:release_lock(whereis(lock_mng), Txid),
-            _ = activate_tx(),
             ok
     end.
-
-%% トランザクションのリストから一番古いものを返す。
-%% Txidは {採番時刻, 単調増加の整数} なので、タプルの比較が採番順と一致する。
-%% 同じナノ秒に開始した2つを区別するため、時刻だけでなくTxid全体で比べる。
-get_oldest_tx([H | T]) ->
-    lists:foldl(fun({Txid, _, _, _, _} = Tx, {OTxid, _, _, _, _} = Oldest) ->
-                        case Txid < OTxid of
-                            true -> Tx;
-                            false -> Oldest
-                        end
-                end, H, T).
 
 %% トランザクションがactiveの場合のみtrue。
 is_active_tx(Txid) ->

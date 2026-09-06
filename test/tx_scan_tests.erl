@@ -122,18 +122,13 @@ does_not_see_other_uncommitted_rows(_) ->
         _ = q(C1, {begin_tx}),
         {ok, _} = q(C1, {insert, fruit, [banana, 200]}),
 
+        %% C2 は待たない。C1 の未コミットの挿入は見えない
         C2 = connect(),
-        Self = self(),
-        spawn_link(fun() ->
-                           _ = q(C2, {begin_tx}),
-                           Self ! {c2, q(C2, {scan, fruit})},
-                           ok = q(C2, {commit_tx})
-                   end),
-        %% C1がコミットするまでC2は進めない(トランザクションは直列)
-        ?assertEqual(timeout, recv(300)),
+        _ = q(C2, {begin_tx}),
+        ?assertEqual([[apple, 100]], q(C2, {scan, fruit})),
         ok = q(C1, {rollback_tx}),
-        %% ロールバックしたのでbananaは見えない
-        ?assertEqual({c2, [[apple, 100]]}, recv(5000))
+        ?assertEqual([[apple, 100]], q(C2, {scan, fruit})),
+        ok = q(C2, {commit_tx})
     end.
 
 rollback_discards_scanned_rows(_) ->
@@ -191,5 +186,3 @@ connect() ->
 
 q(Pid, Query) -> query_exec:exec_query(Pid, Query).
 
-recv(Timeout) ->
-    receive Msg -> Msg after Timeout -> timeout end.

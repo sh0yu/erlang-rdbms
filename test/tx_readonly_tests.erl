@@ -22,7 +22,7 @@ readonly_test_() ->
       fun writes_are_rejected/1,
       fun ddl_is_rejected/1,
       fun readers_do_not_block_each_other/1,
-      fun writer_blocks_readers_out/1,
+      fun writers_run_concurrently/1,
       fun commit_does_not_wait_for_readers/1,
       fun reader_sees_all_or_nothing_of_a_commit/1,
       fun reader_sees_old_values_after_update/1,
@@ -96,20 +96,22 @@ readers_do_not_block_each_other(_) ->
         ?assertMatch(#{snapshots := 0}, snapshot_mng:status())
     end.
 
-%% 読み書きトランザクションはこれまでどおり直列。
-%% 開いたままにすると、別の読み書きトランザクションは待つ。
-writer_blocks_readers_out(_) ->
+%% 読み書きトランザクションも並行に走る。
+%% 待つのは同じ行を書こうとしたときだけ。
+writers_run_concurrently(_) ->
     fun() ->
         C1 = seeded(),
         C2 = connect(),
         ok = q(C1, "BEGIN"),
+        {ok, _} = q(C1, "INSERT INTO t VALUES (3)"),
         Done = async(fun() ->
                              ok = q(C2, "BEGIN"),
-                             q(C2, "SELECT id FROM t")
+                             {ok, _} = q(C2, "INSERT INTO t VALUES (4)"),
+                             q(C2, "COMMIT")
                      end),
-        ?assertEqual(timeout, await(Done, 300)),
-        ok = q(C1, "ROLLBACK"),
-        ?assertMatch({ok, {ok, _, _}}, await(Done, 5000))
+        ?assertEqual({ok, ok}, await(Done, 5000)),
+        ok = q(C1, "COMMIT"),
+        ?assertEqual(4, count(C1))
     end.
 
 %% **これがスナップショットにした目的。** 読み手が開いていても

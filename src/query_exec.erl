@@ -95,9 +95,26 @@ init([]) ->
                 lColumnIndex = LColumnIndex,
                 queryId = []}}.
 
+%%----------------------------------------------------------------------
+%% 読み書きトランザクション。
+%%
+%% 読み手と同じくスナップショットを取る。読むときは開始時点へ巻き戻す
+%% ので、他の書き手が途中でコミットしても見え方が変わらない。
+%% これで**走査に読みロックを取らずに済む**。走査は表の全行に触るので、
+%% 読みロックを取ると事実上の表ロックになり、並行に走れなくなる。
+%%
+%% 書くときは行の書き込みロックを取る。同じ行を2本が同時に書けない。
+%% ただしロックは取った後の変更しか防げないので、コミットの直前に
+%% 「自分のスナップショット以降に、自分が書く行が変わっていないか」を
+%% 確かめる(first-updater-wins)。
+%%
+%% 得られる分離水準は**スナップショット分離**で、直列化可能ではない。
+%% ライトスキュー(互いに相手が読んだ行を書く)は防げない。
+%%----------------------------------------------------------------------
 handle_call({exec_query, {begin_tx}}, _From, #state{txid = undefined} = State) ->
     Txid = tx_mng:begin_tx(get_tx_mng_pid(State)),
-    {reply, Txid, State#state{txid = Txid, queryId = []}};
+    Snap = snapshot_mng:acquire(),
+    {reply, Txid, State#state{txid = Txid, snapshot = Snap, queryId = []}};
 handle_call({exec_query, {begin_tx}}, _From, State) ->
     %% ネストしたトランザクションは扱わない
     {reply, {error, transaction_already_started}, State};
@@ -130,13 +147,14 @@ handle_call({exec_query, {commit_tx}}, _From, State) ->
 handle_call({exec_query, {rollback_tx}}, _From, State) ->
     with_transaction(State, fun() -> do_rollback(State) end);
 
-%% DDLは暗黙のトランザクションとして実行する(下の with_ddl/2 を参照)。
+%% DDLは暗黙のトランザクションとして実行する(下の with_ddl/3 を参照)。
 handle_call({exec_query, {create_table, TableName, ColumnList}}, _From, State) ->
-    with_ddl(State,
+    with_ddl(State, TableName,
              fun() -> simple_db_server:create_table(get_db_pid(State), TableName, ColumnList) end);
 
 handle_call({exec_query, {drop_table, TableName}}, _From, State) ->
-    with_ddl(State, fun() -> simple_db_server:drop_table(get_db_pid(State), TableName) end);
+    with_ddl(State, TableName,
+             fun() -> simple_db_server:drop_table(get_db_pid(State), TableName) end);
 
 handle_call({exec_query, {insert, TableName, Val}}, _From, State) ->
     with_write_transaction(State, fun() -> do_insert(State, TableName, Val) end);
@@ -206,12 +224,13 @@ code_change(_OldVsn, State, _Extra) ->
 %% 明示的なトランザクションの中でのDDLは拒否する。カタログの変更を
 %% 元に戻す仕組み(UNDOログ)が無いため、ロールバックできないものを
 %% 黙って通すより、実行できないと言うほうが正直である。
-with_ddl(#state{txid = undefined} = State, Fun) ->
+with_ddl(#state{txid = undefined} = State, Table, Fun) ->
     TPid = get_tx_mng_pid(State),
     Txid = tx_mng:begin_tx(TPid),
-    %% 自分の順番が来るまで待つ
     case tx_mng:allow_tx(TPid, Txid) of
         ok ->
+            %% その表を書きかけのトランザクションが終わるまで待つ
+            ok = ddl_table_lock(State#state{txid = Txid}, Table),
             %% DDLはカタログと索引を書き換える。走査中に表が落ちると
             %% 読み手が壊れた状態を見るので、適用と同じく排他で囲う。
             Reply = commit_latch:with_write(Fun),
@@ -220,8 +239,11 @@ with_ddl(#state{txid = undefined} = State, Fun) ->
         transaction_not_found ->
             {reply, {error, transaction_not_found}, State}
     end;
-with_ddl(State, _Fun) ->
+with_ddl(State, _Table, _Fun) ->
     {reply, {error, ddl_in_transaction}, State}.
+
+ddl_table_lock(_State, undefined) -> ok;
+ddl_table_lock(State, Table)      -> acquire_table_lock(State, Table, write).
 
 %%----------------------------------------------------------------------
 %% 書き込みを含む操作。読み取り専用トランザクションでは断る。
@@ -234,14 +256,22 @@ with_write_transaction(#state{readonly = true} = State, _Fun) ->
 with_write_transaction(State, Fun) ->
     with_transaction(State, Fun).
 
-%% トランザクションが開始済みで、かつ自分の順番が来ていることを確かめてから
-%% Funを実行する。順番待ちの間はここでブロックする。
+%% トランザクションが開始済みであることを確かめてから Fun を実行する。
+%%
+%% 文の途中で捨てるしかなくなったとき(デッドロック)は throw で
+%% ここまで戻る。文の途中で止めると、ローカル領域に半端な変更が
+%% 残ったままトランザクションが続いてしまうので、その場で捨てる。
 with_transaction(State, Fun) ->
     case ask_transaction(State) of
         transaction_not_found ->
             {reply, transaction_not_found, State};
         ok ->
-            Fun()
+            try Fun()
+            catch
+                throw:{abort, Reason} ->
+                    {reply, _, State2} = do_rollback(State),
+                    {reply, {error, Reason}, State2}
+            end
     end.
 
 do_insert(State, TableName, Val) ->
@@ -255,17 +285,17 @@ do_insert(State, TableName, Val) ->
             {reply, {error, Reason}, State}
     end.
 
+%% タプルAPIの等値検索。SQLの索引スキャンと同じ経路を使う。
+%% 別々に書くと、片方だけスナップショットを見ないといった食い違いが出る。
 do_select(State, TableName, ColName, Val) ->
     case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
         false ->
             {reply, {error, table_not_found}, State};
         true ->
-            QueryIdList = get_query_id_list(State),
-            OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-            ok = acquire_lock(State, OidList, read),
-            Rows = [R || R <- select_data(State, TableName, OidList, QueryIdList),
-                         R =/= not_found],
-            {reply, Rows, State}
+            case tx_index_lookup(State, TableName, ColName, Val) of
+                {ok, Rows}      -> {reply, Rows, State};
+                {error, Reason} -> {reply, {error, Reason}, State}
+            end
     end.
 
 %% SQL文を実行する。
@@ -298,18 +328,19 @@ run_sql(State, {tx, rollback}) ->
 
 %% DDL。既存のDDL経路(暗黙のトランザクション)に載せる
 run_sql(State, {create_table, Table, Columns}) ->
-    with_ddl(State, fun() -> simple_db_server:create_table(get_db_pid(State), Table, Columns) end);
+    with_ddl(State, Table,
+             fun() -> simple_db_server:create_table(get_db_pid(State), Table, Columns) end);
 run_sql(State, {drop_table, Table}) ->
-    with_ddl(State, fun() -> simple_db_server:drop_table(get_db_pid(State), Table) end);
+    with_ddl(State, Table, fun() -> simple_db_server:drop_table(get_db_pid(State), Table) end);
 run_sql(State, {create_index, Name, Table, Column}) ->
-    with_ddl(State, fun() ->
+    with_ddl(State, Table, fun() ->
                             simple_db_server:create_index(get_db_pid(State), Name, Table, Column)
                     end);
 %% ANALYZE はカタログを書き換えるのでDDLと同じ扱い。
 run_sql(State, {analyze, Table}) ->
-    with_ddl(State, fun() -> simple_db_server:analyze(get_db_pid(State), Table) end);
+    with_ddl(State, Table, fun() -> simple_db_server:analyze(get_db_pid(State), Table) end);
 run_sql(State, {drop_index, Name}) ->
-    with_ddl(State, fun() -> simple_db_server:drop_index(get_db_pid(State), Name) end);
+    with_ddl(State, undefined, fun() -> simple_db_server:drop_index(get_db_pid(State), Name) end);
 
 %% DML。トランザクションが要る
 run_sql(State, {select, Plan}) ->
@@ -478,7 +509,9 @@ do_sql_update(State, Table, Assigns, Pred) ->
             end
     end.
 
+%% ローカル領域へ直接書くので、local_data/6 と同じく表の共有ロックが要る。
 record_update(State, Table, Columns, Updated) ->
+    ok = acquire_table_lock(State, Table, read),
     QueryId = db_id:new(),
     LKvstore = get_local_kvstore(State),
     LColumnIndex = get_local_column_index(State),
@@ -762,32 +795,67 @@ do_commit(State) ->
             {reply, _, State2} = do_rollback(State),
             {reply, {error, Reason}, State2};
         ok ->
-            ok = write_redo_log(Txid, Changes),
-            %% 変更前の値を undo として積む。**適用の前**に積むのが要点。
-            %%
-            %% 適用は1行ずつ進むので、その途中を読み手が見ることがある。
-            %% 先に undo があれば、
-            %%   適用済みの行 → undo が古い値へ戻す
-            %%   未適用の行   → もともと古い値
-            %% となって、どちらも同じ値に見える。逆順にすると、その隙間に
-            %% 読んだ行だけが新しい値に見えてしまう。
-            Seq = snapshot_mng:commit(undo_for(Changes)),
-            ok = apply_changes(Changes),
-            %% チェックポイントを書く前にディスクへ落とす。
-            %%
-            %% リカバリは最後のチェックポイント以降しか再実行しない。
-            %% よってチェックポイントは「これより前は永続化済み」という
-            %% 宣言になる。ページキャッシュに置いただけの状態でこれを
-            %% 書くと、電源断のときにデータは失われるのにリカバリは
-            %% 再実行せず、黙って消える。
-            ok = sync_for_commit(),
-            ok = log_util:redo_log_put_checkpoint(),
-            %% 適用が終わったので、この版を見えるようにする
-            ok = snapshot_mng:publish(Seq),
-            clear_local(State, QueryIdList),
-            Rep = tx_mng:commit_tx(TPid, Txid),
-            {reply, Rep, State#state{txid = undefined, queryId = []}}
+            Undo = undo_for(Changes),
+            case check_conflicts(State, maps:keys(Undo)) of
+                {error, Reason} ->
+                    {reply, _, State3} = do_rollback(State),
+                    {reply, {error, Reason}, State3};
+                ok ->
+                    do_commit_1(State, Txid, TPid, QueryIdList, Changes, Undo)
+            end
     end.
+
+%%----------------------------------------------------------------------
+%% 自分が書く行が、自分のスナップショット以降に変わっていないか。
+%%
+%% 書き込みロックは、そのロックを取った**後**の変更しか防げない。
+%% 自分が読んでから書くまでの間に他の書き手がコミットしていると、
+%% その更新を黙って踏み潰す(lost update)。
+%%
+%% 先にコミットした方を勝たせ、後から来た自分を捨てる。
+%%----------------------------------------------------------------------
+check_conflicts(#state{snapshot = undefined}, _Keys) ->
+    ok;
+check_conflicts(#state{snapshot = Snap}, Keys) ->
+    case snapshot_mng:conflicts(Snap, Keys) of
+        {error, Reason} -> {error, Reason};
+        {ok, []}        -> ok;
+        {ok, _Changed}  -> {error, serialization_failure}
+    end.
+
+do_commit_1(#state{snapshot = Snap} = State, Txid, TPid, QueryIdList, Changes, Undo) ->
+    ok = write_redo_log(Txid, Changes),
+    %% 変更前の値を undo として積む。**適用の前**に積むのが要点。
+    %%
+    %% 適用は1行ずつ進むので、その途中を読み手が見ることがある。
+    %% 先に undo があれば、
+    %%   適用済みの行 → undo が古い値へ戻す
+    %%   未適用の行   → もともと古い値
+    %% となって、どちらも同じ値に見える。逆順にすると、その隙間に
+    %% 読んだ行だけが新しい値に見えてしまう。
+    Seq = snapshot_mng:commit(Undo),
+    %% 適用の間は共有ラッチを持つ。DDL が割り込むと、書いている先の
+    %% 表が消えてコミットが千切れる。
+    ok = commit_latch:with_read(fun() -> apply_changes(Changes) end),
+    %% チェックポイントを書く前にディスクへ落とす。
+    %%
+    %% リカバリは最後のチェックポイント以降しか再実行しない。
+    %% よってチェックポイントは「これより前は永続化済み」という
+    %% 宣言になる。ページキャッシュに置いただけの状態でこれを
+    %% 書くと、電源断のときにデータは失われるのにリカバリは
+    %% 再実行せず、黙って消える。
+    ok = sync_for_commit(),
+    ok = log_util:redo_log_put_checkpoint(),
+    %% 適用が終わったので、この版を見えるようにする。
+    %% 並行するコミットがまだ適用中なら、見える版はそこで止まる。
+    ok = snapshot_mng:publish(Seq),
+    clear_local(State, QueryIdList),
+    ok = release_snapshot(Snap),
+    Rep = tx_mng:commit_tx(TPid, Txid),
+    {reply, Rep, State#state{txid = undefined, snapshot = undefined, queryId = []}}.
+
+release_snapshot(undefined) -> ok;
+release_snapshot(Snap)      -> snapshot_mng:release(Snap).
 
 %% 共有データを一切変更せずに、全変更が適用可能かを確かめる。
 validate_changes([]) ->
@@ -811,12 +879,14 @@ do_rollback(#state{readonly = true, snapshot = Snap} = State) ->
     ok = snapshot_mng:release(Snap),
     {reply, ok, State#state{txid = undefined, readonly = false,
                             snapshot = undefined, queryId = []}};
-do_rollback(State) ->
+do_rollback(#state{snapshot = Snap} = State) ->
     TPid = get_tx_mng_pid(State),
     Txid = get_txid(State),
     clear_local(State, get_query_id_list(State)),
+    ok = release_snapshot(Snap),
     Rep = tx_mng:rollback_tx(TPid, Txid),
-    {reply, Rep, State#state{txid = undefined, queryId = []}}.
+    {reply, Rep, State#state{txid = undefined, snapshot = undefined,
+                             queryId = []}}.
 
 %% ローカル領域の変更をクエリの実行順に並べる。
 %% 同じOidに対するdel→insの順序が保たれている必要がある。
@@ -917,6 +987,7 @@ local_delete_data(State, QueryId, TableName, Oid, Val) ->
     local_data(State, QueryId, del, TableName, Oid, Val).
 
 local_data(State, QueryId, Action, TableName, Oid, Val) ->
+    ok = acquire_table_lock(State, TableName, read),
     LKvstore = get_local_kvstore(State),
     LColumnIndex = get_local_column_index(State),
     {ok, ColList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
@@ -1024,10 +1095,38 @@ merge_local_data(State, ShareData, Oid, QueryId) ->
 
 acquire_lock(_State, [], _RW) ->
     ok;
-%% スナップショットの読み手はロックを取らない。
-%% 取っても意味が無い(読む値は undo で決まる)うえ、読み取り専用は
-%% tx_mng を通らないので解放する場所が無く、書き手が永久に待つ。
-acquire_lock(#state{readonly = true}, _ObjectId, _RW) ->
+%% **読みロックは取らない。**
+%%
+%% 読む値はスナップショットと undo で決まるので、ロックしても
+%% 見え方は変わらない。むしろ走査は表の全行に触るため、読みロックを
+%% 取ると事実上の表ロックになって並行に走れなくなる。
+%%
+%% 代わりに失うのは直列化可能性で、得られるのはスナップショット分離。
+acquire_lock(_State, _ObjectId, read) ->
     ok;
-acquire_lock(State, ObjectId, RW) ->
-    lock_mng:acquire_lock(get_lock_mng_pid(State), get_txid(State), ObjectId, RW).
+acquire_lock(State, ObjectId, write) ->
+    lock(State, ObjectId, write).
+
+%%----------------------------------------------------------------------
+%% 表そのもののロック。
+%%
+%% 行ロックだけだと、書きかけのトランザクションの下で DROP TABLE が
+%% 通ってしまう。行を触るトランザクションは表の共有ロックを、DDL は
+%% 排他ロックを取る。DDL は書き手が終わるまで待つ。
+%%
+%% 共有ロックどうしは競合しないので、同じ表への書き手が互いを待つことは
+%% ない。行の競合だけが待ちを作る。
+%%----------------------------------------------------------------------
+acquire_table_lock(State, TableName, RW) ->
+    lock(State, {table, TableName}, RW).
+
+lock(State, ObjectId, RW) ->
+    case lock_mng:acquire_lock(get_lock_mng_pid(State), get_txid(State),
+                               ObjectId, RW) of
+        ok ->
+            ok;
+        %% 待つと閉路ができる。ここで捨てないと双方が永久に止まる。
+        %% 呼び出し元は文の途中なので、throw で文の境界まで戻す。
+        {error, deadlock} ->
+            throw({abort, deadlock})
+    end.

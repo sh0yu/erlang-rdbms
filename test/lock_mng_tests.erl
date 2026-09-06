@@ -14,7 +14,11 @@ lock_mng_test_() ->
       fun lock_after_partial_conflict_gets_every_oid/1,
       fun release_wakes_one_waiter/1,
       fun release_of_unknown_lock_is_ok/1,
-      fun waiters_are_served_in_arrival_order/1]}.
+      fun waiters_are_served_in_arrival_order/1,
+      fun two_way_deadlock_is_refused/1,
+      fun three_way_deadlock_is_refused/1,
+      fun waiting_without_a_cycle_is_allowed/1,
+      fun refused_request_leaves_no_trace/1]}.
 
 %%%===================================================================
 %%% 競合の判定
@@ -135,6 +139,63 @@ waiters_are_served_in_arrival_order(_) ->
         ?assertEqual(timeout, recv(300)),
         ok = release(tx2),
         ?assertEqual({second, ok}, recv(5000))
+    end.
+
+%%%===================================================================
+%%% デッドロック
+%%%===================================================================
+
+%% tx1 が 1 を、tx2 が 2 を持っている状態で互いの相手を取りに行く。
+%% 先に待ちに入った側は通し、閉路を閉じる側を断る。
+two_way_deadlock_is_refused(_) ->
+    fun() ->
+        ok = acquire(tx1, [1], write),
+        ok = acquire(tx2, [2], write),
+        %% tx1 → tx2 の待ち(まだ閉路ではない)
+        ?assertEqual(timeout, acquire_async(tx1, [2], write, 300)),
+        %% tx2 → tx1 を足すと閉路になる
+        ?assertEqual({error, deadlock}, acquire(tx2, [1], write)),
+        %% 断られただけで、tx2 の元のロックは残っている
+        ?assertEqual([2], held_by(tx2)),
+        %% tx2 が終われば tx1 の待ちは解ける
+        ok = release(tx2),
+        ?assertEqual({done, ok}, recv(5000))
+    end.
+
+%% 3本でも辿れる。tx1 → tx2 → tx3 → tx1
+three_way_deadlock_is_refused(_) ->
+    fun() ->
+        ok = acquire(tx1, [1], write),
+        ok = acquire(tx2, [2], write),
+        ok = acquire(tx3, [3], write),
+        ?assertEqual(timeout, acquire_async(tx1, [2], write, 200)),
+        ?assertEqual(timeout, acquire_async(tx2, [3], write, 200)),
+        ?assertEqual({error, deadlock}, acquire(tx3, [1], write))
+    end.
+
+%% 閉路が無ければ待つ。一直線の待ちを誤って断らないこと。
+waiting_without_a_cycle_is_allowed(_) ->
+    fun() ->
+        ok = acquire(tx1, [1], write),
+        ok = acquire(tx2, [2], write),
+        %% tx3 → tx1、tx3 → tx2。tx1 も tx2 も何も待っていない
+        ?assertEqual(timeout, acquire_async(tx3, [1], write, 200)),
+        ?assertEqual(timeout, acquire_async(tx2, [1], write, 200)),
+        ok = release(tx1),
+        %% 待っていた2本のうち先に来た tx3 が取る
+        ?assertEqual({done, ok}, recv(5000))
+    end.
+
+%% 断ったものが待ち行列に残っていると、後で誰かの解放時に
+%% 起こされて二重に応答してしまう。
+refused_request_leaves_no_trace(_) ->
+    fun() ->
+        ok = acquire(tx1, [1], write),
+        ok = acquire(tx2, [2], write),
+        ?assertEqual(timeout, acquire_async(tx1, [2], write, 200)),
+        ?assertEqual({error, deadlock}, acquire(tx2, [1], write)),
+        %% tx2 は 1 を待っていない
+        ?assertEqual(#{tx1 => [tx2]}, lock_mng:wait_for_graph(lock_mng))
     end.
 
 %%%===================================================================

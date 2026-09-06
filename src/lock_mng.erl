@@ -12,6 +12,12 @@
 %%%   ms_lock_waiting_proc: {Oid, LockId, RestOidList, Timestamp, From, RW}
 %%%                         ロック待ち。RestOidListはこのOidが取れた後に
 %%%                         続けて取るべきOidの残り。
+%%%
+%%% デッドロックは待ちに入る直前に検出する。待ち行列は「誰が誰を待つか」の
+%%% グラフそのものなので、要求元から辿って自分に戻れれば閉路がある。
+%%% 見つけたら待たせずに {error, deadlock} を返し、要求した側を捨てる。
+%%% タイムアウトで気づく方式にしないのは、待ち時間が長いほど正しい
+%%% トランザクションまで巻き添えにするため。
 %%% @end
 %%%-------------------------------------------------------------------
 -module(lock_mng).
@@ -19,7 +25,8 @@
 
 %% Public API
 -export([start_link/0, stop/1]).
--export([acquire_lock/4, release_lock/2, locks_held_by/2, is_locked/2]).
+-export([acquire_lock/4, release_lock/2, locks_held_by/2, is_locked/2,
+         wait_for_graph/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -38,7 +45,7 @@ stop(Pid) ->
 %%----------------------------------------------------------------------
 %% @doc OidListの全てにロックをかける。取れるまでブロックする。
 %% ex) acquire_lock(P1, Txid, [Oid1, Oid2], read)
-%% Returns: ok
+%% Returns: ok | {error, deadlock}
 %%----------------------------------------------------------------------
 acquire_lock(Pid, LockId, OidList, RW) when is_list(OidList) ->
     gen_server:call(Pid, {acquire_lock, LockId, OidList, RW}, infinity);
@@ -63,6 +70,12 @@ locks_held_by(Pid, LockId) ->
 is_locked(Pid, Oid) ->
     gen_server:call(Pid, {is_locked, Oid}).
 
+%%----------------------------------------------------------------------
+%% @doc 誰が誰を待っているか(テスト・デバッグ用)。
+%%----------------------------------------------------------------------
+wait_for_graph(Pid) ->
+    gen_server:call(Pid, wait_for_graph).
+
 %%%===================================================================
 %%% Callback functions of gen_server
 %%%===================================================================
@@ -79,8 +92,14 @@ handle_call({acquire_lock, LockId, OidList, RW}, From, State) ->
             {reply, ok, State};
         %% 1つでも取れなければ待ち行列に入る。取れた時点でreplyする。
         queued ->
-            {noreply, State}
+            {noreply, State};
+        %% 待つと閉路ができる。待たせずに断る
+        {error, deadlock} ->
+            {reply, {error, deadlock}, State}
     end;
+
+handle_call(wait_for_graph, _From, State) ->
+    {reply, wait_for_graph(), State};
 
 handle_call({release_lock, LockId}, _From, State) ->
     release_locking_oid(LockId),
@@ -133,8 +152,61 @@ acquire(LockId, [Oid | Rest], Timestamp, From, RW) ->
             acquire(LockId, Rest, Timestamp, From, RW);
         false ->
             %% このOidが解放されるまで待つ。解放時に残りのOidも続けて取る。
-            ets:insert(ms_lock_waiting_proc, {Oid, LockId, Rest, Timestamp, From, RW}),
-            queued
+            %%
+            %% ただし、待つと閉路ができる場合は待たない。待てば双方とも
+            %% 永久に進まないので、片方を断ったほうが良い。
+            case would_deadlock(LockId, Oid) of
+                true ->
+                    {error, deadlock};
+                false ->
+                    ets:insert(ms_lock_waiting_proc,
+                               {Oid, LockId, Rest, Timestamp, From, RW}),
+                    queued
+            end
+    end.
+
+%%----------------------------------------------------------------------
+%% LockId が Oid を待つと閉路ができるか。
+%%
+%% 待ち行列から「誰が誰を待つか」のグラフを作り、これから足す辺
+%% (LockId → Oid の保持者たち)を加えて、LockId から辿って LockId に
+%% 戻れるかを見る。戻れたら閉路。
+%%
+%% 辺は「待ち」の関係なので、保持者が1人も動かない限り解けない。
+%% 保持者が複数(共有ロック)の場合は全員への辺を張る。1人でも解放すれば
+%% 進めるわけではなく、競合する全員の解放が要るため。
+%%----------------------------------------------------------------------
+would_deadlock(LockId, Oid) ->
+    Graph = maps:update_with(LockId, fun(Ws) -> holders_of(Oid, LockId) ++ Ws end,
+                             holders_of(Oid, LockId), wait_for_graph()),
+    reachable(LockId, maps:get(LockId, Graph, []), Graph, #{}).
+
+%% 待ち行列そのものが待ちグラフ。 #{待つ側 => [待たれる側]}
+wait_for_graph() ->
+    lists:foldl(
+      fun({WaitOid, Waiter, _Rest, _Ts, _From, _RW}, Acc) ->
+              case holders_of(WaitOid, Waiter) of
+                  []      -> Acc;
+                  Holders -> maps:update_with(Waiter, fun(Ws) -> Holders ++ Ws end,
+                                              Holders, Acc)
+              end
+      end, #{}, ets:tab2list(ms_lock_waiting_proc)).
+
+%% Oid を持っている、自分以外のトランザクション
+holders_of(Oid, Self) ->
+    lists:usort([L || {_O, _Ts, L, _RW} <- ets:lookup(ms_locked_oid, Oid), L =/= Self]).
+
+%% Targets から辿って Goal に着けるか(深さ優先)
+reachable(_Goal, [], _Graph, _Seen) ->
+    false;
+reachable(Goal, [Goal | _Rest], _Graph, _Seen) ->
+    true;
+reachable(Goal, [N | Rest], Graph, Seen) ->
+    case maps:is_key(N, Seen) of
+        true ->
+            reachable(Goal, Rest, Graph, Seen);
+        false ->
+            reachable(Goal, maps:get(N, Graph, []) ++ Rest, Graph, Seen#{N => true})
     end.
 
 %% 自分が持つreadロックをwriteロックへ書き換える。
@@ -198,7 +270,8 @@ dequeue_lock(Oid) ->
             case acquire(LockId, [Oid | Rest], Timestamp, From, RW) of
                 ok -> gen_server:reply(From, ok);
                 %% さらに別のOidで待つことになった
-                queued -> queued
+                queued -> queued;
+                {error, deadlock} = E -> gen_server:reply(From, E)
             end
     end.
 

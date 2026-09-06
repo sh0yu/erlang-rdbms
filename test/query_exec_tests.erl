@@ -20,7 +20,8 @@ query_exec_test_() ->
       fun nested_begin_is_rejected/1,
       fun unsupported_query_is_reported/1,
       fun select_on_unknown_table/1,
-      fun transactions_run_one_at_a_time/1,
+      fun transactions_run_concurrently/1,
+      fun same_row_written_twice_is_refused/1,
       fun dead_connection_releases_transaction/1,
       fun disconnect_rolls_back/1]}.
 
@@ -201,39 +202,69 @@ uncommitted_changes_are_invisible_to_others(_) ->
         _ = q(C1, {begin_tx}),
         {ok, _} = q(C1, {insert, fruit, [apple, 100]}),
 
-        %% C2はC1のコミットを待つので、別プロセスで走らせる
+        %% C2 は待たない。ただしC1の未コミットの挿入は見えない
         C2 = connect(),
-        Self = self(),
-        spawn_link(fun() ->
-                           _ = q(C2, {begin_tx}),
-                           Self ! {c2, q(C2, {select, fruit, name, apple})},
-                           ok = q(C2, {commit_tx})
-                   end),
-        %% C1がコミットするまでC2は進めない
-        ?assertEqual(timeout, recv(300)),
+        _ = q(C2, {begin_tx}),
+        ?assertEqual([], q(C2, {select, fruit, name, apple})),
         ok = q(C1, {commit_tx}),
-        ?assertEqual({c2, [[apple, 100]]}, recv(5000))
+        %% C2 は自分のスナップショットを見続けるので、まだ見えない
+        ?assertEqual([], q(C2, {select, fruit, name, apple})),
+        ok = q(C2, {commit_tx}),
+        %% 開き直せば見える
+        _ = q(C2, {begin_tx}),
+        ?assertEqual([[apple, 100]], q(C2, {select, fruit, name, apple})),
+        ok = q(C2, {commit_tx})
     end.
 
-%% トランザクションが同時に1つずつしか走らないこと。
-%% 2つ目のbegin_tx後の最初のクエリは、1つ目のコミットまでブロックする。
-transactions_run_one_at_a_time(_) ->
+%% **トランザクションは並行に走る。** 以前は2本目のクエリが
+%% 1本目のコミットまでブロックしていた。
+transactions_run_concurrently(_) ->
     fun() ->
         C1 = connect(),
         ok = q(C1, {create_table, fruit, [name, price]}),
         _ = q(C1, {begin_tx}),
+        {ok, _} = q(C1, {insert, fruit, [apple, 100]}),
 
         C2 = connect(),
         Self = self(),
         spawn_link(fun() ->
                            _ = q(C2, {begin_tx}),
                            {ok, _} = q(C2, {insert, fruit, [orange, 150]}),
-                           Self ! c2_done,
-                           ok = q(C2, {commit_tx})
+                           ok = q(C2, {commit_tx}),
+                           Self ! c2_done
                    end),
-        ?assertEqual(timeout, recv(300)),
+        %% C1 が開いたままでも C2 は進む
+        ?assertEqual(c2_done, recv(5000)),
         ok = q(C1, {commit_tx}),
-        ?assertEqual(c2_done, recv(5000))
+        _ = q(C1, {begin_tx}),
+        ?assertEqual(2, length(q(C1, {scan, fruit}))),
+        ok = q(C1, {commit_tx})
+    end.
+
+%% 同じ行を2本が書いたら、後からコミットする方を捨てる。
+%% 黙って上書きすると、先にコミットした方の更新が消える(lost update)。
+same_row_written_twice_is_refused(_) ->
+    fun() ->
+        C1 = connect(),
+        ok = q(C1, {create_table, fruit, [name, price]}),
+        _ = q(C1, {begin_tx}),
+        {ok, _} = q(C1, {insert, fruit, [apple, 100]}),
+        ok = q(C1, {commit_tx}),
+
+        C2 = connect(),
+        _ = q(C1, {begin_tx}),
+        _ = q(C2, {begin_tx}),
+        {ok, 1} = q(C1, {update, fruit, [{price, 200}], name, apple}),
+        ok = q(C1, {commit_tx}),
+
+        %% C2 は自分のスナップショット(価格100)を見て書こうとする
+        {ok, 1} = q(C2, {update, fruit, [{price, 300}], name, apple}),
+        ?assertEqual({error, serialization_failure}, q(C2, {commit_tx})),
+
+        %% 先にコミットした C1 の値が残る
+        _ = q(C1, {begin_tx}),
+        ?assertEqual([[apple, 200]], q(C1, {select, fruit, name, apple})),
+        ok = q(C1, {commit_tx})
     end.
 
 %% 接続プロセスが異常終了しても、トランザクションの順番が
