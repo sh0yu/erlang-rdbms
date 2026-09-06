@@ -106,7 +106,7 @@ analyze(#explain_stmt{stmt = Inner}) ->
     end;
 
 analyze(#select_stmt{from = From} = Stmt) ->
-    case build_from(From) of
+    case build_from(reorder_joins(From, Stmt#select_stmt.where)) of
         {error, Reason} -> {error, Reason};
         {ok, Scope, Node} -> bind_select(Stmt, Scope, Node)
     end.
@@ -152,6 +152,159 @@ build_from(#join{type = Type, left = L, right = R, on = On}) ->
 
 bind_on(undefined, _Scope) -> {ok, undefined};
 bind_on(Expr, Scope) -> bind_expr(Expr, Scope).
+
+%%%===================================================================
+%%% 結合順序
+%%%
+%%% **ここで決める必要がある。** カラム参照は build_from/1 の中で
+%%% 行タプル内の位置に束縛される。順序を後から入れ替えると位置が
+%%% ずれるので、プランナ(sql_planner)ではもう動かせない。
+%%%
+%%% 内部結合と直積だけを並べ替える。LEFT JOIN は可換でも結合的でも
+%%% ないので、1つでも混ざっていたら書いた順のままにする。
+%%%===================================================================
+
+reorder_joins(From, Where) ->
+    case flatten_joins(From) of
+        not_reorderable ->
+            From;
+        {Tables, _OnPreds} when length(Tables) < 3 ->
+            %% 2表では並べ替える意味が薄い。入れ子ループは右側を
+            %% メモリに載せるので、どちらを右に置くかは効くが、
+            %% 中間結果の大きさは変わらない
+            From;
+        {Tables, OnPreds} ->
+            case table_sizes(Tables) of
+                error ->
+                    From;
+                Sizes ->
+                    %% つながりを見るときは WHERE も含める。
+                    %% FROM a, b WHERE a.x = b.y という書き方では、
+                    %% 結合条件が ON ではなく WHERE にある
+                    Links = [pred_keys(P) || P <- OnPreds ++ and_parts(Where)],
+                    rebuild(greedy_order(Tables, Links, Sizes), OnPreds)
+            end
+    end.
+
+%% 内部結合・直積だけで組まれた木を、表の列と条件の列にほどく。
+flatten_joins(#table_ref{} = T) ->
+    {[T], []};
+flatten_joins(#join{type = Ty, left = L, right = R, on = On})
+  when Ty =:= inner; Ty =:= cross ->
+    case {flatten_joins(L), flatten_joins(R)} of
+        {not_reorderable, _} -> not_reorderable;
+        {_, not_reorderable} -> not_reorderable;
+        {{LT, LP}, {RT, RP}} -> {LT ++ RT, LP ++ RP ++ and_parts(On)}
+    end;
+flatten_joins(_Other) ->
+    not_reorderable.
+
+and_parts(undefined) -> [];
+and_parts(#binop{op = 'and', left = L, right = R}) -> and_parts(L) ++ and_parts(R);
+and_parts(E) -> [E].
+
+%% 左深の木に組み直し、条件は**全部いちばん上の ON に置く**。
+%% そこから先は sql_planner の述語プッシュダウンが、
+%% 評価できるいちばん下の結合まで落としてくれる。
+rebuild([First | Rest], Preds) ->
+    Tree = lists:foldl(fun(T, Acc) -> #join{type = inner, left = Acc, right = T} end,
+                       First, Rest),
+    case Preds of
+        [] -> Tree;
+        _  -> Tree#join{on = lists:foldl(
+                               fun(P, Acc) -> #binop{op = 'and', left = Acc, right = P} end,
+                               hd(Preds), tl(Preds))}
+    end.
+
+%% 各表の推定行数。1つでも引けなければ並べ替えない。
+table_sizes(Tables) ->
+    lists:foldl(
+      fun(_T, error) -> error;
+         (T, Acc) ->
+              case resolve_table(T#table_ref.name) of
+                  {error, _} -> error;
+                  {ok, Name, _Cols} ->
+                      Stats = case sys_tbl_mng:get_stats(whereis(sys_tbl_mng), Name) of
+                                  {ok, S} -> S;
+                                  none    -> none
+                              end,
+                      Acc#{key_of(T) => sql_stats:rows(Stats)}
+              end
+      end, #{}, Tables).
+
+%% 別名があれば別名で区別する(自己結合)。
+%% **文字列のまま扱う。** 修飾子の側(col_ref.table)も文字列なので、
+%% どちらかをアトムにすると比較が常に外れる。加えて、修飾子は
+%% 利用者が書いた任意の文字列なので、アトム化するとアトム表が増える。
+key_of(#table_ref{name = N, alias = undefined}) -> N;
+key_of(#table_ref{alias = A})                   -> A.
+
+%%----------------------------------------------------------------------
+%% 貪欲法。**直積を後回しにする**のが主な効き目である。
+%%
+%%   1. 条件に現れる表のうち、いちばん小さいものから始める。
+%%      どの条件にも現れない表から始めると、そこで必ず直積になる
+%%   2. 以後は、条件でつながっている表を優先して足す。
+%%      つながっているものが複数あれば、中間結果が小さくなる方
+%%   3. つながっている表が無くなったら、残りを小さい順に足す
+%%
+%% 見積もりは粗い。つながっていれば max(左, 右)、つながっていなければ
+%% 積とする。順序を決めるのに要るのは大小関係であって精度ではない。
+%%----------------------------------------------------------------------
+greedy_order(Tables, Links, Sizes) ->
+    Linked = lists:append(Links),
+    Start = smallest([T || T <- Tables, lists:member(key_of(T), Linked)],
+                     Tables, Sizes),
+    grow([Start], Tables -- [Start], Links, Sizes,
+         maps:get(key_of(Start), Sizes)).
+
+%% 候補が空なら全体から選ぶ
+smallest([], Fallback, Sizes) -> smallest(Fallback, Fallback, Sizes);
+smallest(Cands, _Fallback, Sizes) ->
+    hd(lists:sort(fun(A, B) ->
+                          maps:get(key_of(A), Sizes) =< maps:get(key_of(B), Sizes)
+                  end, Cands)).
+
+grow(Chosen, [], _Links, _Sizes, _Size) ->
+    lists:reverse(Chosen);
+grow(Chosen, Rest, Links, Sizes, Size) ->
+    Keys = [key_of(T) || T <- Chosen],
+    %% つながっている表があれば、そちらだけを候補にする
+    Cands = case [T || T <- Rest, connected(Keys, key_of(T), Links)] of
+                [] -> Rest;
+                Cs -> Cs
+            end,
+    Scored = [{joined_size(Size, Keys, T, Links, Sizes), T} || T <- Cands],
+    [{NewSize, Best} | _] = lists:sort(fun({A, _}, {B, _}) -> A =< B end, Scored),
+    grow([Best | Chosen], Rest -- [Best], Links, Sizes, NewSize).
+
+joined_size(Size, Keys, T, Links, Sizes) ->
+    N = maps:get(key_of(T), Sizes),
+    case connected(Keys, key_of(T), Links) of
+        true  -> max(Size, N);
+        false -> Size * N
+    end.
+
+%% 選んだ表のどれかと、この表を結ぶ条件があるか。
+connected(Keys, Key, Links) ->
+    lists:any(fun(L) ->
+                      lists:member(Key, L) andalso
+                          lists:any(fun(K) -> lists:member(K, L) end, Keys)
+              end, Links).
+
+%% 条件が触れている表(別名)の集合。修飾なしの名前は判断できないので
+%% 空にする。空はどの表ともつながらない扱いになり、順序を動かさない。
+pred_keys(Expr) ->
+    lists:usort(col_tables(Expr)).
+
+col_tables(#col_ref{table = undefined}) -> [];
+col_tables(#col_ref{table = T})         -> [T];
+col_tables(#binop{left = L, right = R}) -> col_tables(L) ++ col_tables(R);
+col_tables(#unop{arg = A})              -> col_tables(A);
+col_tables(#is_null{arg = A})           -> col_tables(A);
+col_tables(#func{args = Args}) when is_list(Args) ->
+    lists:append([col_tables(A) || A <- Args]);
+col_tables(_Other)                      -> [].
 
 %% 単一テーブルの操作(INSERT/UPDATE/DELETE)用のスコープ。
 scope_of(Table, Columns) ->

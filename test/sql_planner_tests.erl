@@ -23,7 +23,7 @@ planner_test_() ->
       fun left_join_where_on_null_side_stays_above/1,
       fun left_join_on_condition_on_null_side_is_pushed/1,
       fun left_join_on_condition_on_preserved_side_stays/1,
-      fun cross_predicate_stays_above/1,
+      fun cross_predicate_joins_the_on_clause/1,
       fun left_join_results_unchanged_by_pushdown/1,
       fun index_scan_when_selective/1,
       fun no_index_scan_when_not_selective/1,
@@ -156,16 +156,16 @@ left_join_on_condition_on_preserved_side_stays(_) ->
     end.
 
 %% 両側を見ている条件はどちらにも落とせない。
-cross_predicate_stays_above(_) ->
+%% 内部結合では ON と WHERE が等価なので、結合の ON にまとめる。
+cross_predicate_joins_the_on_clause(_) ->
     fun() ->
         seed2(),
         L = lines("SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id "
                   "WHERE e.sal < d.budget"),
         ?assertEqual([<<"Project (name)">>,
-                      <<"  Filter (sal < budget)">>,
-                      <<"    Nested Loop INNER Join on (dept = id)">>,
-                      <<"      Seq Scan on emp">>,
-                      <<"      Seq Scan on dept">>], L)
+                      <<"  Nested Loop INNER Join on ((dept = id) AND (sal < budget))">>,
+                      <<"    Seq Scan on emp">>,
+                      <<"    Seq Scan on dept">>], L)
     end.
 
 %% 書き換えは結果を変えてはならない。危ないのは外部結合なので、

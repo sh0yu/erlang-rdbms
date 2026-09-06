@@ -110,10 +110,17 @@ push(Preds, #lp_join{type = Ty, pred = On, left = L, right = R} = J) ->
     {WhL, WhR, WhKeep} = classify(Preds, LW, where, Ty),
     %% 右側へ落とすときは位置を左の幅だけ戻す。
     %% 結合後の行では右のカラムが LW だけずれているため。
-    J1 = J#lp_join{pred = conj(OnKeep),
+    %% 内部結合では ON と WHERE は等価なので、両側にまたがる条件は
+    %% 結合の ON にまとめる。選択の節点が1つ減る。
+    %% **LEFT JOIN ではまとめられない**(意味が変わる)。
+    {Keep, Above} = case Ty of
+                        left -> {OnKeep, WhKeep};
+                        _    -> {OnKeep ++ WhKeep, []}
+                    end,
+    J1 = J#lp_join{pred = conj(Keep),
                    left  = push(OnL ++ WhL, L),
                    right = push([shift(E, -LW) || E <- OnR ++ WhR], R)},
-    wrap(conj(WhKeep), J1);
+    wrap(conj(Above), J1);
 push(Preds, #lp_filter{pred = P, input = In}) ->
     %% 選択が重なっていたら1つにまとめて、まとめて押し込む
     push(Preds ++ conjuncts(P), In);
