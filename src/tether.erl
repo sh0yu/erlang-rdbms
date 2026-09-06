@@ -27,13 +27,22 @@ open(Client) -> tether_sessions:ensure(Client).
 %% Seq は、そのクライアントの中で 1 から順に増やす。
 %% 前回と同じ Seq を渡すのが「再送」であり、実行されずに
 %% 前回の答えが返る。
+%%
+%% 大きすぎる要求はここで拒む。上限は tether_data:limits/0。
 %%----------------------------------------------------------------------
 -spec request(binary(), non_neg_integer(), [tether_data:op()]) ->
           tether_session:result() | {error, term()}.
 request(Client, Seq, Ops) ->
-    case tether_sessions:ensure(Client) of
-        {ok, Pid} -> tether_session:request(Pid, Seq, Ops);
-        E         -> E
+    %% 大きさの検査は**セッションへ渡す前**に行う。
+    %% セッションのメールボックスに入った時点で確保は済んでいるので、
+    %% そこで弾いても遅い。本番では通信路の復号器が同じ検査をする。
+    case tether_data:validate(Ops) of
+        {error, R} -> {error, R};
+        ok ->
+            case tether_sessions:ensure(Client) of
+                {ok, Pid} -> tether_session:request(Pid, Seq, Ops);
+                E         -> E
+            end
     end.
 
 -spec read(tether_data:key()) -> {ok, tether_data:value()} | not_found.

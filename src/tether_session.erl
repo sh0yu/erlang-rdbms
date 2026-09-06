@@ -62,7 +62,9 @@
 
 %% 1セッションが使えるメモリの上限(ワード)。超えたらそのプロセスだけ死ぬ。
 %% 多テナントの共有サービスとして、1人の都合が全体に出ないようにするため。
--define(MAX_HEAP, 1000000).
+%% 共有ヒープの実行環境では、この上限をプロセス単位で掛けられないので、
+%% 1人の食い潰しがサービス全体の OOM になる。
+-define(DEFAULT_MAX_HEAP, 1000000).
 
 -record(s, {
           client         :: binary(),
@@ -92,8 +94,9 @@ info(Pid) -> gen_server:call(Pid, info).
 
 init(Client) ->
     %% 1人が食い潰しても、他のクライアントには何も起きない。
-    process_flag(max_heap_size, #{size => ?MAX_HEAP, kill => true,
-                                  error_logger => true}),
+    MaxHeap = application:get_env(tether, session_max_heap, ?DEFAULT_MAX_HEAP),
+    _ = process_flag(max_heap_size, #{size => MaxHeap, kill => true,
+                                      error_logger => false}),
     %% 記憶を取り戻す。ログから復旧済みの状態がストアにある。
     {Last, Reply} = case tether_store:session(Client) of
                         none -> {0, undefined};

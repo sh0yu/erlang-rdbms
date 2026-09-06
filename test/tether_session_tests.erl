@@ -6,6 +6,12 @@
 -define(K(K), {<<"t">>, <<K>>}).
 
 with_db(F) ->
+    _ = application:stop(tether),
+    %% load を先に済ませる。application:load/1 は .app の env を読み込むので、
+    %% 未 load の状態で set_env しても、そこで上書きされて既定値に戻る。
+    %% (VM 内で最初に走ったテストだけが既定の "data" を掴む、という
+    %%  再現しにくい形で出る。実際に12MBの残骸を作って気づいた)
+    _ = application:load(tether),
     D = tmpdir(),
     application:set_env(tether, dir, D),
     {ok, _} = application:ensure_all_started(tether),

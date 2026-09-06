@@ -125,7 +125,6 @@ truncated_tail_is_normal_test() ->
 %% ディスクの故障が「データが少し古いだけ」に化けて表に出てこない。
 corrupt_refuses_to_start_test() ->
     D = tmpdir(),
-    process_flag(trap_exit, true),
     try
         {ok, _} = tether_log:start_link(D),
         {ok, _} = tether_log:write(<<"one">>),
@@ -135,7 +134,7 @@ corrupt_refuses_to_start_test() ->
 
         corrupt_byte(tether_log:path(D), 28),       % 2件目の本体
 
-        ?assertMatch({error, {corrupt_log, bad_crc, 15}}, tether_log:start_link(D)),
+        ?assertMatch({error, {corrupt_log, bad_crc, 15}}, start_expecting_failure(D)),
         ?assertMatch({error, {corrupt, bad_crc, 15}}, collect_err(D)),
 
         %% 人が判断して repair を呼べば、有効な前半だけが残る
@@ -145,12 +144,23 @@ corrupt_refuses_to_start_test() ->
         ok = gen_server:stop(tether_log),
         {Recs, _} = collect(D),
         ?assertEqual([{0, <<"one">>}], Recs)
-    after
-        flush_exits(),
-        process_flag(trap_exit, false),
-        rmrf(D)
+    after rmrf(D)
     end.
 
 collect_err(D) -> tether_log:fold(D, fun(_, _, A) -> A end, []).
 
-flush_exits() -> receive {'EXIT', _, _} -> flush_exits() after 0 -> ok end.
+%% start_link は init が失敗すると、リンク経由で EXIT を撒く。
+%% 呼び出し側でそれを捌こうとすると、trap_exit を戻した後に
+%% 遅れて届いた EXIT で試験プロセスが落ちる、という競走になる。
+%% (実際にそれで「1つ以上の試験が中止されました」が出ていた。
+%%  eunit の既定の探索がその報告を埋もれさせていたので、
+%%  試験モジュールを明示するまで気づけなかった)
+%% 使い捨てのプロセスに閉じ込めれば、リンクは外に漏れない。
+start_expecting_failure(D) ->
+    Self = self(),
+    _ = spawn(fun() ->
+                      process_flag(trap_exit, true),
+                      Self ! {result, tether_log:start_link(D)},
+                      timer:sleep(50)
+              end),
+    receive {result, R} -> R after 5000 -> error(timeout) end.

@@ -21,3 +21,13 @@ corrupt_byte(P, Off) ->
 truncate_file(P, N) ->
     Bin = read(P),
     ok = file:write_file(P, binary:part(Bin, 0, N)).
+
+-include_lib("eunit/include/eunit.hrl").
+
+%% eunit は test/ の全モジュールを走らせるので、
+%% 試験を1つも持たないモジュールがあると「中止」として報告される。
+tmpdir_is_unique_test() ->
+    A = tmpdir(), B = tmpdir(),
+    ?assertNotEqual(A, B),
+    ?assert(filelib:is_dir(A)),
+    rmrf(A), rmrf(B).

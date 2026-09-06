@@ -28,16 +28,23 @@
           reply  :: term()
          }).
 
--opaque entry() :: #entry{}.
+-type entry() :: #entry{}.
 
 -spec new(binary(), non_neg_integer(), [tether_data:op()], term()) -> entry().
 new(Client, Seq, Ops, Reply) ->
     #entry{client = Client, seq = Seq, ops = Ops, reply = Reply}.
 
+-spec client(entry()) -> binary().
 client(#entry{client = C}) -> C.
-seq(#entry{seq = S})       -> S.
-ops(#entry{ops = O})       -> O.
-reply(#entry{reply = R})   -> R.
+
+-spec seq(entry()) -> non_neg_integer().
+seq(#entry{seq = S}) -> S.
+
+-spec ops(entry()) -> [tether_data:op()].
+ops(#entry{ops = O}) -> O.
+
+-spec reply(entry()) -> term().
+reply(#entry{reply = R}) -> R.
 
 -spec encode(entry()) -> binary().
 encode(E) -> term_to_binary(E).
