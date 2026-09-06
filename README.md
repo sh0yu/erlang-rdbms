@@ -5,7 +5,7 @@
 ```
 bin/tether demo     exactly-once と local-first を見せる
 bin/tether bench    預かり(escrow)が効くかを測る
-bin/tether test     試験一式 (78件)
+bin/tether test     試験一式 (87件)
 bin/tether shell    対話シェル
 ```
 
@@ -76,6 +76,8 @@ tether_store      状態を持つ。fsync を待たず、返答の権利をロ�
 tether_session    クライアント1人につき1プロセス。再送を吸収し、
                   **圏外の間の変更を溜め、差分として渡す**
 tether_escrow     数値の下限を協調なしで守る(純粋)
+tether_replica    クライアント側の複製(純粋)。**サーバと同じ関数で状態を作る**
+tether_client     端末の口。圏外で読み書きし、復帰したら送る
 tether_sessions   ETS名簿と購読の配布。引くのにプロセスを経由しない
 ```
 
@@ -133,6 +135,34 @@ tether_sessions   ETS名簿と購読の配布。引くのにプロセスを経�
 内部用の鍵($pool 等)         外に出ない
 ```
 
+## 端末側 — 圏外で読み書きする
+
+```erlang
+{ok, C} = tether_client:open(<<"alice">>, <<"orders">>),
+
+ok = tether_client:offline(C),                      %% 本当に通信を止める
+
+{ok, <<"a">>} = tether_client:read(C, {<<"orders">>, <<"o1">>}),   %% 手元から
+{ok, [ok]}    = tether_client:write(C, [{put, K, V}]),             %% 積まれる
+{ok, <<"v">>} = tether_client:read(C, K),                          %% 自分の書き込みが見える
+
+ok = tether_client:online(C),
+{ok, #{accepted := N, rejected := R, unsent := U}} = tether_client:sync(C).
+```
+
+手元の見え方は `tether_data:apply_batch/3` で計算する。**サーバが使うのと
+まったく同じ純粋関数**なので、意味がずれない。
+
+圏外の書き込みには2種類ある。
+
+| | |
+|---|---|
+| **楽観的** | `put` / `cas` / `delete`。サーバが拒めば覆る |
+| **確定的** | 預かりの範囲内の `consume`。**覆らない** |
+
+同期エンジンは全部を楽観的に扱うので、圏外で見せた結果が後で覆る。
+預かりがあると、覆らないと断言できる範囲が生まれる。
+
 ## 圏外で「書く」ときの問題 — 預かり(escrow)
 
 読むだけなら差分で足りる。書くと、**共有された有限資源**が問題になる。
@@ -182,4 +212,5 @@ tether_sessions   ETS名簿と購読の配布。引くのにプロセスを経�
 * 問い合わせは鍵による読み書きのみ。走査も索引も無い
 * 認証・認可が無い。resume も sync も、誰でも他人のものを読める
 * 購読はコレクション単位のみ。述語による絞り込みが無い
-* クライアント側のライブラリが無い(サーバ側APIだけ)
+* クライアント側の永続化が無い(プロセスが死ぬと手元の複製が消える)
+* 購読の解除でクライアント側の複製を捨てる処理が無い

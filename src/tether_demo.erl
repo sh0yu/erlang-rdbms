@@ -163,7 +163,8 @@ local_first() ->
     {ok, _, _} = tether:subscribe(<<"bob">>, <<"orders">>),
     say("alice は圏外のまま、bob はこまめに受け取る。変更を大量に起こす。"),
     _ = [begin
-             tether:request(<<"shop">>, I, [{put, {<<"orders">>, <<I:32>>}, <<"x">>}]),
+             {ok, [_]} = tether:request(<<"shop">>, I,
+                                        [{put, {<<"orders">>, <<I:32>>}, <<"x">>}]),
              case I rem 50 of 0 -> tether:sync(<<"bob">>); _ -> ok end
          end || I <- lists:seq(254, 253 + 12000)],
     ok = wait_version(<<"alice">>, 253 + 12000),
