@@ -257,9 +257,10 @@ same_row_written_twice_is_refused(_) ->
         {ok, 1} = q(C1, {update, fruit, [{price, 200}], name, apple}),
         ok = q(C1, {commit_tx}),
 
-        %% C2 は自分のスナップショット(価格100)を見て書こうとする
-        {ok, 1} = q(C2, {update, fruit, [{price, 300}], name, apple}),
-        ?assertEqual({error, serialization_failure}, q(C2, {commit_tx})),
+        %% C2 は自分のスナップショット(価格100)を見て書こうとする。
+        %% コミットではなく UPDATE の時点で断られる
+        ?assertEqual({error, serialization_failure},
+                     q(C2, {update, fruit, [{price, 300}], name, apple})),
 
         %% 先にコミットした C1 の値が残る
         _ = q(C1, {begin_tx}),

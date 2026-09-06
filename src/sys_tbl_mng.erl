@@ -4,8 +4,25 @@
 %%% 永続化して管理する。DB再起動後もテーブル定義が残るため、
 %%% recoverがREDOログを適用する前提となる。
 %%%
-%%% 現状は全カラムにインデックスを張る方針のため、
-%%% get_index_column_list/2 は get_column_list/2 と同じ結果を返す。
+%%% == 読みは gen_server を通さない ==
+%%%
+%%% カタログは**読みが極端に多く、書きは DDL のときだけ**。
+%%% 以前は読みも gen_server:call だったため、全接続がこの1プロセスの
+%%% 前に一列に並んでいた。read_data_oid/2 は行ごとに exist_table/2 を
+%%% 呼ぶので、索引で100行引けば往復が100回になる。
+%%%
+%%% 実測では、32接続が同時に走査するとこのプロセスのメッセージキューが
+%%% 31まで伸びていた。接続数と一致する = 全員が待っている、ということ。
+%%%
+%%% よって DETS の内容を public な ETS(?CACHE)に写しておき、
+%%% **読みは呼び出し元のプロセスが直接引く**。gen_server が受け持つのは
+%%% 書き込みだけで、DETS と ETS の両方を更新する。
+%%%
+%%% 順序は「DETS を書く → ETS を写す」。逆にすると、まだ永続化して
+%%% いないものが他のプロセスから見える。
+%%%
+%%% ETS の持ち主はこの gen_server なので、落ちれば ETS も消える。
+%%% sup は rest_for_one なので、その後ろは全部作り直される。
 %%% @end
 %%%-------------------------------------------------------------------
 -module(sys_tbl_mng).
@@ -31,6 +48,12 @@
     ms_indexes,
     ms_stats
 }).
+
+%% 読み専用のキャッシュ。持ち主はこの gen_server。
+%%   {{table, Name}, [#column{}]}
+%%   {{indexes, Name}, [#index{}]}   名前順
+%%   {{stats, Name}, #table_stats{}}
+-define(CACHE, sys_tbl_cache).
 
 %%%===================================================================
 %%% Public API
@@ -64,8 +87,11 @@ drop_table(Pid, TableName) ->
 %%----------------------------------------------------------------------
 %% Returns: {ok, ColumnList} | {error, table_not_found}
 %%----------------------------------------------------------------------
-get_column_list(Pid, TableName) ->
-    gen_server:call(Pid, {get_column_list, TableName}).
+get_column_list(_Pid, TableName) ->
+    case cached_columns(TableName) of
+        {error, Reason} -> {error, Reason};
+        {ok, Columns}   -> {ok, [C#column.name || C <- Columns]}
+    end.
 
 %%----------------------------------------------------------------------
 %% @doc 型を含むカラム定義を返す。SQL層だけが使う。
@@ -75,8 +101,8 @@ get_column_list(Pid, TableName) ->
 %% 形を変えると広範囲に影響するため。
 %% Returns: {ok, [#column{}]} | {error, table_not_found}
 %%----------------------------------------------------------------------
-get_columns(Pid, TableName) ->
-    gen_server:call(Pid, {get_columns, TableName}).
+get_columns(_Pid, TableName) ->
+    cached_columns(TableName).
 
 %%----------------------------------------------------------------------
 %% @doc 索引が張られているカラムの一覧。
@@ -87,7 +113,7 @@ get_columns(Pid, TableName) ->
 %% Returns: {ok, ColumnList} | {error, table_not_found}
 %%----------------------------------------------------------------------
 get_index_column_list(Pid, TableName) ->
-    case gen_server:call(Pid, {get_indexes, TableName}) of
+    case get_indexes(Pid, TableName) of
         {error, Reason} -> {error, Reason};
         {ok, Indexes}   -> {ok, [I#index.column || I <- Indexes]}
     end.
@@ -109,12 +135,17 @@ drop_index(Pid, IndexName) ->
     gen_server:call(Pid, {drop_index, IndexName}).
 
 %% @doc テーブルに定義されている索引。Returns: {ok, [#index{}]} | {error, _}
-get_indexes(Pid, TableName) ->
-    gen_server:call(Pid, {get_indexes, TableName}).
+get_indexes(_Pid, TableName) ->
+    case exists(TableName) of
+        false -> {error, table_not_found};
+        true  -> {ok, lookup(?CACHE, {indexes, TableName}, [])}
+    end.
 
 %% @doc 全索引。名前順。
-list_indexes(Pid) ->
-    gen_server:call(Pid, list_indexes).
+list_indexes(_Pid) ->
+    All = [I || {{indexes, _T}, Is} <- ets:match_object(?CACHE, {{indexes, '_'}, '_'}),
+                I <- Is],
+    {ok, lists:keysort(#index.name, All)}.
 
 %%----------------------------------------------------------------------
 %% @doc 統計を書く / 読む。
@@ -124,14 +155,36 @@ put_stats(Pid, TableName, Stats) ->
     gen_server:call(Pid, {put_stats, TableName, Stats}).
 
 -spec get_stats(pid() | atom(), atom()) -> {ok, #table_stats{}} | none.
-get_stats(Pid, TableName) ->
-    gen_server:call(Pid, {get_stats, TableName}).
+get_stats(_Pid, TableName) ->
+    case ets:lookup(?CACHE, {stats, TableName}) of
+        [{_, Stats}] -> {ok, Stats};
+        []           -> none
+    end.
 
-exist_table(Pid, TableName) ->
-    gen_server:call(Pid, {exist_table, TableName}).
+exist_table(_Pid, TableName) ->
+    exists(TableName).
 
-list_tables(Pid) ->
-    gen_server:call(Pid, list_tables).
+list_tables(_Pid) ->
+    {ok, lists:sort([T || {{table, T}, _} <- ets:match_object(?CACHE, {{table, '_'}, '_'})])}.
+
+%%%===================================================================
+%%% キャッシュの読み(呼び出し元のプロセスで動く)
+%%%===================================================================
+
+exists(TableName) ->
+    ets:member(?CACHE, {table, TableName}).
+
+cached_columns(TableName) ->
+    case ets:lookup(?CACHE, {table, TableName}) of
+        [{_, Columns}] -> {ok, Columns};
+        []             -> {error, table_not_found}
+    end.
+
+lookup(Tab, Key, Default) ->
+    case ets:lookup(Tab, Key) of
+        [{_, V}] -> V;
+        []       -> Default
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -147,15 +200,45 @@ init([]) ->
                                    [{file, filename:join(DataDir, "ms_indexes.sys")}]),
     {ok, StatName} = dets:open_file(ms_stats,
                                     [{file, filename:join(DataDir, "ms_stats.sys")}]),
+    %% 読みはここから引く。DETS の中身を丸ごと写す。
+    %% カタログはテーブル数ぶんしかないので、全部載せてよい。
+    ?CACHE = ets:new(?CACHE, [set, named_table, protected, {read_concurrency, true}]),
+    ok = load_cache(Name, IdxName, StatName),
     {ok, #st{ms_tables = Name, ms_indexes = IdxName, ms_stats = StatName}}.
+
+%% 起動時に DETS から ETS へ写す。
+load_cache(MsTables, MsIdx, MsStat) ->
+    ok = dets:foldl(fun({T, Cols}, ok) ->
+                            true = ets:insert(?CACHE, {{table, T}, Cols}),
+                            ok
+                    end, ok, MsTables),
+    ok = dets:foldl(fun({_N, I}, ok) ->
+                            cache_indexes(MsIdx, I#index.table),
+                            ok
+                    end, ok, MsIdx),
+    ok = dets:foldl(fun({T, S}, ok) ->
+                            true = ets:insert(?CACHE, {{stats, T}, S}),
+                            ok
+                    end, ok, MsStat),
+    ok.
+
+%% そのテーブルの索引一覧を写し直す。
+cache_indexes(MsIdx, TableName) ->
+    true = ets:insert(?CACHE, {{indexes, TableName}, indexes_of(MsIdx, TableName)}),
+    ok.
 
 handle_call({create_table, TableName, ColumnList}, _From, #st{ms_tables = MsTables} = State) ->
     Reply = case validate(TableName, ColumnList) of
                 ok ->
                     case dets:lookup(MsTables, TableName) of
                         [] ->
-                            ok = dets:insert(MsTables, {TableName, normalize(ColumnList)}),
+                            Columns = normalize(ColumnList),
+                            %% **順序が要る。** DETS を書いてから ETS に写す。
+                            %% 逆にすると、まだ永続化していないものが
+                            %% 他のプロセスから見える。
+                            ok = dets:insert(MsTables, {TableName, Columns}),
                             ok = dets:sync(MsTables),
+                            true = ets:insert(?CACHE, {{table, TableName}, Columns}),
                             ok;
                         [_] ->
                             {error, table_already_exists}
@@ -180,6 +263,9 @@ handle_call({drop_table, TableName}, _From,
                     ok = dets:delete(MsTables, TableName),
                     ok = dets:sync(MsTables),
                     ok = dets:sync(MsIdx),
+                    true = ets:delete(?CACHE, {table, TableName}),
+                    true = ets:delete(?CACHE, {indexes, TableName}),
+                    true = ets:delete(?CACHE, {stats, TableName}),
                     ok
             end,
     {reply, Reply, State};
@@ -209,6 +295,7 @@ handle_call({create_index, IndexName, TableName, ColumnName}, _From,
                                                      column = ColumnName},
                                         ok = dets:insert(MsIdx, {IndexName, Idx}),
                                         ok = dets:sync(MsIdx),
+                                        ok = cache_indexes(MsIdx, TableName),
                                         ok
                                 end
                         end
@@ -223,54 +310,16 @@ handle_call({drop_index, IndexName}, _From, #st{ms_indexes = MsIdx} = State) ->
                 [{IndexName, #index{table = T, column = C}}] ->
                     ok = dets:delete(MsIdx, IndexName),
                     ok = dets:sync(MsIdx),
+                    ok = cache_indexes(MsIdx, T),
                     {ok, T, C}
-            end,
-    {reply, Reply, State};
-
-handle_call({get_indexes, TableName}, _From,
-            #st{ms_tables = MsTables, ms_indexes = MsIdx} = State) ->
-    Reply = case dets:lookup(MsTables, TableName) of
-                [] -> {error, table_not_found};
-                [_] -> {ok, indexes_of(MsIdx, TableName)}
             end,
     {reply, Reply, State};
 
 handle_call({put_stats, TableName, Stats}, _From, #st{ms_stats = MsStat} = State) ->
     ok = dets:insert(MsStat, {TableName, Stats}),
     ok = dets:sync(MsStat),
+    true = ets:insert(?CACHE, {{stats, TableName}, Stats}),
     {reply, ok, State};
-
-handle_call({get_stats, TableName}, _From, #st{ms_stats = MsStat} = State) ->
-    Reply = case dets:lookup(MsStat, TableName) of
-                [{TableName, Stats}] -> {ok, Stats};
-                []                   -> none
-            end,
-    {reply, Reply, State};
-
-handle_call(list_indexes, _From, #st{ms_indexes = MsIdx} = State) ->
-    All = dets:foldl(fun({_N, I}, Acc) -> [I | Acc] end, [], MsIdx),
-    {reply, {ok, lists:keysort(#index.name, All)}, State};
-
-handle_call({get_column_list, TableName}, _From, #st{ms_tables = MsTables} = State) ->
-    Reply = case lookup_columns(MsTables, TableName) of
-                {error, Reason} -> {error, Reason};
-                {ok, Columns} -> {ok, [C#column.name || C <- Columns]}
-            end,
-    {reply, Reply, State};
-
-handle_call({get_columns, TableName}, _From, #st{ms_tables = MsTables} = State) ->
-    {reply, lookup_columns(MsTables, TableName), State};
-
-handle_call({exist_table, TableName}, _From, #st{ms_tables = MsTables} = State) ->
-    Reply = case dets:lookup(MsTables, TableName) of
-                [] -> false;
-                [_] -> true
-            end,
-    {reply, Reply, State};
-
-handle_call(list_tables, _From, #st{ms_tables = MsTables} = State) ->
-    Tables = dets:foldl(fun({TableName, _Cols}, Acc) -> [TableName | Acc] end, [], MsTables),
-    {reply, {ok, lists:sort(Tables)}, State};
 
 handle_call(terminate, _From, State) ->
     {stop, normal, ok, State};

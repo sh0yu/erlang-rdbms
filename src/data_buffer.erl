@@ -15,6 +15,32 @@
 %%% file_mng:write_page/3まで到達してから復帰するため、バッファ上に
 %%% ディスクへ未反映のダーティページは存在しない。したがってフレームを
 %%% 追い出す際にフラッシュは不要。
+%%%
+%%% == 走査は gen_server を通さない ==
+%%%
+%%% 以前はページを1枚読むたびに gen_server:call だった。全接続がこの
+%%% 1プロセスの前に並ぶので、走査は並列に走れない。実測では32接続の
+%%% 同時走査でメッセージキューが32まで伸びていた(接続数と一致 =
+%%% 全員が待っている)。
+%%%
+%%% フレームは public な ETS なので、**載っているページを読むだけなら
+%%% 呼び出し元のプロセスが直接引ける**。そのために「どのページが
+%%% どのフレームにあるか」の索引(buf_dir)を置く。
+%%%
+%%%   buf_dir : {TableName, PageId} -> {BufName, Gen}
+%%%
+%%% 読み手は
+%%%   1. buf_dir を引いて {BufName, Gen} を得る
+%%%   2. BufName から行を読む
+%%%   3. buf_dir をもう一度引き、まだ同じ {BufName, Gen} かを確かめる
+%%% 3で違っていたら、読んでいる最中に追い出されたということなので
+%%% gen_server へ回す(そちらがページを読み直す)。
+%%%
+%%% Gen が要るのは A→B→A と入れ替わった場合を捕まえるため。
+%%% フレーム名だけを見ると同じに見えてしまう。
+%%%
+%%% 追い出す側は「buf_dir から消す → フレームを空にする」の順で進む。
+%%% 逆にすると、空になったフレームを読み手が「有効」と見なす。
 %%% @end
 %%%-------------------------------------------------------------------
 -module(data_buffer).
@@ -34,7 +60,11 @@
 
 -include("../include/simple_db_server.hrl").
 
--define(BUF_N, 8).
+%% バッファフレーム数。1フレーム = 1ページ。
+%%
+%% 以前は 8 固定だった。走査が gen_server の中で直列に走っていたので
+%% 少なくても目立たなかったが、並列に走らせると取り合いになる。
+-define(DEFAULT_BUF_N, 256).
 
 -record(buf_info, {
     buf_name,
@@ -148,7 +178,18 @@ all_rows(Pid, TableName) ->
 %%----------------------------------------------------------------------
 -spec scan_open(pid(), atom()) -> {ok, scan_cursor()}.
 scan_open(Pid, TableName) ->
-    gen_server:call(Pid, {scan_open, TableName}, infinity).
+    %% ファイルが開いていれば呼び出し元で数える。data_buffer は
+    %% 全テーブル共通の1プロセスなので、そこを通さないほうがよい。
+    %% file_mng はテーブルごとに1プロセスなので、通っても他のテーブルの
+    %% 走査は止めない。
+    case ets:lookup(fd_tables, TableName) of
+        [{TableName, Fd}] ->
+            {ok, #scan_cursor{table_name = TableName, page_id = 0,
+                              page_count = file_mng:page_count(Fd)}};
+        [] ->
+            %% まだ開いていない。開くのは所有者(data_buffer)の仕事
+            gen_server:call(Pid, {scan_open, TableName}, infinity)
+    end.
 
 %%----------------------------------------------------------------------
 %% @doc 次の1ページ分の行を返す。
@@ -156,8 +197,49 @@ scan_open(Pid, TableName) ->
 %%----------------------------------------------------------------------
 -spec scan_next(pid(), scan_cursor()) ->
           {rows, [{term(), term()}], scan_cursor()} | eof.
-scan_next(Pid, Cursor) ->
-    gen_server:call(Pid, {scan_next, Cursor}, infinity).
+scan_next(_Pid, #scan_cursor{page_id = P, page_count = N}) when P >= N ->
+    eof;
+scan_next(Pid, #scan_cursor{table_name = T, page_id = P} = C) ->
+    %% バッファに載っていれば呼び出し元で読む。載っていなければ
+    %% ディスクから読む必要があるので gen_server に頼む。
+    case read_page_rows(T, P) of
+        miss ->
+            gen_server:call(Pid, {scan_next, C}, infinity);
+        [] ->
+            %% 全スロットが削除済みのページは飛ばす。呼び出し側に空の
+            %% バッチを見せないほうが、上位の演算子の実装が単純になる。
+            scan_next(Pid, C#scan_cursor{page_id = P + 1});
+        Rows ->
+            {rows, Rows, C#scan_cursor{page_id = P + 1}}
+    end.
+
+%%----------------------------------------------------------------------
+%% バッファに載っているページの行を、呼び出し元のプロセスで読む。
+%% 読んでいる最中に追い出されていたら miss を返す。
+%%----------------------------------------------------------------------
+read_page_rows(TableName, PageId) ->
+    case ets:lookup(buf_dir, {TableName, PageId}) of
+        [] ->
+            miss;
+        [{_, Stamp}] ->
+            Rows = collect_rows(buf_name_of(Stamp), PageId),
+            %% 読み終わってから、まだ同じフレーム・同じ世代かを確かめる
+            case ets:lookup(buf_dir, {TableName, PageId}) of
+                [{_, Stamp}] -> Rows;
+                _            -> miss
+            end
+    end.
+
+buf_name_of({BufName, _Gen}) -> BufName.
+
+%% スロット番号順に整える。ets:tab2list/1 はsetの内部順で返るので、
+%% これが無いと同じテーブルを2回走査したときに行順が変わる。
+collect_rows(Buf, PageId) ->
+    Sorted = lists:sort([{Slot, Stored}
+                         || {#phys_loc{page_id = PId, slot = Slot}, Stored}
+                                <- ets:tab2list(Buf),
+                            PId =:= PageId]),
+    [{Oid, Val} || {_Slot, {Oid, Val}} <- Sorted].
 
 %%----------------------------------------------------------------------
 %% @doc 行が1ページに収まるかどうか。
@@ -176,11 +258,14 @@ init([]) ->
     ok = filelib:ensure_dir(filename:join(DataDir, "x")),
     ets:new(buf_info_list, [set, named_table, public]),
     ets:new(fd_tables, [set, named_table, public]),
+    %% 読み手が直接引く索引。書くのはこのプロセスだけ
+    ets:new(buf_dir, [set, named_table, public, {read_concurrency, true}]),
     {ok, oid_phys_loc} =
         dets:open_file(oid_phys_loc, [{file, filename:join(DataDir, "oid_phys_loc.sys")}]),
     {ok, vacuum_oid} =
         dets:open_file(vacuum_oid, [{file, filename:join(DataDir, "vacuum_oid.sys")}, {type, bag}]),
-    ok = init_buf_frames(?BUF_N),
+    ok = init_buf_frames(application:get_env(transaction_db, buffer_frames,
+                                             ?DEFAULT_BUF_N)),
     {ok, #st{data_dir = DataDir}}.
 
 handle_call({read_data, Oid}, _From, State) ->
@@ -267,20 +352,10 @@ do_scan_next(#scan_cursor{page_id = P, page_count = N}) when P >= N ->
     eof;
 do_scan_next(#scan_cursor{table_name = T, page_id = P} = C) ->
     Buf = load_page(T, P),
-    %% スロット番号順に整える。ets:tab2list/1 はsetの内部順で返るので、
-    %% これが無いと同じテーブルを2回走査したときに行順が変わる。
-    Rows = lists:sort([{Slot, Stored}
-                       || {#phys_loc{page_id = PId, slot = Slot}, Stored}
-                              <- ets:tab2list(Buf),
-                          PId =:= P]),
-    case Rows of
-        %% 全スロットが削除済みのページは飛ばす。呼び出し側に空の
-        %% バッチを見せないほうが、上位の演算子の実装が単純になる。
-        [] ->
-            do_scan_next(C#scan_cursor{page_id = P + 1});
-        _ ->
-            {rows, [{Oid, Val} || {_Slot, {Oid, Val}} <- Rows],
-             C#scan_cursor{page_id = P + 1}}
+    case collect_rows(Buf, P) of
+        %% 全スロットが削除済みのページは飛ばす
+        [] -> do_scan_next(C#scan_cursor{page_id = P + 1});
+        Rows -> {rows, Rows, C#scan_cursor{page_id = P + 1}}
     end.
 
 %%%===================================================================
@@ -492,6 +567,9 @@ load_page(TableName, PageId) ->
                       end,
             NewBufInfo = read_page_into(TableName, PageId, FreeBuf),
             ets:insert(buf_info_list, {FreeBuf, NewBufInfo}),
+            %% 中身が揃ってから索引に載せる。逆にすると、
+            %% まだ読み込んでいないフレームを読み手が引く
+            bind_buf(TableName, PageId, FreeBuf),
             FreeBuf;
         BufName ->
             touch_buf(BufName),
@@ -528,6 +606,10 @@ get_data_buf(BufName, PhysLoc) ->
 %% ディスクのページをフレームに読み込む。
 %% ライトスルーのためフレームの旧内容は破棄してよい。
 read_page_into(TableName, PageId, FreeBuf) ->
+    %% このフレームが載せていたページを索引から外す。
+    %% **空にする前に外す。** 逆にすると、空のフレームを読み手が
+    %% 有効なページとして読む。
+    ok = release_buf(FreeBuf),
     Fd = get_fd(TableName),
     #disk_data{empty_size = EmptySize, slot_count = SlotCount, data_list = SlotDataList} =
         case file_mng:load_page(Fd, PageId) of
@@ -550,6 +632,34 @@ new_page_disk_data() ->
 
 reset_buf(BufName) ->
     ets:delete_all_objects(BufName).
+
+%%----------------------------------------------------------------------
+%% フレームを索引に載せる / 外す。
+%%
+%% Gen は世代。フレームが A→B→A と入れ替わったとき、名前だけでは
+%% 同じに見えてしまうので、読み手が「読んでいる間に入れ替わっていない」
+%% ことを確かめられるようにする。
+%%----------------------------------------------------------------------
+bind_buf(TableName, PageId, BufName) ->
+    Gen = erlang:unique_integer([monotonic, positive]),
+    true = ets:insert(buf_dir, {{TableName, PageId}, {BufName, Gen}}),
+    ok.
+
+release_buf(BufName) ->
+    case ets:lookup(buf_info_list, BufName) of
+        [{BufName, #buf_info{table_name = T, page_id = P}}] when T =/= nil, P =/= nil ->
+            true = ets:delete(buf_dir, {T, P}),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% フレームを空に戻す。索引から外してから中身を捨てる。
+free_buf(BufName) ->
+    ok = release_buf(BufName),
+    reset_buf(BufName),
+    ets:insert(buf_info_list, {BufName, #buf_info{buf_name = BufName}}),
+    ok.
 
 init_buf_frames(0) ->
     ok;
@@ -587,8 +697,7 @@ do_drop_table(TableName) ->
     %% このテーブルのページを載せているフレームを解放する
     lists:foreach(
       fun({BufName, #buf_info{table_name = T}}) when T =:= TableName ->
-              reset_buf(BufName),
-              ets:insert(buf_info_list, {BufName, #buf_info{buf_name = BufName}});
+              ok = free_buf(BufName);
          (_) ->
               ok
       end, ets:tab2list(buf_info_list)),
@@ -616,8 +725,7 @@ do_vacuum(TableName) ->
     Live = [{Oid, V} || {Oid, V} <- Values, V =/= {error, oid_not_found}],
     %% 一旦すべてのページを捨てる
     lists:foreach(fun({BufName, #buf_info{table_name = T}}) when T =:= TableName ->
-                          reset_buf(BufName),
-                          ets:insert(buf_info_list, {BufName, #buf_info{buf_name = BufName}});
+                          ok = free_buf(BufName);
                      (_) ->
                           ok
                   end, ets:tab2list(buf_info_list)),

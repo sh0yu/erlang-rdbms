@@ -61,6 +61,9 @@ writer_waits_for_the_row_lock(_) ->
 
 %% 自分が読んだ後に他人が同じ行を変えていたら、自分を捨てる。
 %% 黙って書くと先にコミットした方の更新が消える。
+%%
+%% 断るのは **UPDATE の時点**。コミットまで待つと、残りの文を全部
+%% やってから捨てることになる。PostgreSQL も同じ位置で返す。
 lost_update_is_refused(_) ->
     fun() ->
         C1 = seeded(),
@@ -74,8 +77,10 @@ lost_update_is_refused(_) ->
         {ok, 1} = q(C1, "UPDATE t SET v = 10 WHERE id = 1"),
         ok = q(C1, "COMMIT"),
 
-        {ok, 1} = q(C2, "UPDATE t SET v = 20 WHERE id = 1"),
-        ?assertEqual({error, serialization_failure}, q(C2, "COMMIT")),
+        ?assertEqual({error, serialization_failure},
+                     q(C2, "UPDATE t SET v = 20 WHERE id = 1")),
+        %% 断られた側はロールバック済み
+        ?assertEqual(transaction_not_found, q(C2, "COMMIT")),
         %% 先にコミットした方が残る
         ?assertEqual([[1, 10], [2, 2]], rows(C1))
     end.

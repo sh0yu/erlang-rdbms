@@ -516,7 +516,7 @@ record_update(State, Table, Columns, Updated) ->
     LKvstore = get_local_kvstore(State),
     LColumnIndex = get_local_column_index(State),
     ColumnList = [C#column.name || C <- Columns],
-    ok = acquire_lock(State, [Oid || {Oid, _, _} <- Updated], write),
+    ok = lock_for_write(State, Table, [Oid || {Oid, _, _} <- Updated]),
     lists:foreach(
       fun({Oid, OldVal, NewVal}) ->
               ets:insert(LKvstore, {QueryId, del, Table, Oid, OldVal}),
@@ -553,7 +553,7 @@ do_sql_delete(State, Table, Pred) ->
             {reply, {error, Reason}, State};
         {ok, Rows} ->
             QueryId = db_id:new(),
-            ok = acquire_lock(State, [Oid || {Oid, _} <- Rows], write),
+            ok = lock_for_write(State, Table, [Oid || {Oid, _} <- Rows]),
             lists:foreach(fun({Oid, Val}) ->
                                   ok = local_delete_data(State, QueryId, Table, Oid, Val)
                           end, Rows),
@@ -614,7 +614,7 @@ do_update_1(State, TableName, SetQuery, ColName, Val, ColumnList) ->
     QueryIdList = get_query_id_list(State),
     SetQueryConverted = simple_db_server:convert_set_query(SetQuery, ColumnList),
     OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-    ok = acquire_lock(State, OidList, write),
+    ok = lock_for_write(State, TableName, OidList),
     Updated =
         lists:foldl(
           fun(Oid, Count) ->
@@ -645,7 +645,7 @@ do_delete(State, TableName, ColName, Val) ->
     QueryId = db_id:new(),
     QueryIdList = get_query_id_list(State),
     OidList = select_object_id_list(State, TableName, ColName, Val, QueryIdList),
-    ok = acquire_lock(State, OidList, write),
+    ok = lock_for_write(State, TableName, OidList),
     Deleted =
         lists:foldl(
           fun(Oid, Count) ->
@@ -1106,6 +1106,27 @@ acquire_lock(_State, _ObjectId, read) ->
     ok;
 acquire_lock(State, ObjectId, write) ->
     lock(State, ObjectId, write).
+
+%%----------------------------------------------------------------------
+%% 書き込む行のロックを取り、**その場で**衝突を確かめる。
+%%
+%% ロックが取れた時点で「自分より先にこの行を書いた者はもういない」が、
+%% 「自分がスナップショットを取った後に誰かが書いた」かもしれない。
+%% そのまま進めると、先にコミットした側の更新を踏み潰す。
+%%
+%% コミットまで待ってから断ることもできる(実際そこでも確かめている)が、
+%% それだと**残りの文を全部やってから捨てる**ことになる。PostgreSQL が
+%% UPDATE の時点で "could not serialize access due to concurrent update"
+%% を返すのと同じく、ここで返したほうがやり直しが安い。
+%%----------------------------------------------------------------------
+lock_for_write(_State, _Table, []) ->
+    ok;
+lock_for_write(State, Table, OidList) ->
+    ok = acquire_lock(State, OidList, write),
+    case check_conflicts(State, [{Table, Oid} || Oid <- OidList]) of
+        ok              -> ok;
+        {error, Reason} -> throw({abort, Reason})
+    end.
 
 %%----------------------------------------------------------------------
 %% 表そのもののロック。
