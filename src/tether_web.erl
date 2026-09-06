@@ -78,8 +78,8 @@ act(Sid, _Env, In) ->
     json(Sid, gen_server:call(?MODULE, state, 30000)).
 
 json(Sid, Term) ->
-    mod_esi:deliver(Sid, "Content-Type: application/json; charset=utf-8\r\n\r\n"),
-    mod_esi:deliver(Sid, binary_to_list(enc(Term))).
+    ok = mod_esi:deliver(Sid, "Content-Type: application/json; charset=utf-8\r\n\r\n"),
+    ok = mod_esi:deliver(Sid, binary_to_list(enc(Term))).
 
 %%%===================================================================
 %%% gen_server
