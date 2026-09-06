@@ -2,163 +2,263 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>分散の現象 — tether</title>
+<title>分散DBの系譜 — tether</title>
 <style>
   :root{--bg:#0f1115;--panel:#161a21;--line:#262c36;--fg:#d7dce3;--dim:#8b94a3;
         --accent:#5aa9e6;--ok:#6fcf97;--warn:#f2c94c;--err:#eb5757;}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
-       font:14px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-  header{padding:12px 22px;border-bottom:1px solid var(--line);background:var(--panel);
-         display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  header h1{margin:0;font-size:15px}
+       font:14px/1.75 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{padding:11px 20px;border-bottom:1px solid var(--line);background:var(--panel);
+         display:flex;align-items:center;gap:16px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+  header h1{margin:0;font-size:14px}
   header a{color:var(--accent);font-size:12px;text-decoration:none}
-  header a:hover{text-decoration:underline}
-  .pick{padding:9px 22px;background:#12161d;border-bottom:1px solid var(--line);
-        display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-  .pick .lbl{font-size:11px;color:var(--dim);margin-right:2px}
+  header .sp{margin-left:auto;display:flex;gap:5px;align-items:center}
   button{background:#1e2530;color:var(--fg);border:1px solid var(--line);
-         border-radius:6px;padding:5px 11px;font:inherit;font-size:11.5px;
-         cursor:pointer;white-space:nowrap}
+         border-radius:6px;padding:4px 10px;font:inherit;font-size:11px;cursor:pointer}
   button:hover{border-color:var(--accent);color:#fff}
   button.on{background:var(--accent);color:#08111a;border:0;font-weight:700}
-  main{max-width:1180px;margin:0 auto;padding:20px 22px 60px}
-  h2{font-size:17px;margin:0 0 10px}
+  .wrap{display:grid;grid-template-columns:270px 1fr;gap:0;align-items:start}
+  nav{border-right:1px solid var(--line);padding:14px 0 60px;position:sticky;top:47px;
+      max-height:calc(100vh - 47px);overflow-y:auto}
+  nav .ch{font-size:11.5px;color:var(--dim);padding:12px 16px 4px;font-weight:700}
+  nav .ch:first-child{padding-top:2px}
+  nav a{display:block;padding:4px 16px 4px 22px;font-size:12px;color:#aeb6c2;
+        text-decoration:none;border-left:3px solid transparent}
+  nav a:hover{color:#fff;background:#181d25}
+  nav a.on{color:#fff;border-left-color:var(--accent);background:#1a2029}
+  main{padding:22px 26px 80px;max-width:1050px;min-width:0}
+  h2{font-size:18px;margin:0 0 4px}
+  .kind{font-size:10.5px;color:var(--dim);margin-bottom:12px}
   .why{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
        border-radius:0 8px 8px 0;padding:12px 15px;font-size:13px;color:#c3cad4;margin:0 0 20px}
-  .why b{color:var(--fg)}
-  table{width:100%;border-collapse:separate;border-spacing:8px 0;margin-bottom:6px}
-  th{font-size:12px;color:var(--dim);text-align:left;padding:0 12px 6px;font-weight:600}
-  td{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-     padding:12px;font-size:13px;vertical-align:top;transition:background .3s}
-  td.chg{background:#1d2634;border-color:var(--accent)}
-  td.bad{border-color:#5a3340}
-  .steps{margin:22px 0 0;list-style:none;padding:0}
-  .steps li{padding:7px 12px;border-radius:6px;color:var(--dim);font-size:13px;
-            border-left:3px solid transparent;margin-bottom:2px}
-  .steps li.now{background:var(--panel);color:var(--fg);border-left-color:var(--accent)}
-  .steps li.done{color:#98a1af}
-  .steps li b{color:var(--warn)}
-  .steps .n{display:inline-block;width:22px;color:var(--dim)}
-  .verdict{margin-top:24px;display:none}
-  .verdict.on{display:block}
-  .verdict h3{font-size:12px;color:var(--dim);margin:0 0 8px;font-weight:600}
-  .v{padding:9px 13px;border-radius:7px;margin-bottom:5px;font-size:13px;
+  b{color:var(--fg)}
+  .why b{color:#fff}
+  table{width:100%;border-collapse:collapse;margin:6px 0 14px;font-size:12.5px}
+  th{text-align:left;color:var(--dim);font-weight:600;padding:6px 10px;
+     border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+  td{padding:7px 10px;border-bottom:1px solid #1c222b;vertical-align:top}
+  tr.bad td{background:rgba(235,87,87,.10)}
+  tr.bad td:first-child{border-left:3px solid var(--err)}
+  tr.now td{background:#1d2634}
+  tr.hide{display:none}
+  td.who{color:var(--accent);white-space:nowrap}
+  td.st{color:var(--warn);white-space:nowrap}
+  td.note{color:var(--dim)}
+  .lab td{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+  .lab td.chg{background:#1d2634;border-color:var(--accent)}
+  .fix{background:#12181f;border:1px solid var(--line);border-radius:8px;
+       padding:11px 14px;font-size:12.5px;color:#b9c1cc;margin:14px 0}
+  .fix .h{color:var(--ok);font-size:11px;font-weight:700;display:block;margin-bottom:3px}
+  .sec{margin:0 0 18px}
+  .sec h3{font-size:14px;margin:0 0 6px;color:#dfe5ec}
+  .sec p{margin:0 0 8px;font-size:13px;color:#c3cad4}
+  .sec .it{display:flex;gap:10px;padding:4px 0;font-size:12.5px}
+  .sec .it .n{color:var(--accent);min-width:190px;font-weight:600}
+  .sec .it .d{color:#aeb6c2}
+  .note{font-size:12px;color:var(--dim);border-top:1px solid var(--line);
+        padding-top:10px;margin-top:14px}
+  .v{padding:8px 12px;border-radius:7px;margin-bottom:4px;font-size:12.5px;
      background:var(--panel);border-left:3px solid var(--err)}
   .v.good{border-left-color:var(--ok)}
   .v .who{color:var(--fg);font-weight:700;margin-right:10px}
-  .v .mark{margin-right:8px}
-  .v.good .mark{color:var(--ok)} .v .mark{color:var(--err)}
+  .v .mark{margin-right:8px;color:var(--err)} .v.good .mark{color:var(--ok)}
+  .see{font-size:11.5px;color:var(--dim);margin-top:10px}
+  .see a{color:var(--accent);text-decoration:none;margin-right:10px}
+  .nav2{display:flex;gap:8px;margin-top:26px;border-top:1px solid var(--line);padding-top:14px}
 </style>
 </head>
 <body>
 
 <header>
-  <h1>分散の現象 — 同じ出来事に、方式を当ててみる</h1>
-  <a href="/">← 端末2台とサーバのデモ</a>
+  <h1>分散DBの系譜 — 競合・ロック・分散の類型・何がどれを防ぐか</h1>
+  <a href="/">← 実装のデモ（端末2台とサーバ）</a>
+  <span class="sp">
+    <button id="replay">この項目をもう一度</button>
+    <button data-sp="1500" class="on">ふつう</button>
+    <button data-sp="800">速い</button>
+    <button data-sp="2600">ゆっくり</button>
+  </span>
 </header>
 
-<div class="pick">
-  <span class="lbl">現象:</span>
-  <span id="tabs"></span>
-  <button id="all">全部を続けて</button>
-  <span class="lbl">速さ</span>
-  <button data-sp="2200" class="on">ふつう</button>
-  <button data-sp="1100">速い</button>
-  <button data-sp="3600">ゆっくり</button>
+<div class="wrap">
+  <nav id="toc"></nav>
+  <main id="main"></main>
 </div>
-
-<main id="main"></main>
 
 <script>
 const $=s=>document.querySelector(s);
 const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
                    if(x!==undefined)n.textContent=x;return n;};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const md=s=>s.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>");
+const md=s=>String(s||"").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>");
+const KIND={timeline:"時系列で追う",compare:"方式を並べて比べる",
+            matrix:"表で見る",notes:"整理"};
 
-let LAB=[], speed=2200, run=0;
+let BOOK=[], FLAT=[], speed=1500, run=0, cur=null;
 
 async function boot(){
-  LAB = await (await fetch("/api/tether_web:lab")).json();
-  const tabs=$("#tabs");
-  LAB.forEach((p,i)=>{
-    const b=el("button","",p.title.split(" — ")[0]);
-    b.onclick=()=>play([i]); tabs.append(b);
+  BOOK = await (await fetch("/api/tether_web:book")).json();
+  const toc=$("#toc");
+  BOOK.forEach(ch=>{
+    toc.append(el("div","ch",ch.title));
+    ch.items.forEach(it=>{
+      it.chapter = ch.title;
+      const a=el("a","",it.title); a.href="#"+it.id; a.dataset.id=it.id;
+      a.onclick=e=>{e.preventDefault(); show(it.id);};
+      toc.append(a); FLAT.push(it);
+    });
   });
-  $("#all").onclick=()=>play(LAB.map((_,i)=>i));
   document.querySelectorAll("[data-sp]").forEach(b=>b.onclick=()=>{
     speed=+b.dataset.sp;
     document.querySelectorAll("[data-sp]").forEach(x=>x.classList.remove("on"));
     b.classList.add("on");
   });
-  play([0]);
+  $("#replay").onclick=()=>cur&&show(cur);
+  // ハッシュ直打ち・戻る/進むに追随する。
+  // これが無いと、リンクを開いても項目が変わらない(実際にそうなっていた)。
+  window.addEventListener("hashchange",()=>{
+    const id=location.hash.slice(1);
+    if(id && id!==cur) show(id);
+  });
+  show(location.hash.slice(1)||FLAT[0].id);
 }
 
-async function play(idxs){
-  const me = ++run;
-  for(const i of idxs){
+function show(id){
+  const it=FLAT.find(x=>x.id===id)||FLAT[0];
+  cur=it.id; location.hash=it.id;
+  document.querySelectorAll("nav a").forEach(a=>
+    a.classList.toggle("on", a.dataset.id===it.id));
+  const m=$("#main"); m.textContent=""; m.scrollIntoView&&window.scrollTo(0,0);
+  m.append(el("h2","",it.title));
+  m.append(el("div","kind",(it.chapter?it.chapter+"　/　":"")+(KIND[it.kind]||"")));
+  const w=el("div","why"); w.innerHTML=md(it.why); m.append(w);
+
+  const me=++run;
+  if(it.kind==="timeline") timeline(m,it,me);
+  else if(it.kind==="compare") compare(m,it,me);
+  else if(it.kind==="matrix") matrix(m,it);
+  else notes(m,it);
+
+  if(it.fix&&it.fix!=="—"){
+    const f=el("div","fix"); f.innerHTML='<span class="h">どう防ぐか</span>'+md(it.fix);
+    m.append(f);
+  }
+  if(it.note&&it.note.length){const n=el("div","note"); n.innerHTML=md(it.note); m.append(n);}
+  if(it.seealso&&it.seealso.length){
+    const s=el("div","see"); s.append(el("span","","関連: "));
+    it.seealso.forEach(sid=>{
+      const t=FLAT.find(x=>x.id===sid); if(!t) return;
+      const a=el("a","",t.title); a.href="#"+sid;
+      a.onclick=e=>{e.preventDefault(); show(sid);}; s.append(a);
+    });
+    m.append(s);
+  }
+  const nv=el("div","nav2");
+  const i=FLAT.findIndex(x=>x.id===it.id);
+  if(i>0){const b=el("button","","← "+FLAT[i-1].title);
+          b.onclick=()=>show(FLAT[i-1].id); nv.append(b);}
+  if(i<FLAT.length-1){const b=el("button","",FLAT[i+1].title+" →");
+                      b.onclick=()=>show(FLAT[i+1].id); nv.append(b);}
+  m.append(nv);
+}
+
+async function timeline(m,it,me){
+  const tb=el("table"), th=el("tr");
+  ["","誰が","何をした","状態",""].forEach(h=>th.append(el("th","",h)));
+  const hd=el("thead"); hd.append(th);
+  const bd=el("tbody");
+  it.rows.forEach(rw=>{
+    const tr=el("tr","hide"+(rw.bad?" bad":""));
+    tr.append(el("td","",rw.t), el("td","who",rw.who), el("td","",rw.act),
+              el("td","st",rw.state));
+    const nt=el("td","note"); nt.innerHTML=md(rw.note); tr.append(nt);
+    bd.append(tr);
+  });
+  tb.append(hd,bd); m.append(tb);
+  for(let i=0;i<bd.children.length;i++){
     if(me!==run) return;
-    await one(LAB[i], me);
-    if(me!==run) return;
+    bd.children[i].className=(it.rows[i].bad?"bad ":"")+"now";
+    if(i>0) bd.children[i-1].className=it.rows[i-1].bad?"bad":"";
     await sleep(speed);
   }
+  if(me===run&&bd.children.length)
+    bd.children[bd.children.length-1].className=
+      it.rows[it.rows.length-1].bad?"bad":"";
 }
 
-async function one(p, me){
-  const m=$("#main"); m.textContent="";
-  m.append(el("h2","",p.title));
-  const why=el("div","why"); why.innerHTML=md(p.why); m.append(why);
+async function compare(m,it,me){
+  const tb=el("table","lab"), th=el("tr");
+  it.policies.forEach(p=>th.append(el("th","",p.name)));
+  const hd=el("thead"); hd.append(th);
+  const br=el("tr"); it.policies.forEach(()=>br.append(el("td","","—")));
+  const bd=el("tbody"); bd.append(br);
+  tb.append(hd,bd); m.append(tb);
 
-  // 方式ごとの列
-  const tb=el("table"), hr=el("tr"), br=el("tr");
-  p.policies.forEach(pol=>{ hr.append(el("th","",pol.name)); br.append(el("td","","—")); });
-  const thead=el("thead"); thead.append(hr);
-  const tbody=el("tbody"); tbody.append(br);
-  tb.append(thead, tbody); m.append(tb);
-
-  // 手順
-  const ul=el("ul","steps");
-  p.steps.forEach((s,i)=>{
-    const li=el("li");
-    li.innerHTML=`<span class="n">${i+1}</span>`+md(s.say);
-    ul.append(li);
+  const ul=el("table"), ub=el("tbody");
+  it.steps.forEach((s,i)=>{
+    const tr=el("tr");
+    tr.append(el("td","",i+1));
+    const td=el("td",""); td.innerHTML=md(s.say); tr.append(td);
+    ub.append(tr);
   });
-  m.append(ul);
+  ul.append(ub); m.append(ul);
 
-  const vd=el("div","verdict");
-  vd.append(el("h3","","結果"));
-  m.append(vd);
-
-  // 1手順ずつ進める
+  const vd=el("div"); m.append(vd);
   const prev={};
-  for(let i=0;i<p.steps.length;i++){
+  for(let i=0;i<it.steps.length;i++){
     if(me!==run) return;
-    ul.children[i].className="now";
-    if(i>0) ul.children[i-1].className="done";
-    p.policies.forEach((pol,c)=>{
-      const v=p.steps[i].state[pol.key];
-      const td=br.children[c];
+    ub.children[i].className="now";
+    if(i>0) ub.children[i-1].className="";
+    it.policies.forEach((p,c)=>{
+      const v=it.steps[i].state[p.key], td=br.children[c];
       td.textContent=v;
-      td.className = (prev[pol.key]!==undefined && prev[pol.key]!==v) ? "chg" : "";
-      prev[pol.key]=v;
+      td.className=(prev[p.key]!==undefined&&prev[p.key]!==v)?"chg":"";
+      prev[p.key]=v;
     });
     await sleep(speed);
-    p.policies.forEach((pol,c)=>br.children[c].classList.remove("chg"));
+    it.policies.forEach((p,c)=>br.children[c].classList.remove("chg"));
   }
   if(me!==run) return;
-  ul.children[p.steps.length-1].className="done";
-
-  // 判定
-  p.policies.forEach(pol=>{
-    const ok=(p.good||[]).includes(pol.key);
+  ub.children[it.steps.length-1].className="";
+  it.policies.forEach(p=>{
+    const ok=(it.good||[]).includes(p.key);
     const d=el("div","v"+(ok?" good":""));
-    const txt=el("span","");
-    txt.innerHTML=md(p.verdict[pol.key]);
-    d.append(el("span","mark",ok?"✓":"✗"), el("span","who",pol.name), txt);
+    const t=el("span",""); t.innerHTML=md(it.verdict[p.key]);
+    d.append(el("span","mark",ok?"✓":"✗"), el("span","who",p.name), t);
     vd.append(d);
   });
-  vd.className="verdict on";
+}
+
+function matrix(m,it){
+  const tb=el("table"), th=el("tr");
+  th.append(el("th","",""));
+  it.cols.forEach(c=>th.append(el("th","",c)));
+  th.append(el("th","",""));
+  const hd=el("thead"); hd.append(th);
+  const bd=el("tbody");
+  it.rows.forEach(rw=>{
+    const tr=el("tr");
+    const lb=el("td",""); lb.innerHTML="<b>"+md(rw.label)+"</b>"; tr.append(lb);
+    rw.cells.forEach(c=>{const td=el("td",""); td.innerHTML=md(c); tr.append(td);});
+    const nt=el("td","note"); nt.innerHTML=md(rw.note); tr.append(nt);
+    bd.append(tr);
+  });
+  tb.append(hd,bd); m.append(tb);
+}
+
+function notes(m,it){
+  it.sections.forEach(sc=>{
+    const d=el("div","sec");
+    d.append(el("h3","",sc.head));
+    const p=el("p",""); p.innerHTML=md(sc.body); d.append(p);
+    (sc.items||[]).forEach(x=>{
+      const r=el("div","it");
+      const dd=el("span","d"); dd.innerHTML=md(x.desc);
+      r.append(el("span","n",x.name), dd); d.append(r);
+    });
+    m.append(d);
+  });
 }
 
 boot();
