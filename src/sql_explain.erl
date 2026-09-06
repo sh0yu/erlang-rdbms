@@ -38,6 +38,7 @@ children(#p_sort{input = In})              -> [In];
 children(#p_limit{input = In})             -> [In];
 children(#p_distinct{input = In})          -> [In];
 children(#p_setop{left = L, right = R})     -> [L, R];
+children(#p_derived{input = In})           -> [In];
 children(#p_project{input = In})           -> [In].
 
 %%%===================================================================
@@ -92,6 +93,8 @@ label(#p_limit{count = C, offset = O}) ->
      case O of 0 -> ""; _ -> [" offset ", integer_to_list(O)] end];
 label(#p_distinct{}) ->
     "Unique";
+label(#p_derived{schema = S}) ->
+    ["Subquery (", commas([to_str(N) || N <- S]), ")"];
 label(#p_setop{op = Op, all = All}) ->
     [string:uppercase(atom_to_list(Op)), case All of true -> " ALL"; false -> "" end];
 label(#p_project{names = Names}) ->
@@ -128,6 +131,7 @@ schema(#p_sort{input = In})                    -> schema(In);
 schema(#p_limit{input = In})                   -> schema(In);
 schema(#p_distinct{input = In})                -> schema(In);
 schema(#p_setop{left = L})                     -> schema(L);
+schema(#p_derived{schema = S})                 -> S;
 schema(#p_project{names = N})                  -> N.
 
 %% 集約の出力は [グループキー..., 集約結果...] の順。

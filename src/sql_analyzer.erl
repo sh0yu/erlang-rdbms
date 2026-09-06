@@ -210,6 +210,26 @@ build_from(#table_ref{name = TableStr, alias = Alias}) ->
                      || C <- Columns],
             {ok, Scope, #lp_scan{table = Table, schema = [C#column.name || C <- Columns]}}
     end;
+%%----------------------------------------------------------------------
+%% 導出表。中の問い合わせを解析し、その出力を1つの関係として見せる。
+%%
+%% 列の型は any にする。射影の式から型を推論する仕組みが無く、
+%% 導出表に INSERT することもないので、比較・整列の意味論
+%% (sql_value が引き受ける)だけあれば足りる。
+%%----------------------------------------------------------------------
+build_from(#derived_table{alias = undefined}) ->
+    {error, derived_table_requires_alias};
+build_from(#derived_table{query = Q, alias = Alias}) ->
+    case analyze(Q) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, {select, Sub}} ->
+            Names = output_names(Sub),
+            A = list_to_atom(Alias),
+            Scope = [#sc{alias = A, name = N, type = any, pos = I}
+                     || {N, I} <- lists:zip(Names, lists:seq(1, length(Names)))],
+            {ok, Scope, #lp_derived{input = Sub, schema = Names}}
+    end;
 build_from(#join{type = Type, left = L, right = R, on = On}) ->
     case build_from(L) of
         {error, Reason} ->
@@ -496,6 +516,13 @@ rewrite_items([], Ctx, Exprs, Names) ->
     {ok, lists:reverse(Exprs), lists:reverse(Names), Ctx};
 rewrite_items([#star{} | _], _Ctx, _E, _N) ->
     {error, star_with_group_by};
+rewrite_items([#aliased{expr = E, name = NameStr} | T], Ctx, Exprs, Names) ->
+    case rewrite(E, Ctx) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Bound, Ctx1} ->
+            rewrite_items(T, Ctx1, [Bound | Exprs], [to_atom(NameStr) | Names])
+    end;
 rewrite_items([Item | T], Ctx, Exprs, Names) ->
     case rewrite(Item, Ctx) of
         {error, Reason} ->
@@ -704,6 +731,14 @@ bind_projection_1([], _Columns, Exprs, Names) ->
 bind_projection_1([#star{} | _T], _Columns, _Exprs, _Names) ->
     %% SELECT a, * のような形は今は扱わない
     {error, star_must_be_alone};
+bind_projection_1([#aliased{expr = E, name = NameStr} | T], Columns, Exprs, Names) ->
+    case bind_expr(E, Columns) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Bound} ->
+            bind_projection_1(T, Columns, [Bound | Exprs],
+                              [to_atom(NameStr) | Names])
+    end;
 bind_projection_1([Item | T], Columns, Exprs, Names) ->
     case bind_expr(Item, Columns) of
         {error, Reason} ->

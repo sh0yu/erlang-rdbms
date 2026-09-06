@@ -25,7 +25,7 @@
 
 Nonterminals
     stmt
-    select_stmt create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
+    create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
     explain_stmt create_index_stmt drop_index_stmt analyze_stmt
     select_list select_item table_ref opt_where expr literal
     query set_expr set_term select_core opt_all
@@ -221,8 +221,6 @@ select_core -> select opt_distinct select_list from from_item opt_where
     #select_stmt{distinct = '$2', columns = '$3', from = '$5', where = '$6',
                  group_by = '$7', having = '$8'}.
 
-%% 互換のために名前を残す(他の規則が select_stmt を参照している)。
-select_stmt -> select_core : '$1'.
 
 opt_group -> '$empty'                : [].
 opt_group -> 'group' 'by' expr_list  : '$3'.
@@ -263,6 +261,11 @@ select_list -> select_item                 : ['$1'].
 select_list -> select_item ',' select_list : ['$1' | '$3'].
 
 select_item -> expr : '$1'.
+%% 列別名。AS は省略できないことにしてある。省略を許すと
+%% `SELECT a b` が `a` の別名 `b` なのか2列なのか、
+%% カンマを書き忘れた場合と区別できない。
+select_item -> expr 'as' identifier :
+    #aliased{expr = '$1', name = value_of('$3')}.
 
 %%%===================================================================
 %%% FROM句
@@ -284,6 +287,10 @@ join_kw -> 'left' 'outer' 'join'    : left.
 
 table_ref -> identifier opt_alias :
     #table_ref{name = value_of('$1'), alias = '$2'}.
+
+%% 導出表。FROM (SELECT ...) AS t
+table_ref -> '(' query ')' opt_alias :
+    #derived_table{query = '$2', alias = '$4'}.
 
 opt_alias -> '$empty'         : undefined.
 opt_alias -> identifier       : value_of('$1').

@@ -70,6 +70,7 @@ column_names(#p_limit{input = In}) -> column_names(In);
 column_names(#p_distinct{input = In}) -> column_names(In);
 column_names(#p_agg{}) -> [];
 column_names(#p_setop{left = L}) -> column_names(L);
+column_names(#p_derived{schema = S}) -> S;
 column_names(#p_nl_join{left = L, right = R}) -> column_names(L) ++ column_names(R);
 column_names(#p_seq_scan{schema = Schema}) -> Schema.
 
@@ -176,6 +177,12 @@ open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
                                matched => false, width => W}}
             end
     end;
+%% 導出表。子が出すリストの行をタプルに直して流す。
+open(#p_derived{input = In}, Ctx) ->
+    case open(In, Ctx) of
+        {error, Reason} -> {error, Reason};
+        Child           -> #op{kind = derived, st = Child}
+    end;
 %% 集合演算。両側を読み切ってから突き合わせる。
 open(#p_setop{op = Op, all = All, left = L, right = R}, Ctx) ->
     case open(L, Ctx) of
@@ -273,6 +280,12 @@ next(#op{kind = nl_join, st = St} = Op) ->
 
 next(#op{kind = hash_join, st = St} = Op) ->
     hj_next(Op, St);
+
+next(#op{kind = derived, st = Child} = Op) ->
+    case next(Child) of
+        {eof, Child2}       -> {eof, Op#op{st = Child2}};
+        {row, Row, Child2}  -> {row, to_tuple(Row), Op#op{st = Child2}}
+    end;
 
 %% 並べ替え済みの行を1件ずつ返す
 next(#op{kind = sorted, st = []} = Op) ->
@@ -586,5 +599,7 @@ close(#op{kind = nl_join, st = #{left := Left}}) ->
     close(Left);
 close(#op{kind = hash_join, st = #{left := Left}}) ->
     close(Left);
+close(#op{kind = derived, st = Child}) ->
+    close(Child);
 close({error, _}) ->
     ok.

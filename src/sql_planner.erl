@@ -66,6 +66,8 @@ rewrite(#lp_sort{input = In} = N)     -> N#lp_sort{input = rewrite(In)};
 rewrite(#lp_limit{input = In} = N)    -> N#lp_limit{input = rewrite(In)};
 rewrite(#lp_distinct{input = In} = N) -> N#lp_distinct{input = rewrite(In)};
 rewrite(#lp_agg{input = In} = N)      -> N#lp_agg{input = rewrite(In)};
+rewrite(#lp_derived{input = In} = N) ->
+    N#lp_derived{input = rewrite(In)};
 rewrite(#lp_setop{left = L, right = R} = N) ->
     N#lp_setop{left = rewrite(L), right = rewrite(R)};
 rewrite(#lp_scan{} = N)               -> N.
@@ -191,7 +193,10 @@ shift({is_not_null, E}, D) -> {is_not_null, shift(E, D)}.
 width(#lp_scan{schema = S})          -> length(S);
 width(#lp_filter{input = In})        -> width(In);
 width(#lp_join{left = L, right = R}) -> width(L) + width(R);
-width(#lp_setop{names = N})          -> length(N).
+width(#lp_setop{names = N})          -> length(N);
+%% 導出表の中へは述語を落とさない。中の位置は射影の出力位置であって、
+%% 集約やDISTINCTが挟まると外の条件をそのまま持ち込めない。
+width(#lp_derived{schema = S})       -> length(S).
 
 %% AND を平らにする / 組み直す
 conjuncts(undefined)   -> [];
@@ -263,6 +268,8 @@ physical(#lp_limit{count = C, offset = O, input = In}, Cat) ->
     #p_limit{count = C, offset = O, input = physical(In, Cat)};
 physical(#lp_distinct{input = In}, Cat) ->
     #p_distinct{input = physical(In, Cat)};
+physical(#lp_derived{input = In, schema = S}, Cat) ->
+    #p_derived{input = physical(In, Cat), schema = S};
 physical(#lp_setop{op = Op, all = All, left = L, right = R}, Cat) ->
     #p_setop{op = Op, all = All, left = physical(L, Cat), right = physical(R, Cat)};
 physical(#lp_project{exprs = E, names = N, input = In}, Cat) ->

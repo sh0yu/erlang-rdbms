@@ -29,6 +29,12 @@
     value
 }).
 
+%% 導出表。子が出すリストの行をタプルに直して流す。
+-record(p_derived, {
+    input,
+    schema = []
+}).
+
 %% 述語を満たす行だけを通す(σ)。
 -record(p_filter, {
     pred,

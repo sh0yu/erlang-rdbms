@@ -166,11 +166,14 @@ EXPLAIN SELECT ...;
 INSERT INTO t [(c, ...)] VALUES (v, ...);
 UPDATE t SET c = expr, ... [WHERE expr];
 DELETE FROM t [WHERE expr];
-SELECT [DISTINCT] * | expr, ... FROM from_item [WHERE expr]
+SELECT [DISTINCT] * | expr [AS name], ... FROM from_item [WHERE expr]
   [GROUP BY expr, ...] [HAVING expr]
   [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
   [LIMIT n] [OFFSET n];
 <query> UNION|INTERSECT|EXCEPT [ALL] <query> [ORDER BY ...] [LIMIT n];
+
+from_item は表名、結合、または導出表:
+  FROM (SELECT ...) AS t
 BEGIN;  BEGIN READ ONLY;  COMMIT;  ROLLBACK;
 ```
 
@@ -403,6 +406,20 @@ a = [1, 2, 2, 3]、b = [2] のとき
 NULL 同士は等しいとみなす**(標準SQLの "not distinct from")。
 `=` をそのまま使うと、NULL の行が `UNION` で重複除去されずに残る。
 
+### 導出表
+
+```sql
+SELECT * FROM (SELECT dept, SUM(sal) AS total FROM emp GROUP BY dept) AS d
+ WHERE d.total > 600;
+```
+
+別名は必須(列を修飾するのに要る)。中に集合演算も別の導出表も書ける。
+
+中の射影はリストを出すが、外側の演算子は位置参照(`element/2`)で引くので、
+導出表がタプルへ戻す。述語は導出表の中へは落とさない。中の位置は射影の
+出力位置であって、集約や `DISTINCT` が挟まると外の条件をそのまま
+持ち込めないため。
+
 ### 実行計画
 
 `EXPLAIN` で選ばれた計画が見られる。
@@ -606,7 +623,12 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
 - 索引は単一カラムのみ。複合索引・一意索引は未実装
-- 副問い合わせ・ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
+- 副問い合わせは `FROM` の導出表のみ。`IN (SELECT ...)` / `EXISTS` /
+  スカラー副問い合わせ・相関副問い合わせは未実装
+- ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
+- 導出表の列の型は `any` になる(射影の式から型を推論しない)
+- 列別名の `AS` は省略できない。省略を許すと `SELECT a b` が
+  別名なのかカンマの書き忘れなのか区別できない
 - 集合演算の `ORDER BY` は結果の列名か序数のみ。任意の式は書けない
   (結果には元のスコープが無いため)
 - 結合の右側は、どちらの方式でも開始時にメモリへ載せる。

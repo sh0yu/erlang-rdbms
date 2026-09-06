@@ -103,6 +103,13 @@
     stmt
 }).
 
+%% 導出表。FROM (SELECT ...) AS t
+%% 別名は必須。列を修飾するのに要る。
+-record(derived_table, {
+    query,
+    alias
+}).
+
 -record(table_ref, {
     name,               % string() -> アナライザ後は atom()
     alias = undefined   % string() | undefined
@@ -123,6 +130,12 @@
 
 %% SELECT * の *
 -record(star, {}).
+
+%% 選択リストの項目に付けた別名。SELECT expr AS name
+-record(aliased, {
+    expr,
+    name
+}).
 
 %% カラム参照。
 %% slot はアナライザが埋める。実行時は名前ではなくこの位置で行を引く。
