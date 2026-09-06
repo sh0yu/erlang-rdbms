@@ -61,6 +61,25 @@
   .hist{display:flex;gap:2px;align-items:flex-end;height:34px;margin:6px 0 2px}
   .hist div{background:var(--accent);width:13px;border-radius:2px 2px 0 0;
             font-size:9px;text-align:center;color:#08111a;font-weight:700}
+  /* 自動再生 */
+  .play{display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+        padding:9px 20px;background:#12161d;border-bottom:1px solid var(--line)}
+  .play .lbl{font-size:11px;color:var(--dim);margin-right:2px}
+  .play button{font-size:11.5px}
+  .play button.go{background:var(--accent);color:#08111a;border:0;font-weight:700}
+  .play button.stop{border-color:#5a3340;color:#e8a0a0}
+  .stage{padding:10px 20px;background:#0c1016;border-bottom:1px solid var(--line);
+         display:none}
+  .stage.on{display:block}
+  .stage .say{font-size:14px;color:var(--fg)}
+  .stage .say b{color:var(--warn)}
+  .stage .say em{color:var(--err);font-style:normal;font-weight:700}
+  .stage .meta{font-size:11px;color:var(--dim);margin-top:3px}
+  .prog{height:3px;background:#1e2530;border-radius:2px;margin-top:7px;overflow:hidden}
+  .prog i{display:block;height:100%;background:var(--accent);
+          transition:width .25s ease}
+  .card.hl{border-color:var(--accent);box-shadow:0 0 0 2px rgba(90,169,230,.22)}
+  .card.dim{opacity:.45}
   /* イベントログ */
   .log{max-width:1500px;margin:0 auto 20px;padding:0 14px}
   .log h3{font-size:12px;color:var(--dim);margin:4px 0 8px;font-weight:600}
@@ -90,6 +109,25 @@
   </p>
 </header>
 
+<div class="play">
+  <span class="lbl">自動再生:</span>
+  <button class="go" data-s="sell">圏外で売る</button>
+  <button class="go" data-s="conflict">競合で覆る</button>
+  <button class="go" data-s="overflow">溢れて取り直し</button>
+  <button class="go" data-s="expire">期限切れ</button>
+  <button class="go" data-s="all">全部</button>
+  <button class="stop" id="stop">停止</button>
+  <span class="lbl" id="speedlbl">速さ</span>
+  <button data-sp="1500">ふつう</button>
+  <button data-sp="700">速い</button>
+  <button data-sp="2600">ゆっくり</button>
+</div>
+<div class="stage" id="stage">
+  <div class="say" id="say"></div>
+  <div class="meta" id="meta"></div>
+  <div class="prog"><i id="prog"></i></div>
+</div>
+
 <main id="app"></main>
 <div class="log"><h3>起きたこと（新しい順）</h3><div id="log"></div></div>
 
@@ -107,10 +145,15 @@ const NOTE = "note";
 const noteOf = rows => (rows.find(o=>o.key===NOTE)||{}).value || "—";
 const items  = rows => rows.filter(o=>o.key!==NOTE);
 
+// 強調はここで当てる。draw() はカードを作り直すので、
+// stage() で当てただけだと次の描画で消える(実際に消えていた)。
+let curHl = null;
+
 function draw(){
   const app=$("#app"); app.textContent="";
   const [a,b]=S.clients;
   app.append(card(a), server(), card(b));
+  applyHl();
   const log=$("#log"); log.textContent="";
   S.log.forEach(e=>{
     const d=el("div","ev "+e.kind);
@@ -218,7 +261,115 @@ function server(){
   return k;
 }
 
-load(); setInterval(load, 1000);
+//======================================================================
+// 自動再生
+//======================================================================
+const SC = {
+  sell: {name:"圏外で売る", steps:[
+    {act:["alice","reset"],   say:"最初の状態に戻す。在庫は20個。"},
+    {act:["alice","acquire"], say:"alice が<b>圏内のうちに</b>持ち分を預かる。ここは協調が要る。", hl:"alice"},
+    {act:["alice","offline"], say:"alice が<b>圏外</b>になった。", hl:"alice"},
+    {act:["alice","sell"],    say:"圏外で1個売る。<b>サーバの中央在庫を見ていて</b> — 1も動かない。", hl:"server"},
+    {act:["alice","sell"],    say:"もう1個売る。やはり中央は動かない。<b>協調していない</b>。", hl:"server"},
+    {act:["alice","drain"],   say:"その間に第三者が<b>中央在庫を空にした</b>。普通のDBならもう売れない。", hl:"server"},
+    {act:["alice","online"],  say:"alice が圏内に戻る。", hl:"alice"},
+    {act:["alice","sync"],    say:"同期 → <b>2件とも通った</b>。先に権利を取ってあったから。", hl:"alice", wait:2600}
+  ]},
+  conflict: {name:"競合で覆る", steps:[
+    {act:["alice","reset"],   say:"最初から。共有メモを2台で編集する。"},
+    {act:["alice","edit"],    say:"alice が共有メモを編集。まだ送っていない。", hl:"alice"},
+    {act:["alice","offline"], say:"alice が<b>圏外</b>になった。", hl:"alice"},
+    {act:["alice","edit"],    say:"圏外でもう一度編集。<b>手元では成功して見えている</b>。", hl:"alice"},
+    {act:["alice","conflict"],say:"その間に第三者が<b>先に</b>共有メモを書き換えた。", hl:"server"},
+    {act:["alice","online"],  say:"alice が圏内に戻る。", hl:"alice"},
+    {act:["alice","sync"],    say:"同期 → <em>却下。手元の変更が覆った。</em> これが楽観的な書き込みの本質。", hl:"alice", wait:3400}
+  ]},
+  overflow: {name:"溢れて取り直し", steps:[
+    {act:["alice","reset"],   say:"最初から。溜められる変更は30件まで(デモ用に絞ってある)。"},
+    {act:["alice","offline"], say:"alice が圏外になった。", hl:"alice"},
+    {act:["alice","flood"],   say:"その間にサーバへ<b>40件</b>書き込む。上限を超える。", hl:"server"},
+    {act:["alice","online"],  say:"alice が圏内に戻る。", hl:"alice"},
+    {act:["alice","sync"],    say:"同期 → <b>差分では追いつけず、全件を取り直した</b>。落ちたのは alice だけ。", hl:"alice", wait:3000}
+  ]},
+  expire: {name:"期限切れ", steps:[
+    {act:["alice","reset"],   say:"最初から。<b>リース期間 = 何時間のオフラインを支えるか</b>の話。"},
+    {act:["alice","short"],   say:"<b>8秒だけ</b>の預かりを取る。", hl:"alice"},
+    {act:["alice","offline"], say:"圏外になった。", hl:"alice"},
+    {act:["alice","sell"],    say:"圏外で1個売る。画面上は売れている。", hl:"alice"},
+    {act:["alice","sell"],    say:"もう1個。手元では2件とも成立している。", hl:"alice"},
+    {countdown:10,            say:"預かりの期限が切れるのを待つ", hl:"alice"},
+    {act:["alice","online"],  say:"圏内に戻る。", hl:"alice"},
+    {act:["alice","sync"],    say:"同期 → <em>期限切れ。1件も届かない。</em> 長く支えるほど在庫が遊ぶ、その裏返し。", hl:"alice", wait:3400}
+  ]}
+};
+
+let timer = null, poll = null, speed = 1500, stopped = true;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function applyHl(){
+  document.querySelectorAll(".card").forEach((c,i)=>{
+    const nm = ["alice","server","bob"][i];
+    c.classList.toggle("hl",  curHl === nm);
+    c.classList.toggle("dim", !!curHl && curHl !== nm);
+  });
+}
+
+function stage(on, say, meta, pct, hl){
+  $("#stage").className = "stage" + (on ? " on" : "");
+  curHl = on ? (hl || null) : null;
+  applyHl();
+  if(!on) return;
+  $("#say").innerHTML = say || "";
+  $("#meta").textContent = meta || "";
+  $("#prog").style.width = (pct||0) + "%";
+}
+
+async function play(key){
+  stop();
+  stopped = false;
+  const list = key === "all" ? ["sell","conflict","overflow","expire"] : [key];
+  for(const k of list){
+    const sc = SC[k], n = sc.steps.length;
+    for(let i=0;i<n && !stopped;i++){
+      const st = sc.steps[i];
+      stage(true, st.say, `${sc.name} — ${i+1}/${n}`, (i+1)*100/n, st.hl);
+      if(st.act){ await act(st.act[0], st.act[1]); }
+      if(st.countdown){
+        for(let t=st.countdown; t>0 && !stopped; t--){
+          stage(true, st.say + ` … <b>${t}</b>`, `${sc.name} — ${i+1}/${n}`,
+                (i+1)*100/n, st.hl);
+          await load(); await sleep(1000);
+        }
+      } else {
+        await load();
+        await sleep(st.wait || speed);
+      }
+    }
+    if(stopped) break;
+  }
+  if(!stopped) stage(true, "おわり", "", 100, null);
+  stopped = true;
+  curHl = null; applyHl();
+  poll = setInterval(load, 1000);
+}
+
+function stop(){
+  stopped = true;
+  if(poll) clearInterval(poll);
+  poll = setInterval(load, 1000);
+  curHl = null; applyHl();
+}
+
+document.querySelectorAll(".play button.go").forEach(b=>{
+  b.onclick = () => { if(poll) clearInterval(poll); poll = null; play(b.dataset.s); };
+});
+$("#stop").onclick = () => { stop(); stage(false); };
+document.querySelectorAll(".play button[data-sp]").forEach(b=>{
+  b.onclick = () => { speed = +b.dataset.sp;
+                      $("#speedlbl").textContent = "速さ (" + b.textContent + ")"; };
+});
+
+load(); poll = setInterval(load, 1000);
 </script>
 </body>
 </html>

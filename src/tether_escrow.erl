@@ -44,7 +44,7 @@
 
 -export([apply/3, is_escrow_op/1, validate/1]).
 -export([pool_key/1, grant_key/2, decode_pool/1, decode_grant/1]).
--export([holdings/2, grant_view/3]).
+-export([holdings/2, grant_view/3, seed_grant/4]).
 
 -define(POOL,  <<"$pool">>).
 -define(GRANT, <<"$grant">>).
@@ -90,6 +90,19 @@ holdings(Client, Db) ->
         {ok, Bin} -> binary_to_term(Bin, [safe]);
         error     -> []
     end.
+
+%%----------------------------------------------------------------------
+%% @doc 預かりの記録を外から植え付ける。クライアント側の複製が、
+%% サーバから受け取った預かりを手元に写すときに使う。
+%%
+%% **索引も一緒に更新するのが要点。** 鍵だけ書くと holdings/2 が
+%% 拾えず、「預かっているのに 0 と表示される」ことになる
+%% (実際にそうなっていた。消費が1件でも入ると索引が付くので
+%%  試験では見えていなかった)。
+%%----------------------------------------------------------------------
+-spec seed_grant(binary(), binary(), grant(), tether_data:db()) ->
+          tether_data:db().
+seed_grant(Client, Res, G, Db) -> put_grant(Client, Res, G, Db).
 
 %% @doc 預かりの中身を外から見る形にする。期限切れは none。
 -spec grant_view(binary(), binary(), tether_data:db()) ->

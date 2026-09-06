@@ -152,10 +152,9 @@ reset(Version, Rows, _Now, #rep{confirmed = C} = R) ->
 %%----------------------------------------------------------------------
 -spec set_grant(binary(), non_neg_integer(), integer(), replica()) -> replica().
 set_grant(Resource, Remaining, Expires, #rep{client = Cl, confirmed = C} = R) ->
-    K = tether_escrow:grant_key(Cl, Resource),
     G = #{remaining => Remaining, taken => 0,
           granted_at => Expires, expires_at => Expires},
-    R#rep{confirmed = C#{K => term_to_binary(G)}}.
+    R#rep{confirmed = tether_escrow:seed_grant(Cl, Resource, G, C)}.
 
 %% @doc 預かりの残り時間(ミリ秒)。切れていたら 0。
 -spec expiry(integer(), replica()) -> integer().

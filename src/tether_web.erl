@@ -209,7 +209,7 @@ do(acquire, N, Pid, #w{hist = H} = S) ->
 do(short, N, Pid, #w{hist = H} = S) ->
     case tether_client:acquire(Pid, ?SKU, 8, 8000) of
         {ok, G} -> note(S#w{hist = [G | H]}, N,
-                        io_lib:format("**8秒だけ**の預かりを取った → ~p 個", [G]), warn);
+                        io_lib:format("8秒だけの預かりを取った → ~p 個", [G]), warn);
         {error, E} -> note(S, N, io_lib:format("預かりを取れず(~p)", [E]), bad)
     end;
 

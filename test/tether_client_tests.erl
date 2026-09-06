@@ -216,3 +216,15 @@ acquire_refuses_while_queued_test() ->
         ?assertMatch({ok, _}, tether_client:acquire(C, ?SKU, 4, 600000)),
         tether_client:close(C)
     end).
+
+%% 預かりを取った直後に、手元がそれを把握していること。
+%% 索引を更新し忘れると、消費が1件入るまで 0 に見える。
+grant_visible_right_after_acquire_test() ->
+    with_db(fun(_) ->
+        {ok, _} = tether:stock(?SKU, 100),
+        {ok, C} = tether_client:open(<<"alice">>, <<"orders">>),
+        {ok, G} = tether_client:acquire(C, ?SKU, 4, 600000),
+        ?assertMatch(#{grants := [{?SKU, G}]}, tether_client:state(C)),
+        ?assertMatch(#{expires := E} when E > 0, tether_client:state(C)),
+        tether_client:close(C)
+    end).
