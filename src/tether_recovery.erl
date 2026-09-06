@@ -85,7 +85,9 @@ apply_entry(E, Lsn, {Db, Sess}) ->
     %% ここで時計を読み直すと、期限切れの判定が本番と変わり、
     %% 直後の乖離検査で落ちる(落ちるだけましだが、そもそも読まない)。
     Ctx = #{now => tether_entry:time(E), client => tether_entry:client(E)},
-    {Results, Db1} = tether_data:apply_batch(tether_entry:ops(E), Ctx, Db),
+    %% 復旧では変更の配布はしない。購読しているセッションは
+    %% まだ存在しないし、存在しても復旧中の中間状態を配る意味がない。
+    {Results, Db1, _Changed} = tether_data:apply_batch(tether_entry:ops(E), Ctx, Db),
     Reply = {ok, Results},
     case Reply =:= tether_entry:reply(E) of
         true -> ok;

@@ -47,6 +47,7 @@
 -behaviour(gen_server).
 
 -export([start_link/1, request/3, info/1]).
+-export([subscribe/2, unsubscribe/2, sync/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([result/0]).
@@ -65,12 +66,29 @@
 %% 1人の食い潰しがサービス全体の OOM になる。
 -define(DEFAULT_MAX_HEAP, 1000000).
 
+%% 圏外のクライアントのために溜めておける変更の上限。
+%% 越えたら差分を捨て、「取り直せ」に切り替える。
+%%
+%% **上限が要るのが要点。** 無制限に溜めると、戻ってこないクライアント
+%% 1人がメモリを食い潰す。PostgreSQL の論理レプリケーションスロットが
+%% WAL を溜め続けてディスクを埋める事故と同じ形で、あちらは
+%% スロット単位で止められないので運用事故になる。
+%% ここではプロセス単位に上限があるので、**そのクライアントだけ**が
+%% 「取り直し」に落ちる。他は何も感じない。
+-define(DEFAULT_BACKLOG, 10000).
+
 -record(s, {
           client         :: binary(),
           last = 0       :: non_neg_integer(),
           reply          :: term(),
           served = 0     :: non_neg_integer(),   % 実行した件数
-          deduped = 0    :: non_neg_integer()    % 再送として吸収した件数
+          deduped = 0    :: non_neg_integer(),   % 再送として吸収した件数
+          %% --- クライアントの複製の管理 ---
+          subs = []      :: [binary()],          % 購読しているコレクション
+          pending = #{}  :: #{tether_data:key() => true},  % 未送信の変更
+          version = 0    :: non_neg_integer(),   % pending が対応する版
+          overflow = false :: boolean(),         % 溜めきれなくなった
+          backlog        :: pos_integer()
          }).
 
 %%%===================================================================
@@ -83,9 +101,29 @@ start_link(Client) -> gen_server:start_link(?MODULE, Client, []).
 -spec request(pid(), non_neg_integer(), [[tether_data:op()]]) -> result().
 request(Pid, Seq, Groups) -> gen_server:call(Pid, {request, Seq, Groups}, 30000).
 
--spec info(pid()) -> #{client := binary(), last := non_neg_integer(),
-                       served := non_neg_integer(), deduped := non_neg_integer()}.
+-spec info(pid()) -> map().
 info(Pid) -> gen_server:call(Pid, info).
+
+%%----------------------------------------------------------------------
+%% @doc コレクションを購読する。**現在の中身と版を返す。**
+%% 以後の変更はこのプロセスが溜め、sync/1 で差分として渡す。
+%%----------------------------------------------------------------------
+-spec subscribe(pid(), binary()) ->
+          {ok, non_neg_integer(), [{tether_data:key(), tether_data:value()}]}.
+subscribe(Pid, Coll) -> gen_server:call(Pid, {subscribe, Coll}, 30000).
+
+-spec unsubscribe(pid(), binary()) -> ok.
+unsubscribe(Pid, Coll) -> gen_server:call(Pid, {unsubscribe, Coll}).
+
+%%----------------------------------------------------------------------
+%% @doc 前回から変わったぶんを受け取る。
+%%
+%%   {delta,  Version, [{Key, Value | deleted}]}   差分で追いつけた
+%%   {resync, Version, [{Coll, Rows}]}             溜めきれなかった。取り直し
+%%----------------------------------------------------------------------
+-spec sync(pid()) -> {delta, non_neg_integer(), list()}
+                   | {resync, non_neg_integer(), list()}.
+sync(Pid) -> gen_server:call(Pid, sync, 30000).
 
 %%%===================================================================
 %%% gen_server
@@ -101,7 +139,9 @@ init(Client) ->
                         none -> {0, undefined};
                         LR   -> LR
                     end,
-    {ok, #s{client = Client, last = Last, reply = Reply}, ?IDLE_MS}.
+    {ok, #s{client = Client, last = Last, reply = Reply,
+            backlog = application:get_env(tether, sync_backlog,
+                                          ?DEFAULT_BACKLOG)}, ?IDLE_MS}.
 
 handle_call({request, Seq, _Ops}, _From, #s{last = Last, reply = R} = S)
   when Seq =:= Last, Last > 0 ->
@@ -116,13 +156,49 @@ handle_call({request, Seq, _Ops}, _From, #s{last = Last} = S) when Seq =< Last -
     {reply, {error, {seq_too_old, Last}}, S, ?IDLE_MS};
 handle_call({request, _Seq, _Ops}, _From, #s{last = Last} = S) ->
     {reply, {error, {seq_gap, Last}}, S, ?IDLE_MS};
+handle_call({subscribe, Coll}, _From, #s{subs = Subs} = S) ->
+    %% **名簿への登録が先、複製の取得が後。** 逆にすると、その隙間に
+    %% 起きた変更をどちらも拾えない。この順なら重複するだけで済み、
+    %% 差分は「現在値」なので重複は無害。
+    ok = tether_sessions:subscribe(Coll, self()),
+    {V, Rows} = tether_store:snapshot(Coll),
+    {reply, {ok, V, Rows},
+     S#s{subs = lists:usort([Coll | Subs]), version = max(V, S#s.version)},
+     ?IDLE_MS};
+handle_call({unsubscribe, Coll}, _From, #s{subs = Subs} = S) ->
+    ok = tether_sessions:unsubscribe(Coll, self()),
+    {reply, ok, S#s{subs = lists:delete(Coll, Subs)}, ?IDLE_MS};
+handle_call(sync, _From, #s{overflow = true, subs = Subs} = S) ->
+    %% 溜めきれなかった。全部取り直してもらう。
+    Snaps = [{C, element(2, tether_store:snapshot(C))} || C <- Subs],
+    V = tether_store:version(),
+    {reply, {resync, V, Snaps},
+     S#s{overflow = false, pending = #{}, version = V}, ?IDLE_MS};
+handle_call(sync, _From, #s{pending = P, version = V} = S) ->
+    Rows = tether_store:read_many(maps:keys(P)),
+    {reply, {delta, V, Rows}, S#s{pending = #{}}, ?IDLE_MS};
 handle_call(info, _From, #s{client = C, last = L, served = Sv, deduped = D} = S) ->
-    {reply, #{client => C, last => L, served => Sv, deduped => D}, S, ?IDLE_MS};
+    {reply, #{client => C, last => L, served => Sv, deduped => D,
+              subs => S#s.subs, pending => maps:size(S#s.pending),
+              version => S#s.version, overflow => S#s.overflow}, S, ?IDLE_MS};
 handle_call(_R, _From, S) ->
     {reply, {error, unknown_call}, S, ?IDLE_MS}.
 
 handle_cast(_M, S) -> {noreply, S, ?IDLE_MS}.
 
+%% 購読しているコレクションが書き換わった。**溜めておく。**
+%% クライアントが圏外でも、このプロセスは生きていて記録し続ける。
+%% 行にはこれができない。
+handle_info({changed, V, Keys}, #s{pending = P, backlog = B} = S) ->
+    P1 = lists:foldl(fun(K, M) -> M#{K => true} end, P, Keys),
+    case maps:size(P1) > B of
+        true ->
+            %% 溜めきれない。差分を捨てて「取り直せ」に切り替える。
+            %% **捨てるのはこのクライアントの分だけ。** 他には波及しない。
+            {noreply, S#s{pending = #{}, overflow = true, version = V}, ?IDLE_MS};
+        false ->
+            {noreply, S#s{pending = P1, version = V}, ?IDLE_MS}
+    end;
 %% 暇なら畳む。100万セッションのうち動いているのは一握り、という
 %% 前提で設計している。hibernate はヒープを最小まで縮める。
 handle_info(timeout, S) -> {noreply, S, hibernate};

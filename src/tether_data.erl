@@ -21,6 +21,7 @@
 -module(tether_data).
 
 -export([new/0, apply_ops/3, apply_batch/3, get/2, size/1, keys/1, fold/3]).
+-export([collection/2, is_internal/1]).
 -export([validate/1, limits/0]).
 
 -export_type([db/0, key/0, value/0, op/0, result/0, ctx/0, group_result/0]).
@@ -196,19 +197,52 @@ fold(F, Acc0, Db) -> maps:fold(F, Acc0, Db).
 %% 流し切る実装だと、在庫を確保できていないのに注文が確定する。
 %% どこで止まったかを返し、そこから先の判断はクライアント(あるいは人)に返す。
 %%----------------------------------------------------------------------
--spec apply_batch([[op()]], ctx(), db()) -> {[group_result()], db()}.
-apply_batch(Groups, Ctx, Db) -> apply_batch(Groups, Ctx, Db, []).
+%% 返り値の3つ目は**書き換わった鍵**。購読しているクライアントへ
+%% 差分を押し出すために要る。値そのものは持たない。
+%% 「この鍵が変わった」だけ分かれば、押し出すときに現在値を読めばよい。
+%% 版ごとの値を保持すると、履歴の分だけ場所を食う。
+-spec apply_batch([[op()]], ctx(), db()) -> {[group_result()], db(), [key()]}.
+apply_batch(Groups, Ctx, Db) ->
+    {R, Db1, Ch} = apply_batch(Groups, Ctx, Db, [], []),
+    {R, Db1, lists:usort(Ch)}.
 
-apply_batch([], _Ctx, Db, Acc) ->
-    {lists:reverse(Acc), Db};
-apply_batch([G | T], Ctx, Db, Acc) ->
+apply_batch([], _Ctx, Db, Acc, Ch) ->
+    {lists:reverse(Acc), Db, Ch};
+apply_batch([G | T], Ctx, Db, Acc, Ch) ->
     case apply_ops(G, Ctx, Db) of
         {ok, R, Db1} ->
-            apply_batch(T, Ctx, Db1, [{ok, R} | Acc]);
+            apply_batch(T, Ctx, Db1, [{ok, R} | Acc], changed(G, Ch));
         {error, N, R, Db1} ->
             %% ここで止める。T は実行しない。
-            {lists:reverse([{error, N, R} | Acc]), Db1}
+            {lists:reverse([{error, N, R} | Acc]), Db1, Ch}
     end.
+
+%% 書き込み系の操作が触った鍵を拾う。読み取りは含めない。
+%% 内部用の鍵($pool など)は外に出さない。
+changed([], Ch) -> Ch;
+changed([Op | T], Ch) ->
+    case touched(Op) of
+        none -> changed(T, Ch);
+        K    -> case is_internal(K) of
+                    true  -> changed(T, Ch);
+                    false -> changed(T, [K | Ch])
+                end
+    end.
+
+touched({put, K, _})    -> K;
+touched({delete, K})    -> K;
+touched({cas, K, _, _}) -> K;
+touched({decr, K, _})   -> K;
+touched(_)              -> none.       % get と預かりの操作
+
+%% @doc 鍵のコレクション部分。購読の単位。
+-spec collection(key(), db()) -> binary().
+collection({C, _}, _Db) -> C.
+
+%% @doc 内部用の鍵か。$ で始まるコレクションは外に出さない。
+-spec is_internal(key()) -> boolean().
+is_internal({<<"$", _/binary>>, _}) -> true;
+is_internal(_)                      -> false.
 
 -spec apply_ops([op()], ctx(), db()) ->
           {ok, [result()], db()} | {error, pos_integer(), result(), db()}.

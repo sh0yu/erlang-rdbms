@@ -17,6 +17,7 @@
 
 -export([request/3, read/1, open/1, close/1, session_info/1]).
 -export([stock/2, pool/1, request_batch/3, resume/1]).
+-export([subscribe/2, unsubscribe/2, sync/1]).
 -export([session_count/0, stat/0]).
 
 -spec open(binary()) -> {ok, pid()} | {error, term()}.
@@ -88,6 +89,46 @@ read(Key) -> tether_store:read(Key).
 %%----------------------------------------------------------------------
 -spec resume(binary()) -> map().
 resume(Client) -> tether_store:resume(Client).
+
+%%----------------------------------------------------------------------
+%% @doc コレクションを購読する。現在の中身と版が返る。
+%%
+%% 以後、そのコレクションが書き換わると、このクライアントの
+%% **セッションプロセスが変更を溜める**。圏外の間も溜まり続け、
+%% sync/1 で差分として受け取れる。
+%%
+%% 行にはこれができない(溜められない)。接続に紐づける設計でも
+%% できない(切れたら消える)。生きていて安いプロセスが要る。
+%%----------------------------------------------------------------------
+-spec subscribe(binary(), binary()) ->
+          {ok, non_neg_integer(), list()} | {error, term()}.
+subscribe(Client, Collection) ->
+    case tether_sessions:ensure(Client) of
+        {ok, Pid} -> tether_session:subscribe(Pid, Collection);
+        E         -> E
+    end.
+
+-spec unsubscribe(binary(), binary()) -> ok | {error, term()}.
+unsubscribe(Client, Collection) ->
+    case tether_sessions:lookup(Client) of
+        {ok, Pid} -> tether_session:unsubscribe(Pid, Collection);
+        none      -> ok
+    end.
+
+%%----------------------------------------------------------------------
+%% @doc 前回から変わったぶんを受け取る。
+%%
+%%   {delta,  Version, [{Key, Value | deleted}]}
+%%   {resync, Version, [{Collection, Rows}]}      溜めきれなかった
+%%----------------------------------------------------------------------
+-spec sync(binary()) -> {delta, non_neg_integer(), list()}
+                      | {resync, non_neg_integer(), list()}
+                      | {error, term()}.
+sync(Client) ->
+    case tether_sessions:lookup(Client) of
+        {ok, Pid} -> tether_session:sync(Pid);
+        none      -> {error, not_subscribed}
+    end.
 
 %%----------------------------------------------------------------------
 %% @doc 中央在庫を増減する(管理操作)。

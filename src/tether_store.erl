@@ -38,6 +38,7 @@
 -export([start_link/1, submit/3, submit_batch/3, read/1, size/0, keys/0]).
 -export([sessions/0, session/1]).
 -export([checkpoint/0, entries/0, escrow_pool/1, resume/1]).
+-export([read_many/1, snapshot/1, version/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([reply/0]).
@@ -144,6 +145,23 @@ entries() -> gen_server:call(?MODULE, entries).
 %% ここではセッションの記憶と預かりが**同じログから復元されている**ので、
 %% 食い違いようがない。
 %%----------------------------------------------------------------------
+%%----------------------------------------------------------------------
+%% @doc 鍵をまとめて読む。差分の押し出しで使う。
+%% 消えている鍵は deleted として返す。
+%%----------------------------------------------------------------------
+-spec read_many([tether_data:key()]) ->
+          [{tether_data:key(), tether_data:value() | deleted}].
+read_many(Keys) -> gen_server:call(?MODULE, {read_many, Keys}).
+
+%% @doc コレクション丸ごと。差分で追いつけなくなった相手に渡す。
+-spec snapshot(binary()) ->
+          {non_neg_integer(), [{tether_data:key(), tether_data:value()}]}.
+snapshot(Collection) -> gen_server:call(?MODULE, {snapshot, Collection}).
+
+%% @doc 現在の版。書き込みごとに単調に増える。
+-spec version() -> non_neg_integer().
+version() -> gen_server:call(?MODULE, entries).
+
 -spec resume(binary()) ->
           #{last_seq := non_neg_integer(), last_reply := term(),
             grants := [{binary(), non_neg_integer(), integer()}]}.
@@ -184,10 +202,14 @@ handle_call({submit, Client, Seq, Groups}, From, #s{db = Db, index = I} = S) ->
     %% 復旧の再実行では記録された方を使う。
     Now = erlang:system_time(millisecond),
     Ctx = #{now => Now, client => Client},
-    {Results, Db1} = tether_data:apply_batch(Groups, Ctx, Db),
+    {Results, Db1, Changed} = tether_data:apply_batch(Groups, Ctx, Db),
     Reply = {ok, Results},
     Entry = tether_entry:new(I + 1, Now, Client, Seq, Groups, Reply),
     ok = tether_log:commit(tether_entry:encode(Entry), From, Reply),
+    %% 購読しているセッションへ「この鍵が変わった」を配る。
+    %% 興味のあるプロセスだけに配るので、書き込み1件あたりの費用は
+    %% 全セッション数ではなく、そのコレクションの購読者数に比例する。
+    ok = tether_sessions:publish(I + 1, Changed),
     %% 返答しない。永続化されたらログが From へ返す。
     {noreply, maybe_checkpoint(
                 S#s{db = Db1, index = I + 1, log_records = S#s.log_records + 1,
@@ -212,6 +234,13 @@ handle_call({resume, Client}, _From, #s{db = Db, sessions = Sess} = S) ->
                  {R, Exp} <- [tether_escrow:grant_view(Client, Res, Db)],
                  Exp > Now],
     {reply, #{last_seq => Last, last_reply => Reply, grants => Grants}, S};
+handle_call({read_many, Keys}, _From, #s{db = Db} = S) ->
+    {reply, [{K, maps:get(K, Db, deleted)} || K <- Keys], S};
+handle_call({snapshot, Coll}, _From, #s{db = Db, index = V} = S) ->
+    Rows = maps:fold(fun({C, _} = K, Val, Acc) when C =:= Coll -> [{K, Val} | Acc];
+                        (_, _, Acc) -> Acc
+                     end, [], Db),
+    {reply, {V, lists:sort(Rows)}, S};
 handle_call({escrow_pool, Res}, _From, #s{db = Db} = S) ->
     Ctx = #{now => 0, client => <<>>},
     {ok, {pool, A, G}, _} = tether_escrow:apply({pool_of, Res}, Ctx, Db),
