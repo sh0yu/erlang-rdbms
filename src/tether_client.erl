@@ -25,7 +25,7 @@
 -behaviour(gen_server).
 
 -export([open/2, close/1, read/2, write/2, acquire/4, sync/1, state/1]).
--export([offline/1, online/1, is_online/1]).
+-export([offline/1, online/1, is_online/1, dump/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export([now_ms/0]).
@@ -70,6 +70,10 @@ sync(Pid) -> gen_server:call(Pid, sync, 60000).
 
 -spec state(pid()) -> map().
 state(Pid) -> gen_server:call(Pid, state).
+
+%% @doc 手元の複製の中身(コレクション単位)。未送信の書き込みも含む。
+-spec dump(pid(), binary()) -> [{tether_data:key(), tether_data:value()}].
+dump(Pid, Collection) -> gen_server:call(Pid, {dump, Collection}).
 
 -spec offline(pid()) -> ok.
 offline(Pid) -> gen_server:call(Pid, {net, false}).
@@ -142,6 +146,11 @@ handle_call(state, _From, #c{replica = R, online = On} = S) ->
               grants  => tether_replica:grants(now_ms(), R),
               online  => On}, S};
 
+handle_call({dump, Coll}, _From, #c{replica = R} = S) ->
+    Db = tether_replica:view(now_ms(), R),
+    Rows = maps:fold(fun({C, _} = K, V, Acc) when C =:= Coll -> [{K, V} | Acc];
+                        (_, _, Acc) -> Acc end, [], Db),
+    {reply, lists:sort(Rows), S};
 handle_call({net, On}, _From, S)  -> {reply, ok, S#c{online = On}};
 handle_call(is_online, _From, S)  -> {reply, S#c.online, S};
 handle_call(_R, _From, S)         -> {reply, {error, unknown_call}, S}.

@@ -3,6 +3,7 @@
 #
 #   bin/tether demo     exactly-once と local-first を見せる
 #   bin/tether bench    預かり(escrow)が効くかを測る
+#   bin/tether web      ブラウザで見る (http://127.0.0.1:8080)
 #   bin/tether shell    対話シェル(rebar3 shell)
 #   bin/tether test     試験一式
 set -e
@@ -20,7 +21,9 @@ case "${1:-demo}" in
                 -eval 'tether_demo:run(), halt().' ;;
     bench) exec erl -noshell +pc unicode -pa "$EBIN" \
                 -eval 'tether_bench:run(), halt().' ;;
+    web)   exec erl -noshell +pc unicode -pa "$EBIN" \
+                -eval 'tether_web:start(), receive stop -> ok end.' ;;
     shell) exec rebar3 shell ;;
     test)  exec rebar3 eunit ;;
-    *)     echo "usage: bin/tether [demo|bench|shell|test]" >&2; exit 1 ;;
+    *)     echo "usage: bin/tether [demo|bench|web|shell|test]" >&2; exit 1 ;;
 esac
