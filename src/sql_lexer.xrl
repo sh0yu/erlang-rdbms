@@ -59,7 +59,7 @@ keywords() ->
      "order", "by", "asc", "desc", "limit", "offset", "distinct",
      "nulls", "first", "last",
      "group", "having",
-     "explain",
+     "explain", "index",
      "join", "inner", "left", "outer", "cross", "on", "as"].
 
 keyword_or_identifier(Chars, Line) ->

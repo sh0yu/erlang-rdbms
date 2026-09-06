@@ -256,6 +256,12 @@ run_sql(State, {create_table, Table, Columns}) ->
     with_ddl(State, fun() -> simple_db_server:create_table(get_db_pid(State), Table, Columns) end);
 run_sql(State, {drop_table, Table}) ->
     with_ddl(State, fun() -> simple_db_server:drop_table(get_db_pid(State), Table) end);
+run_sql(State, {create_index, Name, Table, Column}) ->
+    with_ddl(State, fun() ->
+                            simple_db_server:create_index(get_db_pid(State), Name, Table, Column)
+                    end);
+run_sql(State, {drop_index, Name}) ->
+    with_ddl(State, fun() -> simple_db_server:drop_index(get_db_pid(State), Name) end);
 
 %% DML。トランザクションが要る
 run_sql(State, {select, Plan}) ->
@@ -730,7 +736,13 @@ check_table(_State, TableName, Val) ->
 %% 条件に一致するオブジェクトIDのリストを返す。
 %% 共有インデックスを引いた結果に、自分のローカルの変更を実行順に重ねる。
 select_object_id_list(State, TableName, ColName, Val, QueryIdList) ->
-    ShareData = (simple_db_server:index_module()):select_index(TableName, ColName, Val),
+    %% 索引が無ければ走査に落ちる。索引だけを見ていると、
+    %% CREATE INDEX していないカラムへの検索が黙って空になる。
+    %% 存在しないカラムは従来どおり空を返す(タプルAPIの互換)。
+    ShareData = case simple_db_server:oids_matching(TableName, ColName, Val) of
+                    {error, _Reason} -> [];
+                    OidList          -> OidList
+                end,
     lists:foldl(fun(QueryId, SData) ->
                         merge_local_index(State, TableName, ColName, Val, SData, QueryId)
                 end, ShareData, QueryIdList).

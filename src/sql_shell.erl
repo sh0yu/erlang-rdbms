@@ -160,6 +160,7 @@ meta(Sh, "h") -> help(), Sh;
 meta(Sh, "d") -> list_tables(), Sh;
 meta(Sh, "dt") -> list_tables(), Sh;
 meta(Sh, "d " ++ Table) -> describe(string:trim(Table)), Sh;
+meta(Sh, "di") -> list_indexes(), Sh;
 meta(#sh{timing = T} = Sh, "timing") ->
     io:format("timing is ~ts~n", [case T of true -> "off"; false -> "on" end]),
     Sh#sh{timing = not T};
@@ -194,6 +195,15 @@ list_tables() ->
     case sys_tbl_mng:list_tables(whereis(sys_tbl_mng)) of
         {ok, []} -> io:format("no tables~n");
         {ok, Tables} -> print_table(["table"], [[T] || T <- Tables])
+    end.
+
+list_indexes() ->
+    case sys_tbl_mng:list_indexes(whereis(sys_tbl_mng)) of
+        {ok, []} ->
+            io:format("no indexes~n");
+        {ok, Indexes} ->
+            print_table(["index", "table", "column"],
+                        [[N, T, C] || {index, N, T, C} <- Indexes])
     end.
 
 describe(Name) ->

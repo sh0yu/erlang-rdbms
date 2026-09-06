@@ -21,9 +21,11 @@
          select_data/4, update_data/5, vacuum/2, list_tables/1]).
 -export([read_data_oid/2, read_data_oid_with_column/2]).
 -export([scan_open/1, scan_next/1, scan_fold/3]).
+-export([oids_matching/3]).
 -export([validate_insert/3, validate_delete/1]).
 -export([convert_set_query/2, build_new_val/2, get_tab_column_key/2]).
 -export([index_module/0]).
+-export([create_index/4, drop_index/2, list_indexes/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -102,11 +104,11 @@ init([]) ->
 handle_call({create_table, {TableName, ColumnList}}, _From, State) ->
     Reply = case sys_tbl_mng:create_table(whereis(sys_tbl_mng), TableName, ColumnList) of
                 ok ->
-                    %% ColumnList は型つき([{name, varchar}, ...])のこともある。
-                    %% 索引が要るのはカラム名だけなので、カタログが正規化した
-                    %% 名前を引き直して渡す。
-                    {ok, Names} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-                    ok = (index_module()):create_table(TableName, Names),
+                    %% **索引は張らない。** 以前は全カラムに自動で張っていたが、
+                    %% それだと「索引があるか」が常に真になり、プランナの
+                    %% アクセスパス選択が退化する。索引は CREATE INDEX で
+                    %% 明示的に作る。
+                    ok = (index_module()):create_table(TableName, []),
                     ok;
                 {error, Reason} ->
                     {error, Reason}
@@ -115,7 +117,7 @@ handle_call({create_table, {TableName, ColumnList}}, _From, State) ->
 
 handle_call({drop_table, {TableName}}, _From, State) ->
     %% インデックスを先に落とすため、カタログを消す前にカラム一覧を取る
-    Reply = case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+    Reply = case sys_tbl_mng:get_index_column_list(whereis(sys_tbl_mng), TableName) of
                 {error, table_not_found} ->
                     {error, table_not_found};
                 {ok, ColumnList} ->
@@ -138,11 +140,12 @@ handle_call({insert, {TableName, Oid, Val}}, _From, State) ->
                     %% 見えず走査からは見える幽霊行になる)。
                     %% 古い値は索引を外すのに要るので、上書きする前に控えておく。
                     OldVal = existing_row(TableName, ColumnList, Oid),
+                    IdxCols = indexed_columns(TableName),
                     case data_buffer:write_data(whereis(data_buffer), TableName, Oid, Val) of
                         ok ->
-                            ok = unindex(TableName, ColumnList, Oid, OldVal),
+                            ok = unindex(TableName, ColumnList, IdxCols, Oid, OldVal),
                             ok = (index_module()):insert_index(
-                                   TableName, lists:zip(ColumnList, Val), Oid),
+                                   TableName, only_indexed(IdxCols, ColumnList, Val), Oid),
                             ok;
                         {error, Reason} ->
                             {error, Reason}
@@ -150,14 +153,40 @@ handle_call({insert, {TableName, Oid, Val}}, _From, State) ->
             end,
     {reply, Reply, State};
 
+%% 索引があれば索引で引き、無ければ全表走査に落ちる。
+%%
+%% **落ちる先が無いと、索引の無いカラムへの検索が黙って空を返す。**
+%% 全カラムに自動で索引が張られていた頃はこの経路に入らなかったが、
+%% 索引を明示的にするなら走査は必須になる。
+%%
+%% 走査を gen_server の中で回すのでエンジンを占有するが、
+%% トランザクションはどのみち直列なので実害は無い。
 handle_call({select, {TableName, ColumnName, Val}}, _From, State) ->
-    Reply = case sys_tbl_mng:exist_table(whereis(sys_tbl_mng), TableName) of
-                false ->
+    Reply = case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+                {error, table_not_found} ->
                     {error, table_not_found};
-                true ->
-                    OidList = (index_module()):select_index(TableName, ColumnName, Val),
-                    Rows = [read_data_oid(TableName, Oid) || Oid <- OidList],
-                    [R || R <- Rows, R =/= not_found]
+                {ok, ColumnList} ->
+                    case lists:member(ColumnName, indexed_columns(TableName)) of
+                        true ->
+                            OidList = (index_module()):select_index(
+                                        TableName, ColumnName, Val),
+                            Rows = [read_data_oid(TableName, Oid) || Oid <- OidList],
+                            [R || R <- Rows, R =/= not_found];
+                        false ->
+                            scan_select(TableName, ColumnList, ColumnName, Val)
+                    end
+            end,
+    {reply, Reply, State};
+
+handle_call({create_index, {IndexName, TableName, ColumnName}}, _From, State) ->
+    {reply, do_create_index(IndexName, TableName, ColumnName), State};
+
+handle_call({drop_index, {IndexName}}, _From, State) ->
+    Reply = case sys_tbl_mng:drop_index(whereis(sys_tbl_mng), IndexName) of
+                {error, Reason} -> {error, Reason};
+                {ok, Table, Column} ->
+                    ok = (index_module()):drop_index(Table, Column),
+                    ok
             end,
     {reply, Reply, State};
 
@@ -171,14 +200,15 @@ handle_call({delete, {TableName, Oid}}, _From, State) ->
                     {error, table_not_found};
                 {ok, ColumnList} ->
                     %% 挿入と同じ理由で、行を消してから索引を外す
+                    IdxCols = indexed_columns(TableName),
                     OldVal = existing_row(TableName, ColumnList, Oid),
                     case data_buffer:delete_data(whereis(data_buffer), Oid) of
                         ok ->
-                            unindex(TableName, ColumnList, Oid, OldVal);
+                            unindex(TableName, ColumnList, IdxCols, Oid, OldVal);
                         %% すでに消えている場合も削除は成功とみなす(冪等)。
                         %% 索引に参照が残っていれば外しておく。
                         {error, oid_not_found} ->
-                            unindex(TableName, ColumnList, Oid, OldVal);
+                            unindex(TableName, ColumnList, IdxCols, Oid, OldVal);
                         {error, Reason} ->
                             {error, Reason}
                     end
@@ -290,30 +320,45 @@ do_update(TableName, SetQuery, ColumnName, Val) ->
             case unknown_columns(SetQuery, ColumnList) of
                 [] ->
                     SetQueryConverted = convert_set_query(SetQuery, ColumnList),
-                    OidList = (index_module()):select_index(TableName, ColumnName, Val),
-                    update_rows(TableName, ColumnList, SetQueryConverted, OidList, 0);
+                    %% 索引が無ければ走査で対象を集める。
+                    %% ここを索引だけにしておくと、索引の無いカラムを
+                    %% 条件にした UPDATE が黙って0件になる。
+                    case oids_matching(TableName, ColumnList, ColumnName, Val) of
+                        {error, Reason} ->
+                            {error, Reason};
+                        OidList ->
+                            IdxCols = indexed_columns(TableName),
+                            update_rows(TableName, ColumnList, IdxCols,
+                                        SetQueryConverted, OidList, 0)
+                    end;
                 Unknown ->
                     {error, {unknown_columns, Unknown}}
             end
     end.
 
-update_rows(_TableName, _ColumnList, _SetQueryConverted, [], Count) ->
+update_rows(_TableName, _ColumnList, _IdxCols, _SetQueryConverted, [], Count) ->
     {ok, Count};
-update_rows(TableName, ColumnList, SetQueryConverted, [Oid | Rest], Count) ->
+update_rows(TableName, ColumnList, IdxCols, SetQueryConverted, [Oid | Rest], Count) ->
     case read_data_oid(TableName, Oid) of
         not_found ->
-            update_rows(TableName, ColumnList, SetQueryConverted, Rest, Count);
+            update_rows(TableName, ColumnList, IdxCols, SetQueryConverted, Rest, Count);
         OldVal ->
             NewVal = build_new_val(OldVal, SetQueryConverted),
             case data_buffer:update_data(whereis(data_buffer), TableName, Oid, NewVal) of
                 {ok, _PhysLoc} ->
-                    %% 値が変わったカラムだけインデックスを張り替える
+                    %% 値が変わったカラムだけインデックスを張り替える。
+                    %% 索引の無いカラムは触らない(ETSが存在しない)。
                     lists:foreach(
                       fun({ColumnN, OldColVal, NewColVal}) ->
-                              ok = (index_module()):update_index(
-                                     TableName, ColumnN, OldColVal, NewColVal, Oid)
+                              case lists:member(ColumnN, IdxCols) of
+                                  true ->
+                                      ok = (index_module()):update_index(
+                                             TableName, ColumnN, OldColVal, NewColVal, Oid);
+                                  false -> ok
+                              end
                       end, lists:zip3(ColumnList, OldVal, NewVal)),
-                    update_rows(TableName, ColumnList, SetQueryConverted, Rest, Count + 1);
+                    update_rows(TableName, ColumnList, IdxCols, SetQueryConverted,
+                                Rest, Count + 1);
                 {error, Reason} ->
                     {error, Reason}
             end
@@ -336,13 +381,100 @@ existing_row(TableName, ColumnList, Oid) ->
     end.
 
 %% 控えておいた古い値の索引参照を外す。
-unindex(_TableName, _ColumnList, _Oid, none) ->
+unindex(_TableName, _ColumnList, _IdxCols, _Oid, none) ->
     ok;
-unindex(TableName, ColumnList, Oid, OldVal) ->
+unindex(TableName, ColumnList, IdxCols, Oid, OldVal) ->
     lists:foreach(fun({ColName, ColVal}) ->
                           ok = (index_module()):delete_index(TableName, ColName, ColVal, Oid)
-                  end, lists:zip(ColumnList, OldVal)),
+                  end, only_indexed(IdxCols, ColumnList, OldVal)),
     ok.
+
+%%----------------------------------------------------------------------
+%% 索引まわりの補助
+%%
+%% 索引の張られたカラムはカタログにしかない。1行ごとに引くとDETSを
+%% 舐め直すことになるので、**操作の頭で1回だけ引いて持ち回る**。
+%%----------------------------------------------------------------------
+indexed_columns(TableName) ->
+    case sys_tbl_mng:get_index_column_list(whereis(sys_tbl_mng), TableName) of
+        {ok, Cols}      -> Cols;
+        {error, _}      -> []
+    end.
+
+%% {カラム名, 値} の組を、索引のあるカラムだけに絞る。
+only_indexed(IdxCols, ColumnList, Val) ->
+    [P || {C, _} = P <- lists:zip(ColumnList, Val), lists:member(C, IdxCols)].
+
+%% 索引が無いカラムへの等値検索。全表走査して突き合わせる。
+scan_select(TableName, ColumnList, ColumnName, Val) ->
+    case scan_matching(TableName, ColumnList, ColumnName, Val) of
+        {error, Reason} -> {error, Reason};
+        Pairs           -> [Row || {_Oid, Row} <- Pairs]
+    end.
+
+%%----------------------------------------------------------------------
+%% @doc 条件に合う行のOid。索引があれば索引を、無ければ走査を使う。
+%% read_data_oid/2 と同じく、呼び出し元のプロセスから直接呼ぶ。
+%%----------------------------------------------------------------------
+oids_matching(TableName, ColumnName, Val) ->
+    case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
+        {error, Reason}  -> {error, Reason};
+        {ok, ColumnList} -> oids_matching(TableName, ColumnList, ColumnName, Val)
+    end.
+
+oids_matching(TableName, ColumnList, ColumnName, Val) ->
+    case lists:member(ColumnName, indexed_columns(TableName)) of
+        true ->
+            (index_module()):select_index(TableName, ColumnName, Val);
+        false ->
+            case scan_matching(TableName, ColumnList, ColumnName, Val) of
+                {error, Reason} -> {error, Reason};
+                Pairs           -> [Oid || {Oid, _Row} <- Pairs]
+            end
+    end.
+
+scan_matching(TableName, ColumnList, ColumnName, Val) ->
+    case position_of(ColumnName, ColumnList) of
+        not_found ->
+            {error, {column_not_found, ColumnName}};
+        Pos ->
+            lists:reverse(
+              scan_fold(TableName,
+                        fun({Oid, Row}, Acc) when length(Row) >= Pos ->
+                                case lists:nth(Pos, Row) of
+                                    Val -> [{Oid, Row} | Acc];
+                                    _   -> Acc
+                                end;
+                           ({_Oid, _Row}, Acc) ->
+                                Acc
+                        end, []))
+    end.
+
+%% カラム名から行タプル内の位置(1始まり)。
+position_of(Name, List) -> position_of(Name, List, 1).
+
+position_of(_Name, [], _N)       -> not_found;
+position_of(Name, [Name | _], N) -> N;
+position_of(Name, [_ | T], N)    -> position_of(Name, T, N + 1).
+
+%% CREATE INDEX。定義を登録してから、既存の行で索引を作り直す。
+do_create_index(IndexName, TableName, ColumnName) ->
+    case sys_tbl_mng:create_index(whereis(sys_tbl_mng), IndexName, TableName, ColumnName) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
+            ok = (index_module()):create_index(TableName, ColumnName),
+            Pos = position_of(ColumnName, ColumnList),
+            scan_fold(TableName,
+                      fun({Oid, Row}, Acc) when length(Row) >= Pos ->
+                              ok = (index_module()):insert_index(
+                                     TableName, [{ColumnName, lists:nth(Pos, Row)}], Oid),
+                              Acc;
+                         ({_Oid, _Row}, Acc) ->
+                              Acc
+                      end, ok)
+    end.
 
 %%----------------------------------------------------------------------
 %% @doc 挿入が成功しうるかを、共有データを一切変更せずに確かめる。
@@ -385,13 +517,14 @@ rebuild_indexes() ->
 
 rebuild_table_index(TableName) ->
     {ok, ColumnList} = sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName),
-    ok = (index_module()):create_table(TableName, ColumnList),
+    IdxCols = indexed_columns(TableName),
+    ok = (index_module()):create_table(TableName, IdxCols),
     %% 新しい順次走査を使う。起動のたびに走るので、これが走査の
     %% 実利用者となり、既存の再起動テストがそのまま回帰検出器になる。
     scan_fold(TableName,
               fun({Oid, Val}, Acc) when length(Val) =:= length(ColumnList) ->
                       ok = (index_module()):insert_index(
-                             TableName, lists:zip(ColumnList, Val), Oid),
+                             TableName, only_indexed(IdxCols, ColumnList, Val), Oid),
                       Acc;
                  ({_Oid, _Val}, Acc) ->
                       %% カラム数が合わない行はカタログと整合しないので飛ばす
@@ -408,6 +541,18 @@ rebuild_table_index(TableName) ->
 %% index             : B+tree。等値検索に加えて範囲検索ができる。
 %% どちらも同じ関数群を備えているので差し替えられる。
 %%----------------------------------------------------------------------
+%%----------------------------------------------------------------------
+%% @doc 索引を作る / 落とす / 一覧する。
+%%----------------------------------------------------------------------
+create_index(Pid, IndexName, TableName, ColumnName) ->
+    gen_server:call(Pid, {create_index, {IndexName, TableName, ColumnName}}, infinity).
+
+drop_index(Pid, IndexName) ->
+    gen_server:call(Pid, {drop_index, {IndexName}}, infinity).
+
+list_indexes(_Pid) ->
+    sys_tbl_mng:list_indexes(whereis(sys_tbl_mng)).
+
 index_module() ->
     application:get_env(transaction_db, index_module, simple_index).
 

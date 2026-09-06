@@ -25,6 +25,7 @@
 
 %% Public API
 -export([init/0, create_table/2, drop_table/2, add_column/2]).
+-export([create_index/2, drop_index/2, exist_index/2]).
 -export([insert_index/3, delete_index/4, update_index/5, select_index/3,
          select_range/4]).
 -export([get_index_ets/1, get_tree_top/2]).
@@ -64,6 +65,35 @@ create_table(TableName, ColNameList) ->
     _ = add_table(TableName),
     lists:foreach(fun(ColName) -> add_column(TableName, ColName) end, ColNameList),
     ok.
+
+%%----------------------------------------------------------------------
+%% @doc カラム1つぶんの索引を作る / 落とす。simple_index と同じ口。
+%%
+%% drop_index は木の根を消すだけで、ぶら下がっていた節はテーブルの
+%% ETS に残る。テーブルを落とすまで回収されない(既知の割り切り)。
+%%----------------------------------------------------------------------
+create_index(TableName, ColName) ->
+    _ = add_table(TableName),
+    _ = add_column(TableName, ColName),
+    ok.
+
+drop_index(TableName, ColName) ->
+    case ets:lookup(ms_index, TableName) of
+        [] -> ok;
+        [{TableName, IndexName}] ->
+            case ets:info(IndexName) of
+                undefined -> ok;
+                _ -> ets:delete(IndexName, ColName), ok
+            end
+    end.
+
+exist_index(TableName, ColName) ->
+    case ets:lookup(ms_index, TableName) of
+        [] -> false;
+        [{TableName, IndexName}] ->
+            ets:info(IndexName) =/= undefined
+                andalso get_tree_top(IndexName, ColName) =/= not_found
+    end.
 
 drop_table(TableName, _ColNameList) ->
     case ets:lookup(ms_index, TableName) of

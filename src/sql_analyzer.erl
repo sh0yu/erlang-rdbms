@@ -46,6 +46,30 @@ analyze(#create_table_stmt{table = TableStr, columns = Defs}) ->
         Dups -> {error, {duplicate_columns, Dups}}
     end;
 
+%% CREATE INDEX。索引名は新しい名前なので list_to_atom で作る。
+%% テーブル名・カラム名はカタログに載っているものだけを解決する。
+analyze(#create_index_stmt{name = NameStr, table = TableStr, column = ColStr}) ->
+    with_table(TableStr,
+               fun(Table, Columns) ->
+                       case to_existing_atom(ColStr) of
+                           error ->
+                               {error, {no_such_column, ColStr}};
+                           {ok, Col} ->
+                               case lists:keyfind(Col, #column.name, Columns) of
+                                   false -> {error, {no_such_column, ColStr}};
+                                   _     -> {ok, {create_index, to_atom(NameStr), Table, Col}}
+                               end
+                       end
+               end);
+
+analyze(#drop_index_stmt{name = NameStr}) ->
+    %% 存在しない索引名は「見つからない」であって新しい名前ではないので、
+    %% ここでアトム表を増やさない。
+    case to_existing_atom(NameStr) of
+        error     -> {error, {index_not_found, NameStr}};
+        {ok, Name} -> {ok, {drop_index, Name}}
+    end;
+
 analyze(#drop_table_stmt{table = TableStr}) ->
     with_table(TableStr, fun(Table, _Columns) -> {ok, {drop_table, Table}} end);
 

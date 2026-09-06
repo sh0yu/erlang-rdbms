@@ -16,6 +16,15 @@
 %% 型宣言のない古いタプルAPIで作られたテーブルとの互換のためだけに存在する。
 -type sql_type() :: integer | float | varchar | boolean | any.
 
+%% 索引の定義。カタログが持つ唯一の索引の真実。
+%% 索引モジュール(ETS)の状態は起動のたびに作り直されるので、
+%% 「どのカラムに索引があるか」はここにしか永続化されない。
+-record(index, {
+    name   :: atom(),
+    table  :: atom(),
+    column :: atom()
+}).
+
 -record(column, {
     name     :: atom(),
     type     = any :: sql_type(),

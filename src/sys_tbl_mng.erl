@@ -13,6 +13,7 @@
 
 %% Public API
 -export([start_link/0, stop/1]).
+-export([create_index/4, drop_index/2, get_indexes/2, list_indexes/1]).
 -export([create_table/3, drop_table/2, exist_table/2,
          get_column_list/2, get_index_column_list/2, list_tables/1,
          get_columns/2]).
@@ -25,7 +26,8 @@
 -include("../include/catalog.hrl").
 
 -record(st, {
-    ms_tables
+    ms_tables,
+    ms_indexes
 }).
 
 %%%===================================================================
@@ -75,11 +77,42 @@ get_columns(Pid, TableName) ->
     gen_server:call(Pid, {get_columns, TableName}).
 
 %%----------------------------------------------------------------------
-%% @doc インデックスを張るカラムの一覧。現状は全カラムが対象。
+%% @doc 索引が張られているカラムの一覧。
+%%
+%% **以前は全カラムを返していた。** 全カラムに自動で索引が張られていたので
+%% 「索引があるか」が常に真になり、プランナのアクセスパス選択が退化する。
+%% いまは CREATE INDEX で明示的に宣言されたものだけを返す。
 %% Returns: {ok, ColumnList} | {error, table_not_found}
 %%----------------------------------------------------------------------
 get_index_column_list(Pid, TableName) ->
-    gen_server:call(Pid, {get_column_list, TableName}).
+    case gen_server:call(Pid, {get_indexes, TableName}) of
+        {error, Reason} -> {error, Reason};
+        {ok, Indexes}   -> {ok, [I#index.column || I <- Indexes]}
+    end.
+
+%%----------------------------------------------------------------------
+%% @doc 索引を定義する。
+%% Returns: ok | {error, table_not_found | column_not_found
+%%                     | index_already_exists | already_indexed}
+%%----------------------------------------------------------------------
+create_index(Pid, IndexName, TableName, ColumnName) ->
+    gen_server:call(Pid, {create_index, IndexName, TableName, ColumnName}).
+
+%%----------------------------------------------------------------------
+%% @doc 索引の定義を消す。落とすべきETSを呼び出し側に伝えるため、
+%% どのテーブルのどのカラムだったかを返す。
+%% Returns: {ok, TableName, ColumnName} | {error, {index_not_found, Name}}
+%%----------------------------------------------------------------------
+drop_index(Pid, IndexName) ->
+    gen_server:call(Pid, {drop_index, IndexName}).
+
+%% @doc テーブルに定義されている索引。Returns: {ok, [#index{}]} | {error, _}
+get_indexes(Pid, TableName) ->
+    gen_server:call(Pid, {get_indexes, TableName}).
+
+%% @doc 全索引。名前順。
+list_indexes(Pid) ->
+    gen_server:call(Pid, list_indexes).
 
 exist_table(Pid, TableName) ->
     gen_server:call(Pid, {exist_table, TableName}).
@@ -95,7 +128,11 @@ init([]) ->
     DataDir = application:get_env(transaction_db, data_dir, "./data"),
     ok = filelib:ensure_dir(filename:join(DataDir, "x")),
     {ok, Name} = dets:open_file(ms_tables, [{file, filename:join(DataDir, "ms_tables.sys")}]),
-    {ok, #st{ms_tables = Name}}.
+    %% 索引の定義は別のDETSに置く。テーブルの行 {Name, Columns} の形を
+    %% 変えると、既存のデータファイルとの互換が切れる。
+    {ok, IdxName} = dets:open_file(ms_indexes,
+                                   [{file, filename:join(DataDir, "ms_indexes.sys")}]),
+    {ok, #st{ms_tables = Name, ms_indexes = IdxName}}.
 
 handle_call({create_table, TableName, ColumnList}, _From, #st{ms_tables = MsTables} = State) ->
     Reply = case validate(TableName, ColumnList) of
@@ -113,16 +150,78 @@ handle_call({create_table, TableName, ColumnList}, _From, #st{ms_tables = MsTabl
             end,
     {reply, Reply, State};
 
-handle_call({drop_table, TableName}, _From, #st{ms_tables = MsTables} = State) ->
+handle_call({drop_table, TableName}, _From,
+            #st{ms_tables = MsTables, ms_indexes = MsIdx} = State) ->
     Reply = case dets:lookup(MsTables, TableName) of
                 [] ->
                     {error, table_not_found};
                 [_] ->
+                    %% テーブルに付いていた索引の定義も消す。
+                    %% 残すと、同名のテーブルを作り直したときに
+                    %% 実体の無い索引があることになる。
+                    _ = [dets:delete(MsIdx, I#index.name)
+                         || I <- indexes_of(MsIdx, TableName)],
                     ok = dets:delete(MsTables, TableName),
                     ok = dets:sync(MsTables),
+                    ok = dets:sync(MsIdx),
                     ok
             end,
     {reply, Reply, State};
+
+handle_call({create_index, IndexName, TableName, ColumnName}, _From,
+            #st{ms_tables = MsTables, ms_indexes = MsIdx} = State) ->
+    Reply =
+        case lookup_columns(MsTables, TableName) of
+            {error, Reason} ->
+                {error, Reason};
+            {ok, Columns} ->
+                case lists:keyfind(ColumnName, #column.name, Columns) of
+                    false ->
+                        {error, {column_not_found, ColumnName}};
+                    _ ->
+                        case dets:lookup(MsIdx, IndexName) of
+                            [_] ->
+                                {error, index_already_exists};
+                            [] ->
+                                case [I || I <- indexes_of(MsIdx, TableName),
+                                           I#index.column =:= ColumnName] of
+                                    [_ | _] ->
+                                        {error, already_indexed};
+                                    [] ->
+                                        Idx = #index{name = IndexName,
+                                                     table = TableName,
+                                                     column = ColumnName},
+                                        ok = dets:insert(MsIdx, {IndexName, Idx}),
+                                        ok = dets:sync(MsIdx),
+                                        ok
+                                end
+                        end
+                end
+        end,
+    {reply, Reply, State};
+
+handle_call({drop_index, IndexName}, _From, #st{ms_indexes = MsIdx} = State) ->
+    Reply = case dets:lookup(MsIdx, IndexName) of
+                [] ->
+                    {error, {index_not_found, IndexName}};
+                [{IndexName, #index{table = T, column = C}}] ->
+                    ok = dets:delete(MsIdx, IndexName),
+                    ok = dets:sync(MsIdx),
+                    {ok, T, C}
+            end,
+    {reply, Reply, State};
+
+handle_call({get_indexes, TableName}, _From,
+            #st{ms_tables = MsTables, ms_indexes = MsIdx} = State) ->
+    Reply = case dets:lookup(MsTables, TableName) of
+                [] -> {error, table_not_found};
+                [_] -> {ok, indexes_of(MsIdx, TableName)}
+            end,
+    {reply, Reply, State};
+
+handle_call(list_indexes, _From, #st{ms_indexes = MsIdx} = State) ->
+    All = dets:foldl(fun({_N, I}, Acc) -> [I | Acc] end, [], MsIdx),
+    {reply, {ok, lists:keysort(#index.name, All)}, State};
 
 handle_call({get_column_list, TableName}, _From, #st{ms_tables = MsTables} = State) ->
     Reply = case lookup_columns(MsTables, TableName) of
@@ -157,9 +256,21 @@ handle_cast(_Msg, State) ->
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-terminate(_Reason, #st{ms_tables = MsTables}) ->
+terminate(_Reason, #st{ms_tables = MsTables, ms_indexes = MsIdx}) ->
+    _ = dets:sync(MsIdx),
+    _ = dets:close(MsIdx),
     _ = dets:close(MsTables),
     ok.
+
+%% テーブルに付いている索引。名前順に揃えておく。
+indexes_of(MsIdx, TableName) ->
+    All = dets:foldl(fun({_N, I}, Acc) ->
+                             case I#index.table =:= TableName of
+                                 true -> [I | Acc];
+                                 false -> Acc
+                             end
+                     end, [], MsIdx),
+    lists:keysort(#index.name, All).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.

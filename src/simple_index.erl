@@ -16,6 +16,7 @@
 -module(simple_index).
 
 -export([init/0, create_table/2, drop_table/2, exist_index/2]).
+-export([create_index/2, drop_index/2]).
 -export([insert_index/3, delete_index/4, update_index/5, select_index/3]).
 -export([get_tab_column_key/2]).
 
@@ -50,6 +51,18 @@ drop_table(TableName, ColNameList) ->
     lists:foreach(fun(ColName) ->
                           drop_column_index(get_tab_column_key(TableName, ColName))
                   end, ColNameList),
+    ok.
+
+%%----------------------------------------------------------------------
+%% @doc カラム1つぶんの索引を作る / 落とす。
+%% CREATE INDEX / DROP INDEX の受け口。
+%%----------------------------------------------------------------------
+create_index(TableName, ColName) ->
+    _ = create_column_index(get_tab_column_key(TableName, ColName)),
+    ok.
+
+drop_index(TableName, ColName) ->
+    _ = drop_column_index(get_tab_column_key(TableName, ColName)),
     ok.
 
 exist_index(TableName, ColName) ->

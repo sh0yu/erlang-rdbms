@@ -26,7 +26,7 @@
 Nonterminals
     stmt
     select_stmt create_stmt drop_stmt insert_stmt update_stmt delete_stmt tx_stmt
-    explain_stmt
+    explain_stmt create_index_stmt drop_index_stmt
     select_list select_item table_ref opt_where expr literal
     neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
     opt_group opt_having expr_list func_call
@@ -48,7 +48,7 @@ Terminals
     'and' 'or' 'not' 'is'
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
-    'group' 'having' 'explain'
+    'group' 'having' 'explain' 'index'
     'join' 'inner' 'left' 'outer' 'cross' 'on' 'as' '.'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
@@ -91,6 +91,8 @@ stmt -> update_stmt     : '$1'.
 stmt -> delete_stmt     : '$1'.
 stmt -> tx_stmt         : '$1'.
 stmt -> explain_stmt    : '$1'.
+stmt -> create_index_stmt : '$1'.
+stmt -> drop_index_stmt   : '$1'.
 stmt -> select_stmt ';' : '$1'.
 stmt -> create_stmt ';' : '$1'.
 stmt -> drop_stmt ';'   : '$1'.
@@ -99,6 +101,8 @@ stmt -> update_stmt ';' : '$1'.
 stmt -> delete_stmt ';' : '$1'.
 stmt -> tx_stmt ';'     : '$1'.
 stmt -> explain_stmt ';' : '$1'.
+stmt -> create_index_stmt ';' : '$1'.
+stmt -> drop_index_stmt ';'   : '$1'.
 
 %%%===================================================================
 %%% トランザクション制御
@@ -165,6 +169,12 @@ delete_stmt -> delete from identifier opt_where :
 %% EXPLAIN は SELECT にしか意味が無いが、文法では他の文も受ける。
 %% ここで弾くと「構文エラー」になり、なぜ駄目なのかが伝わらない。
 %% 受けておいて sql_analyzer が explain_requires_select を返す。
+create_index_stmt -> create 'index' identifier on identifier '(' identifier ')' :
+    #create_index_stmt{name = value_of('$3'), table = value_of('$5'), column = value_of('$7')}.
+
+drop_index_stmt -> drop 'index' identifier :
+    #drop_index_stmt{name = value_of('$3')}.
+
 explain_stmt -> 'explain' select_stmt : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' insert_stmt : #explain_stmt{stmt = '$2'}.
 explain_stmt -> 'explain' update_stmt : #explain_stmt{stmt = '$2'}.

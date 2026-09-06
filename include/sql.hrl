@@ -65,6 +65,18 @@
 %%% FROM句
 %%%===================================================================
 
+%% CREATE INDEX name ON table (column)
+-record(create_index_stmt, {
+    name,
+    table,
+    column
+}).
+
+%% DROP INDEX name
+-record(drop_index_stmt, {
+    name
+}).
+
 %% EXPLAIN <SELECT文>。実行せずに、選ばれた実行計画を返す。
 -record(explain_stmt, {
     stmt

@@ -109,6 +109,7 @@ OK
 | `\?` `\h` | ヘルプ |
 | `\d` | テーブル一覧 |
 | `\d NAME` | テーブル定義 |
+| `\di` | インデックス一覧 |
 | `\timing` | 実行時間の表示を切り替える |
 | `\q` | 終了 |
 
@@ -158,6 +159,9 @@ SQL:
 ```sql
 CREATE TABLE t (a VARCHAR, b INTEGER, c BOOLEAN);
 DROP TABLE t;
+CREATE INDEX i ON t (a);
+DROP INDEX i;
+EXPLAIN SELECT ...;
 INSERT INTO t [(c, ...)] VALUES (v, ...);
 UPDATE t SET c = expr, ... [WHERE expr];
 DELETE FROM t [WHERE expr];
@@ -306,6 +310,18 @@ monitorで検知してabortし、次のトランザクションに順番を渡�
 
 ### インデックス
 
+**索引は `CREATE INDEX` で明示的に作る。** 以前は `CREATE TABLE` が
+全カラムに自動で索引を張っていたが、それだと「索引があるか」が常に真になり、
+プランナのアクセスパス選択が退化する。
+
+```sql
+CREATE INDEX fruit_price ON fruit (price);
+DROP INDEX fruit_price;
+```
+
+索引の無いカラムへの検索は**全表走査に落ちる**。落ちる先が無いと、
+索引の無いカラムを条件にした検索が黙って空を返すことになる。
+
 既定は `simple_index`(ETSハッシュ、等値検索のみ)。設定で `index`
 (B+tree)に差し替えられる。B+treeは等値検索に加えて `index:select_range/4`
 による範囲検索ができる。
@@ -315,7 +331,12 @@ application:set_env(transaction_db, index_module, index).
 ```
 
 インデックスはETS上にしかないため、`simple_db_server` は起動時に
-カタログとデータファイルから読み直して再構築する。
+カタログとデータファイルから読み直して再構築する。作り直すのは
+カタログに宣言されているものだけ。
+
+索引の定義は `ms_indexes.sys`(DETS)に永続化される。テーブルの行の形
+`{Name, Columns}` を変えると既存のデータファイルとの互換が切れるので、
+別のDETSに分けてある。
 
 ## 設定
 
@@ -413,20 +434,20 @@ Erlangの価値が最も出るのはこの領域なので、いま安く、後�
   文レベルスナップショットが必要
 - **DDLのロールバック** — カタログ変更のUNDOが無いため、明示的な
   トランザクション内のDDLは拒否している
-- **全カラムに自動で索引が張られる** — プランナの索引選択が退化するので、
-  `CREATE INDEX` の導入が要る
 
 ## 制限
 
 - `CREATE TABLE` / `DROP TABLE` は暗黙のトランザクションとして実行される。
   他のトランザクションとは直列化されるが、明示的なトランザクションの中では
   実行できない(カタログ変更を戻すUNDOログが無いため)
+- 索引は単一カラムのみ。複合索引・一意索引は未実装
 - 副問い合わせ・`UNION`・ウィンドウ関数・`RIGHT`/`FULL OUTER JOIN` は未実装
 - 結合は入れ子ループのみ。右側は左の行ごとに読み直すため開始時にメモリへ載せる
   (ハッシュ結合は未実装)
 - 集約は NULL を入力から外す(`COUNT(*)` だけが例外)。
   空集合では `COUNT` が 0、それ以外は NULL を返す
-- `SELECT` は常に全表走査。索引を使うアクセスパス選択はプランナ未実装のため
+- `SELECT` は常に全表走査。索引を使うアクセスパス選択は未実装(Stage 7-5)。
+  `EXPLAIN` で選ばれた実行計画を確認できる
 - 型宣言のないテーブル(タプルAPIで作ったもの)は全カラムが `any` 型になり、
   アトムをそのまま格納する。SQLの文字列リテラル(binary)とは一致しない
 - トランザクションは1つずつ直列に実行されるため、書き込みの並行度は上がらない
