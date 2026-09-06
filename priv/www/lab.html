@@ -66,6 +66,27 @@
   .see{font-size:11.5px;color:var(--dim);margin-top:10px}
   .see a{color:var(--accent);text-decoration:none;margin-right:10px}
   .nav2{display:flex;gap:8px;margin-top:26px;border-top:1px solid var(--line);padding-top:14px}
+  /* 選び方の木 */
+  .flow{margin-bottom:20px}
+  .trail{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:14px}
+  .crumb{font-size:11px;color:var(--dim);background:#141920;padding:3px 9px}
+  .crumb.reset{color:var(--accent)}
+  .q{font-size:16px;margin:0 0 12px;color:#fff}
+  .opt{display:block;width:100%;text-align:left;padding:11px 14px;margin-bottom:7px;
+       font-size:13.5px;line-height:1.6;background:var(--panel)}
+  .opt:hover{background:#1d2634;border-color:var(--accent)}
+  .ans{background:var(--panel);border:1px solid var(--ok);border-radius:10px;padding:16px 18px}
+  .atitle{font-size:17px;color:var(--ok);font-weight:700;margin-bottom:8px}
+  .abody{font-size:13px;color:#c3cad4;margin-bottom:10px}
+  .picks{list-style:none;margin:0;padding:0}
+  .picks li{padding:4px 0 4px 16px;font-size:12.5px;color:#aeb6c2;position:relative}
+  .picks li:before{content:"▸";position:absolute;left:0;color:var(--accent)}
+  .tree{margin-top:8px;font-size:12px}
+  .tree summary{color:var(--dim);cursor:pointer;padding:6px 0}
+  .tn{margin:10px 0 14px;padding-left:12px;border-left:2px solid var(--line)}
+  .tq{color:#dfe5ec;margin-bottom:4px}
+  .to{color:#9aa3b0;padding:2px 0 2px 14px}
+  .to .arw{color:var(--accent);margin:0 6px}
 </style>
 </head>
 <body>
@@ -93,7 +114,7 @@ const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const md=s=>String(s||"").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>");
 const KIND={timeline:"時系列で追う",compare:"方式を並べて比べる",
-            matrix:"表で見る",notes:"整理"};
+            matrix:"表で見る",notes:"整理",flow:"押して辿る"};
 
 let BOOK=[], FLAT=[], speed=1500, run=0, cur=null;
 
@@ -135,7 +156,8 @@ function show(id){
   const w=el("div","why"); w.innerHTML=md(it.why); m.append(w);
 
   const me=++run;
-  if(it.kind==="timeline") timeline(m,it,me);
+  if(it.kind==="flow") flow(m,it);
+  else if(it.kind==="timeline") timeline(m,it,me);
   else if(it.kind==="compare") compare(m,it,me);
   else if(it.kind==="matrix") matrix(m,it);
   else notes(m,it);
@@ -245,6 +267,70 @@ function matrix(m,it){
     bd.append(tr);
   });
   tb.append(hd,bd); m.append(tb);
+}
+
+//----------------------------------------------------------------------
+// 選び方の木。押して辿る。
+//----------------------------------------------------------------------
+function flow(m,it){
+  const box=el("div","flow"); m.append(box);
+  const byId=id=>it.nodes.find(n=>n.id===id);
+  let trail=[];
+
+  function draw(id){
+    box.textContent="";
+    if(trail.length){
+      const bc=el("div","trail");
+      trail.forEach((t,i)=>{
+        const b=el("button","crumb",t.label);
+        b.onclick=()=>{trail=trail.slice(0,i); draw(t.from);};
+        bc.append(b);
+      });
+      const rs=el("button","crumb reset","最初から");
+      rs.onclick=()=>{trail=[]; draw(it.start);};
+      bc.append(rs);
+      box.append(bc);
+    }
+    const n=byId(id);
+    if(!n){box.append(el("div","","?")); return;}
+    if(n.q!==undefined){
+      const q=el("div","q"); q.innerHTML=md(n.q); box.append(q);
+      n.opts.forEach(op=>{
+        const b=el("button","opt");
+        b.innerHTML=md(op.label);
+        b.onclick=()=>{trail=trail.concat([{label:strip(op.label),from:id}]);
+                       draw(op.goto);};
+        box.append(b);
+      });
+    } else {
+      const a=el("div","ans");
+      a.append(el("div","atitle","→ "+n.answer));
+      const bd=el("div","abody"); bd.innerHTML=md(n.body); a.append(bd);
+      const ul=el("ul","picks");
+      (n.picks||[]).forEach(p=>{const li=el("li",""); li.innerHTML=md(p); ul.append(li);});
+      a.append(ul);
+      box.append(a);
+    }
+  }
+  const strip=s=>String(s).replace(/\*\*/g,"");
+  draw(it.start);
+
+  // 参照用に木の全体も出す
+  const ov=el("details","tree");
+  ov.append(el("summary","","木の全体を開く"));
+  it.nodes.filter(n=>n.q!==undefined).forEach(n=>{
+    const d=el("div","tn");
+    const h=el("div","tq"); h.innerHTML=md(n.q); d.append(h);
+    n.opts.forEach(op=>{
+      const t=byId(op.goto);
+      const r=el("div","to");
+      r.innerHTML=md(op.label)+' <span class="arw">→</span> '+
+                  (t&&t.answer?("<b>"+t.answer+"</b>"):(t?md(t.q):"?"));
+      d.append(r);
+    });
+    ov.append(d);
+  });
+  m.append(ov);
 }
 
 function notes(m,it){

@@ -25,9 +25,25 @@ shape_test() ->
              <<"matrix">>   -> Cols = length(maps:get(cols, I)),
                                [?assertEqual({Id, Cols}, {Id, length(maps:get(cells, R))})
                                 || R <- maps:get(rows, I)];
-             <<"notes">>    -> ?assert(length(maps:get(sections, I)) >= 1, Id)
+             <<"notes">>    -> ?assert(length(maps:get(sections, I)) >= 1, Id);
+             <<"flow">>     -> check_flow(I)
          end
      end || I <- tether_book:flat()].
+
+%% 選び方の木: 全ての枝の飛び先が実在し、全ての節へ到達できること
+check_flow(I) ->
+    Nodes = maps:get(nodes, I),
+    Ids   = [maps:get(id, N) || N <- Nodes],
+    ?assert(lists:member(maps:get(start, I), Ids)),
+    Gotos = [maps:get(goto, O) || N <- Nodes, O <- maps:get(opts, N, [])],
+    [?assert(lists:member(G, Ids), G) || G <- Gotos],
+    %% 到達できない節が無いこと(始点を除く)
+    Unreachable = [X || X <- Ids, X =/= maps:get(start, I),
+                        not lists:member(X, Gotos)],
+    ?assertEqual([], Unreachable),
+    %% 答えの節には picks があること
+    [?assert(length(maps:get(picks, N)) >= 1, maps:get(id, N))
+     || N <- Nodes, maps:is_key(answer, N)].
 
 %% 関連リンクの飛び先が実在すること
 seealso_resolves_test() ->
