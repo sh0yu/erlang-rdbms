@@ -26,7 +26,12 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
--record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex, queryId = []}).
+-record(state, {sdsPid, txMngPid, lockMngPid, txid, lKvstore, lColumnIndex,
+                queryId = [],
+                %% 読み取り専用トランザクションかどうか。
+                %% true のとき tx_mng の直列化の列に並ばず、
+                %% commit_latch の共有ラッチだけを持つ。
+                readonly = false}).
 
 %% トランザクションから見えるテーブル走査の状態。
 %% base   : 共有ページの走査カーソル
@@ -94,6 +99,26 @@ handle_call({exec_query, {begin_tx}}, _From, State) ->
     %% ネストしたトランザクションは扱わない
     {reply, {error, transaction_already_started}, State};
 
+%%----------------------------------------------------------------------
+%% 読み取り専用トランザクション。
+%%
+%% tx_mng の直列化の列に**並ばない**。代わりに commit_latch の共有
+%% ラッチを、トランザクションの間じゅう持つ。したがって
+%%
+%%   * 読み手同士は並行に走る(いまは互いに待っている)
+%%   * 読み手が動いている間、どのコミットも適用されない
+%%   * 読み手はコミットの全部を見るか全部を見ないか
+%%
+%% 直列化可能性は保たれる。書き手の変更は適用まで共有データに
+%% 現れず、その適用が読み手の終わりまで待つため、読み手は
+%% その書き手の前か後ろのどちらかに並べられる。
+%%----------------------------------------------------------------------
+handle_call({exec_query, {begin_read_only}}, _From, #state{txid = undefined} = State) ->
+    ok = commit_latch:read_lock(),
+    {reply, ok, State#state{txid = readonly, readonly = true, queryId = []}};
+handle_call({exec_query, {begin_read_only}}, _From, State) ->
+    {reply, {error, transaction_already_started}, State};
+
 handle_call({exec_query, {commit_tx}}, _From, State) ->
     with_transaction(State, fun() -> do_commit(State) end);
 
@@ -109,7 +134,7 @@ handle_call({exec_query, {drop_table, TableName}}, _From, State) ->
     with_ddl(State, fun() -> simple_db_server:drop_table(get_db_pid(State), TableName) end);
 
 handle_call({exec_query, {insert, TableName, Val}}, _From, State) ->
-    with_transaction(State, fun() -> do_insert(State, TableName, Val) end);
+    with_write_transaction(State, fun() -> do_insert(State, TableName, Val) end);
 
 handle_call({exec_query, {select, TableName, ColName, Val}}, _From, State) ->
     with_transaction(State, fun() -> do_select(State, TableName, ColName, Val) end);
@@ -124,10 +149,10 @@ handle_call({exec_query, {sql, Sql}}, _From, State) ->
     do_sql(State, Sql);
 
 handle_call({exec_query, {update, TableName, SetQuery, ColName, Val}}, _From, State) ->
-    with_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
+    with_write_transaction(State, fun() -> do_update(State, TableName, SetQuery, ColName, Val) end);
 
 handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State) ->
-    with_transaction(State, fun() -> do_delete(State, TableName, ColName, Val) end);
+    with_write_transaction(State, fun() -> do_delete(State, TableName, ColName, Val) end);
 
 handle_call({exec_query, Query}, _From, State) ->
     {reply, {error, {unsupported_query, Query}}, State};
@@ -182,7 +207,9 @@ with_ddl(#state{txid = undefined} = State, Fun) ->
     %% 自分の順番が来るまで待つ
     case tx_mng:allow_tx(TPid, Txid) of
         ok ->
-            Reply = Fun(),
+            %% DDLはカタログと索引を書き換える。走査中に表が落ちると
+            %% 読み手が壊れた状態を見るので、適用と同じく排他で囲う。
+            Reply = commit_latch:with_write(Fun),
             _ = tx_mng:commit_tx(TPid, Txid),
             {reply, Reply, State};
         transaction_not_found ->
@@ -190,6 +217,17 @@ with_ddl(#state{txid = undefined} = State, Fun) ->
     end;
 with_ddl(State, _Fun) ->
     {reply, {error, ddl_in_transaction}, State}.
+
+%%----------------------------------------------------------------------
+%% 書き込みを含む操作。読み取り専用トランザクションでは断る。
+%%
+%% 黙って通すと、共有ラッチを持ったまま共有データを書くことになり、
+%% 「読み手が動いている間はコミットが適用されない」が崩れる。
+%%----------------------------------------------------------------------
+with_write_transaction(#state{readonly = true} = State, _Fun) ->
+    {reply, {error, read_only_transaction}, State};
+with_write_transaction(State, Fun) ->
+    with_transaction(State, Fun).
 
 %% トランザクションが開始済みで、かつ自分の順番が来ていることを確かめてから
 %% Funを実行する。順番待ちの間はここでブロックする。
@@ -246,6 +284,8 @@ run_sql(State, {tx, 'begin'}) ->
         {reply, {error, Reason}, S} -> {reply, {error, Reason}, S};
         {reply, _Txid, S} -> {reply, ok, S}
     end;
+run_sql(State, {tx, begin_read_only}) ->
+    handle_call({exec_query, {begin_read_only}}, undefined, State);
 run_sql(State, {tx, commit}) ->
     handle_call({exec_query, {commit_tx}}, undefined, State);
 run_sql(State, {tx, rollback}) ->
@@ -278,11 +318,11 @@ run_sql(State, {explain, Logical}) ->
     Lines = sql_explain:explain(sql_planner:plan(Logical, catalog_fun())),
     {reply, {ok, ['QUERY PLAN'], [[L] || L <- Lines]}, State};
 run_sql(State, {insert, Table, Row}) ->
-    with_transaction(State, fun() -> do_insert(State, Table, Row) end);
+    with_write_transaction(State, fun() -> do_insert(State, Table, Row) end);
 run_sql(State, {update, Table, Assigns, Pred}) ->
-    with_transaction(State, fun() -> do_sql_update(State, Table, Assigns, Pred) end);
+    with_write_transaction(State, fun() -> do_sql_update(State, Table, Assigns, Pred) end);
 run_sql(State, {delete, Table, Pred}) ->
-    with_transaction(State, fun() -> do_sql_delete(State, Table, Pred) end).
+    with_write_transaction(State, fun() -> do_sql_delete(State, Table, Pred) end).
 
 do_sql_select(State, Logical) ->
     %% 論理プランから物理プランを作る。実行方法(全表走査か索引か、
@@ -605,6 +645,8 @@ local_only_rows(TableName, Delta) ->
 %%   3. checkpointを書く(ここまで来ればリカバリ不要)
 %%   4. ロックを解放してトランザクションを終了する
 %% 2の途中で落ちても、1が済んでいるのでリカバリで再実行できる。
+do_commit(#state{readonly = true} = State) ->
+    do_rollback(State);
 do_commit(State) ->
     TPid = get_tx_mng_pid(State),
     Txid = get_txid(State),
@@ -624,15 +666,29 @@ do_commit(State) ->
             {reply, {error, Reason}, State2};
         ok ->
             ok = write_redo_log(Txid, Changes),
-            ok = apply_changes(Changes),
-            %% チェックポイントを書く前にディスクへ落とす。
+            %% 適用は排他ラッチの下で行う。
             %%
-            %% リカバリは最後のチェックポイント以降しか再実行しない。
-            %% よってチェックポイントは「これより前は永続化済み」という宣言になる。
-            %% ページキャッシュに置いただけの状態でこれを書くと、電源断のときに
-            %% データは失われるのにリカバリは再実行せず、黙って消える。
-            ok = sync_for_commit(),
-            ok = log_util:redo_log_put_checkpoint(),
+            %% apply_changes/1 は1行ずつ書き、走査は data_buffer への
+            %% 呼び出しを繰り返すので、その隙間に適用が挟まると
+            %% **読み手がコミットの途中を見る**。ラッチで囲えば、
+            %% 読み手から見て適用は不可分になる。
+            %%
+            %% REDOログの書き込みはラッチの外に置く。ここが一番長く
+            %% かかる(fsyncを含む)ので、読み手を待たせる区間は
+            %% メモリ上の反映だけに絞る。
+            commit_latch:with_write(
+              fun() ->
+                      ok = apply_changes(Changes),
+                      %% チェックポイントを書く前にディスクへ落とす。
+                      %%
+                      %% リカバリは最後のチェックポイント以降しか再実行しない。
+                      %% よってチェックポイントは「これより前は永続化済み」という
+                      %% 宣言になる。ページキャッシュに置いただけの状態でこれを
+                      %% 書くと、電源断のときにデータは失われるのにリカバリは
+                      %% 再実行せず、黙って消える。
+                      ok = sync_for_commit(),
+                      ok = log_util:redo_log_put_checkpoint()
+              end),
             clear_local(State, QueryIdList),
             Rep = tx_mng:commit_tx(TPid, Txid),
             {reply, Rep, State#state{txid = undefined, queryId = []}}
@@ -654,6 +710,10 @@ validate_changes([{_QId, del, TableName, _Oid, _Val} | T]) ->
 
 %% ロールバックはローカル領域を捨てるだけでよい。
 %% 共有データにはまだ何も書いていない。
+%% 読み取り専用は共有データに何も書いていないので、ラッチを外すだけ。
+do_rollback(#state{readonly = true} = State) ->
+    ok = commit_latch:read_unlock(),
+    {reply, ok, State#state{txid = undefined, readonly = false, queryId = []}};
 do_rollback(State) ->
     TPid = get_tx_mng_pid(State),
     Txid = get_txid(State),
@@ -752,6 +812,9 @@ local_data(State, QueryId, Action, TableName, Oid, Val) ->
 %%%===================================================================
 
 %% トランザクションが開始済みか確かめ、自分の順番が来るまで待つ。
+%% 読み取り専用は直列化の列に並ばないので、順番待ちも要らない。
+ask_transaction(#state{readonly = true}) ->
+    ok;
 ask_transaction(#state{txid = undefined}) ->
     transaction_not_found;
 ask_transaction(#state{txMngPid = TPid, txid = Txid}) ->

@@ -9,6 +9,7 @@
 %%%   simple_db_server ストレージエンジン。起動時にインデックスを再構築する
 %%%   tx_mng          初期化でrecover:recover/0を呼ぶため、上記が揃った後
 %%%   lock_mng        ロック管理
+%%%   commit_latch    コミットの適用を読み手から見て原子的にするラッチ
 %%%   query_exec_sup  クライアント接続ごとのquery_execを起こす
 %%%
 %%% rest_for_oneにしているのは、下位のサーバが落ちたときに、その状態に
@@ -34,6 +35,7 @@ init(_Args) ->
                   worker(simple_db_server),
                   worker(tx_mng),
                   worker(lock_mng),
+                  worker(commit_latch),
                   #{id => query_exec_sup,
                     start => {query_exec_sup, start_link, []},
                     restart => permanent,

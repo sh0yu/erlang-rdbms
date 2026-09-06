@@ -48,7 +48,7 @@ Terminals
     'and' 'or' 'not' 'is'
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
-    'group' 'having' 'explain' 'index' 'analyze'
+    'group' 'having' 'explain' 'index' 'analyze' 'read' 'only'
     'join' 'inner' 'left' 'outer' 'cross' 'on' 'as' '.'
     ',' '*' '(' ')' ';'
     '=' '<>' '<' '<=' '>' '>=' '+' '-' '/'.
@@ -111,6 +111,8 @@ stmt -> analyze_stmt ';'      : '$1'.
 %%%===================================================================
 
 tx_stmt -> 'begin'  : #tx_stmt{op = 'begin'}.
+%% 読み取り専用トランザクションは直列化の列に並ばず、互いに並行に走る。
+tx_stmt -> 'begin' 'read' 'only' : #tx_stmt{op = begin_read_only}.
 tx_stmt -> commit   : #tx_stmt{op = commit}.
 tx_stmt -> rollback : #tx_stmt{op = rollback}.
 
