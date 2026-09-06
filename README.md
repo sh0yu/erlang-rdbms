@@ -3,8 +3,9 @@
 セッションが接続より長生きするデータベース。Erlang/OTP 25。
 
 ```
-bin/tether demo     exactly-once が効いていることを見せる
-bin/tether test     試験一式 (50件)
+bin/tether demo     exactly-once と local-first を見せる
+bin/tether bench    預かり(escrow)が効くかを測る
+bin/tether test     試験一式 (70件)
 bin/tether shell    対話シェル
 ```
 
@@ -93,6 +94,43 @@ tether_sessions   ETS名簿。引くのにプロセスを経由しない
   ディスクの故障が「データが少し古いだけ」に化けて表に出てこない
 
 詳細と、作りながら分かったことは `DESIGN.md`。
+
+## 圏外でも、在庫の下限を破らずに売る
+
+`{cas, ...}` では、オフライン中に前提が古くなると必ず落ちる。
+既存の同期エンジン(ElectricSQL, PowerSync, Replicache)も CRDT も、
+オフラインの書き込みは受け付けるが、**共有された有限資源の下限は守れない**。
+
+預かり(escrow)は、協調が要るのが「在庫が尽きるとき」だけであることを使う。
+
+```erlang
+%% オンラインのうちに持ち分を預かる
+{ok, [{granted, N, Expires}]} =
+    tether:request(<<"alice">>, 1, [{acquire, <<"sku:1">>, 5, 600000}]),
+
+%% --- ここから圏外。中央が空になっても関係ない ---
+
+%% 戻ってから、積んだ操作をまとめて流す。最初の失敗で止まる
+{ok, Results} = tether:request_batch(<<"alice">>, 2,
+    [[{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o1">>}, <<"c">>}],
+     [{consume, <<"sku:1">>, 1}, {put, {<<"orders">>, <<"o2">>}, <<"c">>}]]),
+
+%% 端末を作り直したら、自分の位置と権利を聞き直せる
+#{last_seq := L, grants := G} = tether:resume(<<"alice">>).
+```
+
+配る量は TCP の輻輳窓と同じ形で自動調整する。実測:
+
+```
+使い切るたびの配布量        [4, 8, 16, 32, 64, 128]
+枯渇に向かう配布量          [4, 4, 3, 1, 1, ..., sold_out]
+
+20000件の売上のうち、接続が要ったのは 1000回 (5%)
+遊休(配ってあるが未使用)は 19%
+```
+
+**escrow は速くするための機構ではない**(原子的減算に対しては 0.6〜0.9倍)。
+**接続を不要にするための機構**である。詳細と正直な限界は `DESIGN.md`。
 
 ## まだ無いもの
 

@@ -90,7 +90,9 @@ release_test() ->
 offline_client_still_sells_test() ->
     with_db(fun(_) ->
         {ok, _} = tether:stock(?SKU, 100),
-        {ok, [{granted, G, _}]} = req(<<"alice">>, 1, [{acquire, ?SKU, 5, 600000}]),
+        %% 実績が無いうちは小さくしか配られない(slow start)。
+        %% 圏外に出る前に、必要なだけ取り直しておくのがクライアントの仕事。
+        {G, Seq} = acquire_at_least(<<"alice">>, 5, 1),
         ?assert(G >= 5),
 
         %% alice は圏外。bob が中央を食い尽くす
@@ -100,7 +102,7 @@ offline_client_still_sells_test() ->
 
         %% alice が復帰して、溜めた5件を流す
         Results = [req(<<"alice">>, S, [{consume, ?SKU, 1}])
-                   || S <- lists:seq(2, 6)],
+                   || S <- lists:seq(Seq, Seq + 4)],
         ?assertEqual(5, length([x || {ok, [{consumed, _}]} <- Results])),
 
         %% 保存則: 売れた数 + 中央 + 預かり残 == 100
@@ -130,25 +132,49 @@ without_escrow_offline_write_fails_test() ->
 %%% 枯渇したら、古典の振る舞いへ連続的に退化する
 %%%===================================================================
 
-degrades_when_scarce_test() ->
+%% 使い切るたびに配る量が倍になる(TCP の slow start と同じ)。
+%% 初回から要求どおり配ると、少ししか使わずに消えるクライアントが
+%% 在庫を抱えたままいなくなる(実測で遊休75%)。
+grant_grows_with_use_test() ->
     with_db(fun(_) ->
-        {ok, _} = tether:stock(?SKU, 1000),
-        %% 在庫が減るにつれて、1回に配れる量が小さくなること
+        {ok, _} = tether:stock(?SKU, 100000),
+        {Sizes, _} =
+            lists:foldl(
+              fun(_, {Acc, Seq}) ->
+                      {ok, [{granted, G, _}]} =
+                          req(<<"alice">>, Seq, [{acquire, ?SKU, 100000, 600000}]),
+                      {ok, [{consumed, 0}]} = req(<<"alice">>, Seq+1,
+                                                  [{consume, ?SKU, G}]),
+                      {[G | Acc], Seq + 2}
+              end, {[], 1}, lists:seq(1, 6)),
+        Grants = lists:reverse(Sizes),
+        ?debugFmt("使い切るたびの配布量: ~p", [Grants]),
+        ?assertEqual([4, 8, 16, 32, 64, 128], Grants)
+    end).
+
+%% 在庫が減ると配れる量が落ち、最後は 1 になって sold_out へ。
+%% **崖が無く、古典のロックと同じ振る舞いへ連続的に退化する。**
+grants_shrink_when_scarce_test() ->
+    with_db(fun(_) ->
+        {ok, _} = tether:stock(?SKU, 20),
         Grants = [begin
                       C = <<"c", I:32>>,
-                      {ok, [{granted, G, _}]} =
-                          req(C, 1, [{acquire, ?SKU, 1000, 600000}]),
-                      G
-                  end || I <- lists:seq(1, 12)],
-        ?debugFmt("配られた量の推移: ~p", [Grants]),
-        %% 単調に減っていく(等しいことは許す)
+                      case req(C, 1, [{acquire, ?SKU, 1000, 600000}]) of
+                          {ok, [{granted, G, _}]} -> G;
+                          {error, 1, sold_out}    -> sold_out
+                      end
+                  end || I <- lists:seq(1, 14)],
+        ?debugFmt("枯渇に向かう配布量: ~p", [Grants]),
+        Nums = [G || G <- Grants, is_integer(G)],
+        %% 単調に減る(等しいことは許す)
         ?assert(lists:all(fun({A, B}) -> A >= B end,
-                          lists:zip(lists:droplast(Grants), tl(Grants)))),
-        ?assert(hd(Grants) > lists:last(Grants)),
+                          lists:zip(lists:droplast(Nums), tl(Nums)))),
+        ?assertEqual(1, lists:last(Nums)),          % 最後は1個ずつ
+        ?assert(lists:member(sold_out, Grants)),    % そして尽きる
         %% 配った総和は在庫を超えない
         {A, G} = tether:pool(?SKU),
-        ?assertEqual(1000, A + G),
-        ?assertEqual(lists:sum(Grants), G)
+        ?assertEqual(20, A + G),
+        ?assertEqual(lists:sum(Nums), G)
     end).
 
 sold_out_when_empty_test() ->
@@ -205,6 +231,14 @@ survives_restart_test() ->
     end).
 
 %%%===================================================================
+
+%% 必要な量が貯まるまで取り直す。slow start があるので数回かかる。
+acquire_at_least(C, N, Seq) ->
+    case req(C, Seq, [{acquire, ?SKU, N, 600000}]) of
+        {ok, [{granted, G, _}]} when G >= N -> {G, Seq + 1};
+        {ok, [{granted, _, _}]}             -> acquire_at_least(C, N, Seq + 1);
+        {error, 1, sold_out}                -> error(sold_out)
+    end.
 
 drain(C, Seq) -> drain(C, Seq, 0).
 drain(C, Seq, N) when N < 500 ->

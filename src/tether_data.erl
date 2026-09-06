@@ -41,6 +41,11 @@
               %% 期待した値と一致したときだけ書く。undefined は「無いこと」を期待する。
               %% read-modify-write を1往復で書くための最小の道具。
             | {cas, key(), value() | undefined, value()}
+              %% 1往復で済む原子的な減算。下限を割るなら失敗する。
+              %% RDBMS の `UPDATE t SET n = n - 1 WHERE n >= 1` にあたる。
+              %% 読んでから書く形と違い再試行が起きないが、
+              %% **その行に対する直列化は残る**。
+            | {decr, key(), pos_integer()}
               %% 預かり(escrow)。数値の下限を、協調なしで守るための道具。
               %% 詳細は tether_escrow を参照。
             | {stock,    resource(), integer()}
@@ -60,6 +65,7 @@
                 | {released,  non_neg_integer()}
                 | {grant,     non_neg_integer(), integer()}
                 | {pool,      non_neg_integer(), non_neg_integer()}
+                | {decremented, non_neg_integer()}
                 | {insufficient, non_neg_integer()}
                 | sold_out
                 | expired.
@@ -123,6 +129,7 @@ op_bytes(Op) when element(1, Op) =:= stock;   element(1, Op) =:= acquire;
 op_bytes({get, K})           -> key_bytes(K);
 op_bytes({delete, K})        -> key_bytes(K);
 op_bytes({put, K, V})        -> add(key_bytes(K), value_bytes(V));
+op_bytes({decr, K, _})       -> key_bytes(K);
 op_bytes({cas, K, undefined, V}) -> add(key_bytes(K), value_bytes(V));
 op_bytes({cas, K, E, V})     -> add(key_bytes(K), add(value_bytes(E), value_bytes(V)));
 op_bytes(Other)              -> {error, {unknown_op, Other}}.
@@ -231,6 +238,18 @@ apply_one({cas, K, Expect, New}, _Ctx, Db) when is_binary(New) ->
         {error, undefined}      -> {ok, ok, Db#{K => New}};
         {{ok, Actual}, _}       -> {error, {conflict, Actual}};
         {error, _}              -> {error, {conflict, undefined}}
+    end;
+apply_one({decr, K, N}, _Ctx, Db) ->
+    case maps:find(K, Db) of
+        {ok, V} ->
+            try binary_to_integer(V) of
+                Cur when Cur >= N ->
+                    {ok, {decremented, Cur - N}, Db#{K => integer_to_binary(Cur - N)}};
+                Cur ->
+                    {error, {insufficient, Cur}}
+            catch _:_ -> {error, {conflict, V}}
+            end;
+        error -> {error, {insufficient, 0}}
     end;
 apply_one(Op, Ctx, Db) ->
     %% 預かりの操作。時刻とクライアントが要るので Ctx を渡す。

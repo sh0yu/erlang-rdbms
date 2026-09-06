@@ -31,8 +31,9 @@ open(Client) -> tether_sessions:ensure(Client).
 %%
 %% 大きすぎる要求はここで拒む。上限は tether_data:limits/0。
 %%----------------------------------------------------------------------
+%% 1グループだけの束なので、返るのは1つのグループの結果。
 -spec request(binary(), non_neg_integer(), [tether_data:op()]) ->
-          tether_session:result() | {error, term()}.
+          tether_data:group_result() | {error, term()}.
 request(Client, Seq, Ops) ->
     %% 大きさの検査は**セッションへ渡す前**に行う。
     %% セッションのメールボックスに入った時点で確保は済んでいるので、
@@ -60,7 +61,7 @@ unwrap(Other)     -> Other.
 %% 束全体で通番は1つなので、途中で切れても**同じ束を送り直せばよい**。
 %%----------------------------------------------------------------------
 -spec request_batch(binary(), non_neg_integer(), [[tether_data:op()]]) ->
-          {ok, [tether_data:group_result()]} | {error, term()}.
+          tether_session:result() | {error, term()}.
 request_batch(Client, Seq, Groups) ->
     case lists:foldl(fun(G, ok) -> tether_data:validate(G); (_, E) -> E end,
                      ok, Groups) of
