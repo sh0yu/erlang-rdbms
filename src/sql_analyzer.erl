@@ -21,7 +21,7 @@
 %%%-------------------------------------------------------------------
 -module(sql_analyzer).
 
--export([analyze/1]).
+-export([analyze/1, analyze/2]).
 
 -include("../include/sql.hrl").
 -include("../include/logical.hrl").
@@ -29,7 +29,11 @@
 
 %% 名前解決のスコープ。結合すると複数テーブルのカラムが1つの行に並ぶので、
 %% 別名とカラム名の組で引き、位置は連結後の行における位置になる。
--record(sc, {alias, name, type, pos}).
+%% level は名前解決の層。0 がこの問い合わせ自身、1 が1つ外側、2 がその外。
+%% 相関副問い合わせは外側の列を参照するので、内側のスコープの後ろに
+%% 外側のスコープを level を1つ上げて連ねる。位置は**それぞれの行の中の
+%% 位置**で、混ざらない({ref, N} と {outer, Level, N} で区別する)。
+-record(sc, {alias, name, type, pos, level = 0}).
 
 %%----------------------------------------------------------------------
 %% @doc AST を実行可能な形に変換する。
@@ -37,23 +41,32 @@
 %% SELECT はプラン木に、それ以外は実行器を経由しない操作記述になる。
 %% Returns: {ok, Op} | {error, Reason}
 %%----------------------------------------------------------------------
-analyze(#tx_stmt{op = Op}) ->
+%%----------------------------------------------------------------------
+%% @doc AST を実行可能な形に変換する。
+%% Outer は外側の問い合わせのスコープ(相関副問い合わせ用)。
+%%----------------------------------------------------------------------
+analyze(Stmt) -> analyze(Stmt, []).
+
+%% 副問い合わせへ入るとき、いまのスコープを1段外側にする。
+outer_scope(Columns) -> [S#sc{level = S#sc.level + 1} || S <- Columns].
+
+analyze(#tx_stmt{op = Op}, _Outer) ->
     {ok, {tx, Op}};
 
-analyze(#create_table_stmt{table = TableStr, columns = Defs}) ->
+analyze(#create_table_stmt{table = TableStr, columns = Defs}, _Outer) ->
     case duplicate_names([N || {N, _T} <- Defs]) of
         [] -> {ok, {create_table, to_atom(TableStr), [{to_atom(N), T} || {N, T} <- Defs]}};
         Dups -> {error, {duplicate_columns, Dups}}
     end;
 
-analyze(#analyze_stmt{table = undefined}) ->
+analyze(#analyze_stmt{table = undefined}, _Outer) ->
     {ok, {analyze, all}};
-analyze(#analyze_stmt{table = TableStr}) ->
+analyze(#analyze_stmt{table = TableStr}, _Outer) ->
     with_table(TableStr, fun(Table, _Columns) -> {ok, {analyze, Table}} end);
 
 %% CREATE INDEX。索引名は新しい名前なので list_to_atom で作る。
 %% テーブル名・カラム名はカタログに載っているものだけを解決する。
-analyze(#create_index_stmt{name = NameStr, table = TableStr, column = ColStr}) ->
+analyze(#create_index_stmt{name = NameStr, table = TableStr, column = ColStr}, _Outer) ->
     with_table(TableStr,
                fun(Table, Columns) ->
                        case to_existing_atom(ColStr) of
@@ -67,7 +80,7 @@ analyze(#create_index_stmt{name = NameStr, table = TableStr, column = ColStr}) -
                        end
                end);
 
-analyze(#drop_index_stmt{name = NameStr}) ->
+analyze(#drop_index_stmt{name = NameStr}, _Outer) ->
     %% 存在しない索引名は「見つからない」であって新しい名前ではないので、
     %% ここでアトム表を増やさない。
     case to_existing_atom(NameStr) of
@@ -75,19 +88,19 @@ analyze(#drop_index_stmt{name = NameStr}) ->
         {ok, Name} -> {ok, {drop_index, Name}}
     end;
 
-analyze(#drop_table_stmt{table = TableStr}) ->
+analyze(#drop_table_stmt{table = TableStr}, _Outer) ->
     with_table(TableStr, fun(Table, _Columns) -> {ok, {drop_table, Table}} end);
 
-analyze(#insert_stmt{table = TableStr, columns = ColStrs, values = Values}) ->
+analyze(#insert_stmt{table = TableStr, columns = ColStrs, values = Values}, _Outer) ->
     with_table(TableStr, fun(Table, Columns) -> bind_insert(Table, Columns, ColStrs, Values) end);
 
-analyze(#update_stmt{table = TableStr, set = Set, where = Where}) ->
+analyze(#update_stmt{table = TableStr, set = Set, where = Where}, _Outer) ->
     with_table(TableStr,
                fun(Table, Columns) ->
                        bind_update(Table, Columns, scope_of(Table, Columns), Set, Where)
                end);
 
-analyze(#delete_stmt{table = TableStr, where = Where}) ->
+analyze(#delete_stmt{table = TableStr, where = Where}, _Outer) ->
     with_table(TableStr,
                fun(Table, Columns) ->
                        case bind_where(Where, scope_of(Table, Columns)) of
@@ -98,8 +111,8 @@ analyze(#delete_stmt{table = TableStr, where = Where}) ->
 
 %% EXPLAIN は中の文を解析するだけで実行しない。
 %% 実行計画を持つのは SELECT だけなので、他は断る。
-analyze(#explain_stmt{stmt = Inner}) ->
-    case analyze(Inner) of
+analyze(#explain_stmt{stmt = Inner}, Outer) ->
+    case analyze(Inner, Outer) of
         {ok, {select, Logical}} -> {ok, {explain, Logical}};
         {ok, _Other}            -> {error, explain_requires_select};
         {error, Reason}         -> {error, Reason}
@@ -114,8 +127,10 @@ analyze(#explain_stmt{stmt = Inner}) ->
 %%     この a は左の出力列であって、右のスコープには無い。
 %%----------------------------------------------------------------------
 analyze(#set_op_stmt{op = Op, all = All, left = L, right = R,
-                     order_by = Order, limit = Limit, offset = Offset}) ->
-    case {analyze(L), analyze(R)} of
+                     order_by = Order, limit = Limit, offset = Offset}, Outer) ->
+    %% 被演算子は同じ層。集合演算が相関副問い合わせの中にあれば、
+    %% 両側とも外側の列を見られる
+    case {analyze(L, Outer), analyze(R, Outer)} of
         {{error, Reason}, _} -> {error, Reason};
         {_, {error, Reason}} -> {error, Reason};
         {{ok, {select, LP}}, {ok, {select, RP}}} ->
@@ -129,10 +144,10 @@ analyze(#set_op_stmt{op = Op, all = All, left = L, right = R,
             end
     end;
 
-analyze(#select_stmt{from = From} = Stmt) ->
+analyze(#select_stmt{from = From} = Stmt, Outer) ->
     case build_from(reorder_joins(From, Stmt#select_stmt.where)) of
         {error, Reason} -> {error, Reason};
-        {ok, Scope, Node} -> bind_select(Stmt, Scope, Node)
+        {ok, Scope, Node} -> bind_select(Stmt, Scope ++ Outer, Node)
     end.
 
 %%%===================================================================
@@ -140,8 +155,9 @@ analyze(#select_stmt{from = From} = Stmt) ->
 %%%===================================================================
 
 %% 副問い合わせを解析して論理プランにする。Arity が 1 なら1列であることを要求する。
-with_subplan(Q, Arity, Wrap) ->
-    case analyze(Q) of
+%% Columns は外側のスコープ。1段外側にして持ち込むと、中から外の列が引ける。
+with_subplan(Q, Arity, Wrap, Columns) ->
+    case analyze(Q, outer_scope(Columns)) of
         {error, Reason} ->
             {error, Reason};
         {ok, {select, Sub}} ->
@@ -237,7 +253,8 @@ build_from(#table_ref{name = TableStr, alias = Alias}) ->
 build_from(#derived_table{alias = undefined}) ->
     {error, derived_table_requires_alias};
 build_from(#derived_table{query = Q, alias = Alias}) ->
-    case analyze(Q) of
+    %% LATERAL ではないので外側の列は見せない
+    case analyze(Q, []) of
         {error, Reason} ->
             {error, Reason};
         {ok, {select, Sub}} ->
@@ -427,6 +444,9 @@ col_tables(#is_null{arg = A})           -> col_tables(A);
 col_tables(#func{args = Args}) when is_list(Args) ->
     lists:append([col_tables(A) || A <- Args]);
 col_tables(_Other)                      -> [].
+
+%% この問い合わせ自身の列だけ。行の並びを表すのはこちら。
+own(Scope) -> [S || #sc{level = 0} = S <- Scope].
 
 %% 単一テーブルの操作(INSERT/UPDATE/DELETE)用のスコープ。
 scope_of(Table, Columns) ->
@@ -801,7 +821,9 @@ nulls_for(desc, default) -> nulls_first;
 nulls_for(_Dir, Explicit) -> Explicit.
 
 bind_projection([#star{}], Columns) ->
-    {ok, [{ref, N} || N <- lists:seq(1, length(Columns))], names(Columns)};
+    %% `*` は**自分の層**だけを展開する。外側の列まで出してはいけない。
+    Own = own(Columns),
+    {ok, [{ref, N} || N <- lists:seq(1, length(Own))], names(Own)};
 bind_projection(Items, Columns) ->
     bind_projection_1(Items, Columns, [], []).
 
@@ -950,7 +972,9 @@ bind_expr(#const{value = Value}, _Columns) ->
 bind_expr(#col_ref{table = Q, name = NameStr}, Columns) ->
     case resolve_column(Q, NameStr, Columns) of
         {error, Reason} -> {error, Reason};
-        {ok, #sc{pos = Pos}} -> {ok, {ref, Pos}}
+        {ok, #sc{pos = Pos, level = 0}} -> {ok, {ref, Pos}};
+        %% 外側の列。実行時に外側の行から引く(Level 段だけ外)
+        {ok, #sc{pos = Pos, level = L}} -> {ok, {outer, L, Pos}}
     end;
 bind_expr(#binop{op = Op, left = L, right = R}, Columns) ->
     case bind_pair(L, R, Columns) of
@@ -1019,11 +1043,11 @@ bind_expr(#func{name = NameStr, args = Args, distinct = Dist}, Columns) ->
                     end
             end
     end;
-bind_expr(#scalar_subquery{query = Q}, _Columns) ->
-    with_subplan(Q, 1, fun(Sub) -> {scalar_subquery, Sub} end);
-bind_expr(#exists_expr{query = Q}, _Columns) ->
+bind_expr(#scalar_subquery{query = Q}, Columns) ->
+    with_subplan(Q, 1, fun(Sub) -> {scalar_subquery, Sub} end, Columns);
+bind_expr(#exists_expr{query = Q}, Columns) ->
     %% EXISTS は列数を問わない
-    with_subplan(Q, any, fun(Sub) -> {exists_subquery, Sub} end);
+    with_subplan(Q, any, fun(Sub) -> {exists_subquery, Sub} end, Columns);
 bind_expr(#in_expr{arg = A, values = Vs, query = undefined}, Columns) when Vs =/= undefined ->
     case bind_all([A | Vs], Columns) of
         {error, Reason}    -> {error, Reason};
@@ -1034,7 +1058,7 @@ bind_expr(#in_expr{arg = A, query = Q}, Columns) ->
         {error, Reason} ->
             {error, Reason};
         {ok, BA} ->
-            with_subplan(Q, 1, fun(Sub) -> {in_subquery, BA, Sub} end)
+            with_subplan(Q, 1, fun(Sub) -> {in_subquery, BA, Sub} end, Columns)
     end;
 bind_expr(#is_null{arg = A, negated = Neg}, Columns) ->
     case bind_expr(A, Columns) of
@@ -1100,14 +1124,31 @@ resolve_column(Qualifier, NameStr, Scope) ->
         error ->
             {error, {column_not_found, NameStr}};
         {ok, Name} ->
-            Matches = [S || #sc{alias = A, name = N} = S <- Scope,
-                            N =:= Name,
-                            Qualifier =:= undefined orelse matches_alias(Qualifier, A)],
-            case Matches of
-                [C] -> {ok, C};
-                [] -> {error, {column_not_found, qualified(Qualifier, NameStr)}};
-                _ -> {error, {ambiguous_column, NameStr}}
-            end
+            %% 自分の層で見つかればそれ。見つからなければ外側を見る。
+            %% 内側で解決できる名前を外側に取られてはいけない。
+            %% 内側の層から順に探す。内側で解決できる名前を
+            %% 外側に取られてはいけない。
+            search_levels(Name, Qualifier, Scope, 0, max_level(Scope), NameStr)
+    end.
+
+max_level(Scope) -> lists:max([0 | [L || #sc{level = L} <- Scope]]).
+
+search_levels(_Name, Qualifier, _Scope, L, Max, NameStr) when L > Max ->
+    {error, {column_not_found, qualified(Qualifier, NameStr)}};
+search_levels(Name, Qualifier, Scope, L, Max, NameStr) ->
+    case pick(Name, Qualifier, Scope, L) of
+        {ok, _} = R -> R;
+        ambiguous   -> {error, {ambiguous_column, NameStr}};
+        none        -> search_levels(Name, Qualifier, Scope, L + 1, Max, NameStr)
+    end.
+
+pick(Name, Qualifier, Scope, Level) ->
+    case [S || #sc{alias = A, name = N, level = L} = S <- Scope,
+               L =:= Level, N =:= Name,
+               Qualifier =:= undefined orelse matches_alias(Qualifier, A)] of
+        [C] -> {ok, C};
+        []  -> none;
+        _   -> ambiguous
     end.
 
 matches_alias(Qualifier, Alias) ->

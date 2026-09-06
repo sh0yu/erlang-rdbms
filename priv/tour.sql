@@ -216,6 +216,12 @@ SELECT name FROM fruit WHERE price NOT IN (100, null);
 SELECT name FROM fruit WHERE price = (SELECT price FROM fruit);
 COMMIT;
 
+-- 相関副問い合わせ。外側の行ごとに実行し直す
+BEGIN READ ONLY;
+SELECT f.name FROM fruit f
+ WHERE f.price = (SELECT MAX(g.price) FROM fruit g WHERE g.ripe = f.ripe);
+COMMIT;
+
 -- 導出表。別名は必須
 BEGIN READ ONLY;
 SELECT d.name FROM (SELECT name, price FROM fruit WHERE price > 100) AS d

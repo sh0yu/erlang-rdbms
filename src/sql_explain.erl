@@ -22,14 +22,28 @@
 %%----------------------------------------------------------------------
 -spec explain(term()) -> [binary()].
 explain(Plan) ->
-    [iolist_to_binary(L) || L <- lines(Plan, 0)].
+    [iolist_to_binary(L) || L <- lines(Plan, 0, [])].
 
-lines(Node, Depth) ->
+%% Outers は外側の問い合わせが出す列名の並び(1つ目が1段外)。
+%% 相関副問い合わせの中の {outer, L, Pos} を名前に戻すのに使う。
+lines(Node, Depth, Outers) ->
     Pad = lists:duplicate(Depth * 2, $\s),
     %% 式の中の副問い合わせも木として出す。出さないと
     %% 「(subquery)」とだけ書かれて中身が分からない。
-    Kids = children(Node) ++ subplans(Node),
-    [[Pad, label(Node)] | lists:append([lines(C, Depth + 1) || C <- Kids])].
+    Inner = [{C, Outers} || C <- children(Node)],
+    %% 副問い合わせから見ると、この節点の入力が1段外側になる
+    Sub = [{P, [input_schema(Node) | Outers]} || P <- subplans(Node)],
+    [[Pad, label(Node, Outers)]
+     | lists:append([lines(C, Depth + 1, O) || {C, O} <- Inner ++ Sub])].
+
+%% その節点が式を評価するときに見ている行の列名。
+input_schema(#p_filter{input = In})   -> schema(In);
+input_schema(#p_project{input = In})  -> schema(In);
+input_schema(#p_sort{input = In})     -> schema(In);
+input_schema(#p_agg{input = In})      -> schema(In);
+input_schema(#p_nl_join{left = L, right = R})   -> schema(L) ++ schema(R);
+input_schema(#p_hash_join{left = L, right = R}) -> schema(L) ++ schema(R);
+input_schema(Node)                    -> schema(Node).
 
 %% その節点の式に埋まっている副問い合わせのプラン。
 subplans(Node) ->
@@ -79,73 +93,73 @@ children(#p_project{input = In})           -> [In].
 %%% 1演算子ぶんの見出し
 %%%===================================================================
 
-label(#p_seq_scan{table = T}) ->
+label(#p_seq_scan{table = T}, _Outers) ->
     ["Seq Scan on ", atom_to_list(T)];
-label(#p_index_scan{table = T, column = C, value = V}) ->
+label(#p_index_scan{table = T, column = C, value = V}, _Outers) ->
     ["Index Scan on ", atom_to_list(T), " (", atom_to_list(C), " = ", value(V), ")"];
-label(#p_filter{pred = P, input = In}) ->
-    ["Filter ", expr(P, schema(In))];
-label(#p_nl_join{type = Ty, pred = P, left = L, right = R}) ->
+label(#p_filter{pred = P, input = In}, Outers) ->
+    ["Filter ", expr(P, schema(In), Outers)];
+label(#p_nl_join{type = Ty, pred = P, left = L, right = R}, Outers) ->
     S = schema(L) ++ schema(R),
     ["Nested Loop ", string:uppercase(atom_to_list(Ty)), " Join",
      case P of
          undefined -> "";
-         _ -> [" on ", expr(P, S)]
+         _ -> [" on ", expr(P, S, Outers)]
      end];
 label(#p_hash_join{type = Ty, left_keys = LK, right_keys = RK, pred = P,
-                   left = L, right = R}) ->
+                   left = L, right = R}, Outers) ->
     LS = schema(L),
     RS = schema(R),
-    Keys = [[expr(LE, LS), " = ", expr(RE, RS)] || {LE, RE} <- lists:zip(LK, RK)],
+    Keys = [[expr(LE, LS, Outers), " = ", expr(RE, RS, Outers)] || {LE, RE} <- lists:zip(LK, RK)],
     ["Hash ", string:uppercase(atom_to_list(Ty)), " Join on ", commas(Keys),
      case P of
          undefined -> "";
-         _ -> [" filter ", expr(P, LS ++ RS)]
+         _ -> [" filter ", expr(P, LS ++ RS, Outers)]
      end];
-label(#p_agg{group_by = G, aggs = A, having = H, input = In}) ->
+label(#p_agg{group_by = G, aggs = A, having = H, input = In}, Outers) ->
     S = schema(In),
     ["HashAggregate",
      case G of
          [] -> "";
-         _ -> [" group by (", commas([expr(K, S) || K <- G]), ")"]
+         _ -> [" group by (", commas([expr(K, S, Outers) || K <- G]), ")"]
      end,
-     " -> (", commas([agg_name(Ag, S) || Ag <- A]), ")",
+     " -> (", commas([agg_name(Ag, S, Outers) || Ag <- A]), ")",
      case H of
          undefined -> "";
-         _ -> [" having ", expr(H, group_schema(G, A, S))]
+         _ -> [" having ", expr(H, group_schema(G, A, S), Outers)]
      end];
-label(#p_sort{keys = Keys, limit = Limit, input = In}) ->
+label(#p_sort{keys = Keys, limit = Limit, input = In}, Outers) ->
     S = schema(In),
-    ["Sort (", commas([sort_key(K, S) || K <- Keys]), ")",
+    ["Sort (", commas([sort_key(K, S, Outers) || K <- Keys]), ")",
      case Limit of
          undefined -> "";
          N -> [" top ", integer_to_list(N)]
      end];
-label(#p_limit{count = C, offset = O}) ->
+label(#p_limit{count = C, offset = O}, _Outers) ->
     ["Limit ",
      case C of undefined -> "all"; _ -> integer_to_list(C) end,
      case O of 0 -> ""; _ -> [" offset ", integer_to_list(O)] end];
-label(#p_distinct{}) ->
+label(#p_distinct{}, _Outers) ->
     "Unique";
-label(#p_derived{schema = S}) ->
+label(#p_derived{schema = S}, _Outers) ->
     ["Subquery (", commas([to_str(N) || N <- S]), ")"];
-label(#p_setop{op = Op, all = All}) ->
+label(#p_setop{op = Op, all = All}, _Outers) ->
     [string:uppercase(atom_to_list(Op)), case All of true -> " ALL"; false -> "" end];
-label(#p_project{names = Names}) ->
+label(#p_project{names = Names}, _Outers) ->
     ["Project (", commas([to_str(N) || N <- Names]), ")"].
 
-sort_key({E, Dir, Nulls}, S) ->
-    [expr(E, S), " ", string:uppercase(atom_to_list(Dir)),
+sort_key({E, Dir, Nulls}, S, Outers) ->
+    [expr(E, S, Outers), " ", string:uppercase(atom_to_list(Dir)),
      case Nulls of
          nulls_first -> " NULLS FIRST";
          nulls_last  -> " NULLS LAST";
          _           -> ""
      end].
 
-agg_name(#agg{func = count_star}, _S) -> "count(*)";
-agg_name(#agg{func = F, arg = A, distinct = D}, S) ->
+agg_name(#agg{func = count_star}, _S, _Outers) -> "count(*)";
+agg_name(#agg{func = F, arg = A, distinct = D}, S, Outers) ->
     [atom_to_list(F), "(", case D of true -> "DISTINCT "; false -> "" end,
-     expr(A, S), ")"].
+     expr(A, S, Outers), ")"].
 
 %%%===================================================================
 %%% 各演算子が出すカラム名
@@ -171,40 +185,46 @@ schema(#p_project{names = N})                  -> N.
 %% 集約の出力は [グループキー..., 集約結果...] の順。
 group_schema(Group, Aggs, InSchema) ->
     [key_name(K, InSchema) || K <- Group] ++
-        [iolist_to_binary(agg_name(A, InSchema)) || A <- Aggs].
+        [iolist_to_binary(agg_name(A, InSchema, [])) || A <- Aggs].
 
 key_name({ref, P}, S) -> name_at(P, S);
-key_name(E, S)        -> iolist_to_binary(expr(E, S)).
+key_name(E, S)        -> iolist_to_binary(expr(E, S, [])).
 
 %%%===================================================================
 %%% 式
 %%%===================================================================
 
-expr(undefined, _S)          -> "true";
-expr({const, V}, _S)         -> value(V);
-expr({ref, P}, S)            -> to_str(name_at(P, S));
-expr({comp, Op, L, R}, S)    -> ["(", expr(L, S), " ", op(Op), " ", expr(R, S), ")"];
-expr({arith, Op, L, R}, S)   -> ["(", expr(L, S), " ", atom_to_list(Op), " ", expr(R, S), ")"];
-expr({'and', Es}, S)         -> ["(", sep(" AND ", [expr(E, S) || E <- Es]), ")"];
-expr({'or', Es}, S)          -> ["(", sep(" OR ", [expr(E, S) || E <- Es]), ")"];
-expr({'not', E}, S)          -> ["NOT ", expr(E, S)];
-expr({neg, E}, S)            -> ["-", expr(E, S)];
-expr({is_null, E}, S)        -> [expr(E, S), " IS NULL"];
-expr({is_not_null, E}, S)    -> [expr(E, S), " IS NOT NULL"];
-expr({in, A, Es}, S)         -> ["(", expr(A, S), " IN (",
-                                commas([expr(E, S) || E <- Es]), "))"];
-expr({in_subquery, A, _}, S) -> ["(", expr(A, S), " IN (subquery))"];
-expr({func, N, Args}, S)     -> [string:uppercase(N), "(",
-                                commas([expr(A, S) || A <- Args]), ")"];
-expr({like, A, P}, S)        -> ["(", expr(A, S), " LIKE ", expr(P, S), ")"];
-expr({'case', Ws, E}, S)     ->
+expr(undefined, _S, _Outers)         -> "true";
+expr({const, V}, _S, _Outers)        -> value(V);
+expr({ref, P}, S, _Outers)           -> to_str(name_at(P, S));
+expr({comp, Op, L, R}, S, Outers)    -> ["(", expr(L, S, Outers), " ", op(Op), " ", expr(R, S, Outers), ")"];
+expr({arith, Op, L, R}, S, Outers)   -> ["(", expr(L, S, Outers), " ", atom_to_list(Op), " ", expr(R, S, Outers), ")"];
+expr({'and', Es}, S, Outers)         -> ["(", sep(" AND ", [expr(E, S, Outers) || E <- Es]), ")"];
+expr({'or', Es}, S, Outers)          -> ["(", sep(" OR ", [expr(E, S, Outers) || E <- Es]), ")"];
+expr({'not', E}, S, Outers)          -> ["NOT ", expr(E, S, Outers)];
+expr({neg, E}, S, Outers)            -> ["-", expr(E, S, Outers)];
+expr({is_null, E}, S, Outers)        -> [expr(E, S, Outers), " IS NULL"];
+expr({is_not_null, E}, S, Outers)    -> [expr(E, S, Outers), " IS NOT NULL"];
+expr({in, A, Es}, S, Outers)         -> ["(", expr(A, S, Outers), " IN (",
+                                commas([expr(E, S, Outers) || E <- Es]), "))"];
+expr({in_subquery, A, _}, S, Outers) -> ["(", expr(A, S, Outers), " IN (subquery))"];
+expr({func, N, Args}, S, Outers)     -> [string:uppercase(N), "(",
+                                commas([expr(A, S, Outers) || A <- Args]), ")"];
+expr({like, A, P}, S, Outers)        -> ["(", expr(A, S, Outers), " LIKE ", expr(P, S, Outers), ")"];
+expr({'case', Ws, E}, S, Outers)     ->
     ["CASE",
-     [[" WHEN ", expr(C, S), " THEN ", expr(V, S)] || {C, V} <- Ws],
-     case E of undefined -> ""; _ -> [" ELSE ", expr(E, S)] end,
+     [[" WHEN ", expr(C, S, Outers), " THEN ", expr(V, S, Outers)] || {C, V} <- Ws],
+     case E of undefined -> ""; _ -> [" ELSE ", expr(E, S, Outers)] end,
      " END"];
-expr({scalar_subquery, _}, _S) -> "(subquery)";
-expr({exists_subquery, _}, _S) -> "EXISTS (subquery)";
-expr(Other, _S)              -> io_lib:format("~p", [Other]).
+expr({scalar_subquery, _}, _S, _Outers) -> "(subquery)";
+expr({exists_subquery, _}, _S, _Outers) -> "EXISTS (subquery)";
+%% 外側の列。何段外かと、その行の中の位置で指してある。
+%% 名前が分かるなら名前で出す。
+expr({outer, L, Pos}, _S, Outers) when L >= 1, L =< length(Outers) ->
+    ["outer.", to_str(name_at(Pos, lists:nth(L, Outers)))];
+expr({outer, L, Pos}, _S, _Outers) ->
+    io_lib:format("outer~p.#~p", [L, Pos]);
+expr(Other, _S, _Outers)              -> io_lib:format("~p", [Other]).
 
 op('=')  -> "=";
 op('<>') -> "<>";

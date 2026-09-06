@@ -27,11 +27,12 @@
 -include("../include/plan.hrl").
 
 %% 演算子。mod は種別、st はその状態。
--record(op, {kind, st}).
+-record(op, {kind, st, env = #{}}).
 
 %% 実行文脈。ストレージへの入口を関数で渡すことで、
 %% 実行器が query_exec の内部状態に直接触らないようにする。
--record(ctx, {scan_open, scan_next, index_lookup}).
+%% outers は外側の行の並び(1つ目が1段外)。相関副問い合わせのためにある。
+-record(ctx, {scan_open, scan_next, index_lookup, outers = []}).
 
 -export_type([ctx/0]).
 -opaque ctx() :: #ctx{}.
@@ -93,7 +94,25 @@ drain(Op, Acc) ->
 %%% open
 %%%===================================================================
 
-open(#p_seq_scan{table = Table}, #ctx{scan_open = ScanOpen} = Ctx) ->
+%%----------------------------------------------------------------------
+%% 演算子を作る。**env はここで一括して押す。**
+%% 個々の節で付け忘れると、その演算子だけ外側の行を見られなくなる。
+%%----------------------------------------------------------------------
+open(Plan, Ctx) ->
+    case open_1(Plan, Ctx) of
+        {error, Reason} -> {error, Reason};
+        #op{} = Op      -> Op#op{env = env(Ctx)}
+    end.
+
+%% 式の評価に渡す環境。副問い合わせを実行する関数もここに入れる。
+%% 実行するとき、いまの行を1段外側として積む。
+env(#ctx{outers = Outers} = Ctx) ->
+    #{outers => Outers,
+      run => fun(Plan, CurRow) ->
+                     sub_lists(Plan, Ctx#ctx{outers = [CurRow | Outers]})
+             end}.
+
+open_1(#p_seq_scan{table = Table}, #ctx{scan_open = ScanOpen} = Ctx) ->
     case ScanOpen(Table) of
         {error, Reason} ->
             {error, Reason};
@@ -106,7 +125,7 @@ open(#p_seq_scan{table = Table}, #ctx{scan_open = ScanOpen} = Ctx) ->
 %% query_exec が渡す関数に任せる。そちらが未コミットの
 %% ローカル変更を重ねてから返す。ここで索引を直接引くと、
 %% 自分がさっき入れた行が見えない。
-open(#p_index_scan{table = Table, column = Col, value = Val},
+open_1(#p_index_scan{table = Table, column = Col, value = Val},
      #ctx{index_lookup = Lookup}) when is_function(Lookup, 3) ->
     case Lookup(Table, Col, Val) of
         {error, Reason} ->
@@ -114,33 +133,33 @@ open(#p_index_scan{table = Table, column = Col, value = Val},
         {ok, Rows} ->
             #op{kind = sorted, st = [list_to_tuple(R) || R <- Rows]}
     end;
-open(#p_index_scan{}, _Ctx) ->
+open_1(#p_index_scan{}, _Ctx) ->
     {error, index_lookup_not_available};
-open(#p_filter{pred = Pred, input = Input}, Ctx) ->
+open_1(#p_filter{pred = Pred, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = filter, st = {Pred, Child}}
     end;
-open(#p_project{exprs = Exprs, input = Input}, Ctx) ->
+open_1(#p_project{exprs = Exprs, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = project, st = {Exprs, Child}}
     end;
 %% 並べ替えはブロッキング演算子。open の時点で入力を読み切る。
-open(#p_sort{keys = Keys, limit = Limit, input = Input}, Ctx) ->
+open_1(#p_sort{keys = Keys, limit = Limit, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} ->
             {error, Reason};
         Child ->
             {ok, Rows} = collect(Child, []),
-            #op{kind = sorted, st = sort_rows(Keys, Limit, Rows)}
+            #op{kind = sorted, st = sort_rows(Keys, Limit, Rows, env(Ctx))}
     end;
-open(#p_limit{count = Count, offset = Offset, input = Input}, Ctx) ->
+open_1(#p_limit{count = Count, offset = Offset, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = limit, st = {Count, Offset, Child}}
     end;
-open(#p_distinct{input = Input}, Ctx) ->
+open_1(#p_distinct{input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} -> {error, Reason};
         Child -> #op{kind = distinct, st = {sets:new([{version, 2}]), Child}}
@@ -148,7 +167,7 @@ open(#p_distinct{input = Input}, Ctx) ->
 %% 入れ子ループ結合。
 %% 右側は左の行ごとに読み直すので、開始時にメモリへ載せる
 %% (走査カーソルは一度しか流せないため)。
-open(#p_nl_join{type = Type, pred = Pred, left = L, right = R,
+open_1(#p_nl_join{type = Type, pred = Pred, left = L, right = R,
                 left_width = LW, right_width = W}, Ctx) ->
     case open(L, Ctx) of
         {error, Reason} ->
@@ -166,7 +185,7 @@ open(#p_nl_join{type = Type, pred = Pred, left = L, right = R,
     end;
 %% 集約もブロッキング演算子。入力を読み切ってグループごとにまとめる。
 %% ハッシュ結合。右側でハッシュ表を作り、左側で引く。
-open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
+open_1(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
                   left = L, right = R, left_width = LW, right_width = W}, Ctx) ->
     case open(L, Ctx) of
         {error, Reason} ->
@@ -180,18 +199,18 @@ open(#p_hash_join{type = Type, left_keys = LK, right_keys = RK, pred = Pred,
                     close(Right),
                     St = join_state(Type, Pred, Left, Rows, LW, W),
                     #op{kind = hash_join,
-                        st = St#{table => build_hash(maps:get(rows, St), RK),
+                        st = St#{table => build_hash(maps:get(rows, St), RK, env(Ctx)),
                                  lkeys => LK}}
             end
     end;
 %% 導出表。子が出すリストの行をタプルに直して流す。
-open(#p_derived{input = In}, Ctx) ->
+open_1(#p_derived{input = In}, Ctx) ->
     case open(In, Ctx) of
         {error, Reason} -> {error, Reason};
         Child           -> #op{kind = derived, st = Child}
     end;
 %% 集合演算。両側を読み切ってから突き合わせる。
-open(#p_setop{op = Op, all = All, left = L, right = R}, Ctx) ->
+open_1(#p_setop{op = Op, all = All, left = L, right = R}, Ctx) ->
     case open(L, Ctx) of
         {error, Reason} ->
             {error, Reason};
@@ -211,7 +230,7 @@ open(#p_setop{op = Op, all = All, left = L, right = R}, Ctx) ->
                         st = [to_tuple(Row) || Row <- set_op(Op, All, LRows, RRows)]}
             end
     end;
-open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) ->
+open_1(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) ->
     case open(Input, Ctx) of
         {error, Reason} ->
             {error, Reason};
@@ -219,9 +238,10 @@ open(#p_agg{group_by = Keys, aggs = Aggs, having = Having, input = Input}, Ctx) 
             {ok, Rows} = collect(Child, []),
             %% 上位の演算子(並べ替え・射影)は行をタプルとして扱う。
             %% 束縛済みの式が位置参照で、element/2 で引くため。
-            Out = [list_to_tuple(R) || R <- aggregate(Keys, Aggs, Rows)],
+            Env = env(Ctx),
+            Out = [list_to_tuple(R) || R <- aggregate(Keys, Aggs, Rows, Env)],
             #op{kind = sorted,
-                st = [R || R <- Out, sql_expr:eval_pred(Having, R)]}
+                st = [R || R <- Out, sql_expr:eval_pred(Having, R, Env)]}
     end.
 
 %% 入力を読み切る。並べ替えのようなブロッキング演算子で使う。
@@ -233,20 +253,20 @@ collect(Op, Acc) ->
 
 %% 並べ替え。Erlangの項順序ではなく sql_value:order_compare/4 を使う。
 %% 素の `<` だと 100 < null が真になり、NULLを含む列で順序が壊れる。
-sort_rows(Keys, Limit, Rows) ->
-    Sorted = lists:sort(fun(A, B) -> compare_rows(Keys, A, B) =/= gt end, Rows),
+sort_rows(Keys, Limit, Rows, Env) ->
+    Sorted = lists:sort(fun(A, B) -> compare_rows(Keys, A, B, Env) =/= gt end, Rows),
     case Limit of
         undefined -> Sorted;
         N -> lists:sublist(Sorted, N)
     end.
 
-compare_rows([], _A, _B) ->
+compare_rows([], _A, _B, _Env) ->
     eq;
-compare_rows([{Expr, Dir, Nulls} | T], A, B) ->
-    Va = sql_expr:eval(Expr, A),
-    Vb = sql_expr:eval(Expr, B),
+compare_rows([{Expr, Dir, Nulls} | T], A, B, Env) ->
+    Va = sql_expr:eval(Expr, A, Env),
+    Vb = sql_expr:eval(Expr, B, Env),
     case sql_value:order_compare(Va, Vb, Dir, Nulls) of
-        eq -> compare_rows(T, A, B);
+        eq -> compare_rows(T, A, B, Env);
         Other -> Other
     end.
 
@@ -269,12 +289,12 @@ next(#op{kind = seq_scan, st = {#ctx{scan_next = ScanNext} = Ctx, Cursor, []}} =
             next(Op#op{st = {Ctx, Cursor2, Tuples}})
     end;
 
-next(#op{kind = filter, st = {Pred, Child}} = Op) ->
+next(#op{kind = filter, st = {Pred, Child}, env = Env} = Op) ->
     case next(Child) of
         {eof, Child2} ->
             {eof, Op#op{st = {Pred, Child2}}};
         {row, Row, Child2} ->
-            case sql_expr:eval_pred(Pred, Row) of
+            case sql_expr:eval_pred(Pred, Row, Env) of
                 true -> {row, Row, Op#op{st = {Pred, Child2}}};
                 %% 3値論理はここに集約されている。null は通さない。
                 false -> next(Op#op{st = {Pred, Child2}})
@@ -282,11 +302,11 @@ next(#op{kind = filter, st = {Pred, Child}} = Op) ->
     end;
 
 %% 左の行を1つ取り、右の行を順に当てる。
-next(#op{kind = nl_join, st = St} = Op) ->
-    nl_next(Op, St);
+next(#op{kind = nl_join, st = St, env = Env} = Op) ->
+    nl_next(Op, St, Env);
 
-next(#op{kind = hash_join, st = St} = Op) ->
-    hj_next(Op, St);
+next(#op{kind = hash_join, st = St, env = Env} = Op) ->
+    hj_next(Op, St, Env);
 
 next(#op{kind = derived, st = Child} = Op) ->
     case next(Child) of
@@ -319,13 +339,13 @@ next(#op{kind = distinct, st = {Seen, Child}} = Op) ->
             end
     end;
 
-next(#op{kind = project, st = {Exprs, Child}} = Op) ->
+next(#op{kind = project, st = {Exprs, Child}, env = Env} = Op) ->
     case next(Child) of
         {eof, Child2} ->
             {eof, Op#op{st = {Exprs, Child2}}};
         {row, Row, Child2} ->
             %% 出力はリストに戻す。既存APIの行の形に合わせるため。
-            Out = [sql_expr:eval(E, Row) || E <- Exprs],
+            Out = [sql_expr:eval(E, Row, Env) || E <- Exprs],
             {row, Out, Op#op{st = {Exprs, Child2}}}
     end.
 
@@ -362,33 +382,33 @@ outer_right(T) -> T =:= right orelse T =:= full.
 %% 右側を出し切ったら次の左の行へ。
 %% 1件も一致しなかった左の行は、LEFT/FULL なら右をNULLで埋めて返す。
 %% 左を読み切ったら、RIGHT/FULL なら未一致の右の行を出す。
-nl_next(Op, #{stage := drain, rest := []} = St) ->
+nl_next(Op, #{stage := drain, rest := []} = St, _Env) ->
     {eof, Op#op{st = St}};
-nl_next(Op, #{stage := drain, rest := [{_I, R} | Rest], lwidth := LW} = St) ->
+nl_next(Op, #{stage := drain, rest := [{_I, R} | Rest], lwidth := LW} = St, _Env) ->
     {row, pad_left(R, LW), Op#op{st = St#{rest => Rest}}};
-nl_next(Op, #{cur := undefined, left := Left, type := Type} = St) ->
+nl_next(Op, #{cur := undefined, left := Left, type := Type} = St, Env) ->
     case next(Left) of
         {eof, Left2} ->
             St1 = St#{left => Left2},
             case outer_right(Type) of
-                true  -> nl_next(Op, St1#{stage => drain, rest => unmatched(St1)});
+                true  -> nl_next(Op, St1#{stage => drain, rest => unmatched(St1)}, Env);
                 false -> {eof, Op#op{st = St1}}
             end;
         {row, Row, Left2} ->
             nl_next(Op, St#{left => Left2, cur => Row,
-                            rest => maps:get(rows, St), matched => false})
+                            rest => maps:get(rows, St), matched => false}, Env)
     end;
 nl_next(Op, #{rest := [], type := Type, matched := false,
-              cur := Cur, rwidth := RW} = St) when Type =:= left; Type =:= full ->
+              cur := Cur, rwidth := RW} = St, _Env) when Type =:= left; Type =:= full ->
     {row, pad_right(Cur, RW), Op#op{st = St#{cur => undefined, matched => true}}};
-nl_next(Op, #{rest := []} = St) ->
-    nl_next(Op, St#{cur => undefined});
-nl_next(Op, #{rest := [{I, R} | Rest], cur := Cur, pred := Pred, seen := Seen} = St) ->
+nl_next(Op, #{rest := []} = St, Env) ->
+    nl_next(Op, St#{cur => undefined}, Env);
+nl_next(Op, #{rest := [{I, R} | Rest], cur := Cur, pred := Pred, seen := Seen} = St, Env) ->
     Joined = concat_rows(Cur, R),
-    case sql_expr:eval_pred(Pred, Joined) of
+    case sql_expr:eval_pred(Pred, Joined, Env) of
         true  -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true,
                                               seen => Seen#{I => []}}}};
-        false -> nl_next(Op, St#{rest => Rest})
+        false -> nl_next(Op, St#{rest => Rest}, Env)
     end.
 
 concat_rows(A, B) ->
@@ -404,12 +424,82 @@ concat_rows(A, B) ->
 resolve_subqueries(Node, Ctx) ->
     map_node_exprs(fun(E) -> resolve_expr(E, Ctx) end, Node, Ctx).
 
+%%----------------------------------------------------------------------
+%% 副問い合わせを定数へ畳む。**相関するものは畳まない。**
+%%
+%% 相関しない副問い合わせは外側の行に依存しないので1回で済む。
+%% 外側の列を参照している({outer, _, _} を含む)ものは行ごとに
+%% 答えが変わるので、式のまま残して実行時に評価する。
+%%----------------------------------------------------------------------
 resolve_expr(E, Ctx) ->
     sql_expr:map_subqueries(
-      fun({scalar_subquery, P})  -> {const, scalar_value(P, Ctx)};
-         ({exists_subquery, P})  -> {const, sub_rows(P, Ctx) =/= []};
-         ({in_subquery, A, P})   -> {in, A, [{const, V} || [V] <- sub_lists(P, Ctx)]}
+      fun({scalar_subquery, P} = Node) ->
+              case correlated(P) of
+                  true  -> Node;
+                  false -> {const, scalar_value(P, Ctx)}
+              end;
+         ({exists_subquery, P} = Node) ->
+              case correlated(P) of
+                  true  -> Node;
+                  false -> {const, sub_rows(P, Ctx) =/= []}
+              end;
+         ({in_subquery, A, P} = Node) ->
+              case correlated(P) of
+                  true  -> Node;
+                  false -> {in, A, [{const, V} || [V] <- sub_lists(P, Ctx)]}
+              end
       end, E).
+
+%% そのプランが外側の列を参照しているか。
+correlated(Plan) ->
+    lists:any(fun has_outer/1, plan_exprs(Plan)).
+
+%% プラン木の全ての式(子も含む)。
+plan_exprs(Node) ->
+    node_exprs(Node) ++ lists:append([plan_exprs(C) || C <- node_children(Node)]).
+
+node_exprs(#p_filter{pred = P})            -> [P];
+node_exprs(#p_nl_join{pred = P})           -> [P];
+node_exprs(#p_hash_join{pred = P, left_keys = LK, right_keys = RK}) -> [P | LK ++ RK];
+node_exprs(#p_agg{group_by = G, aggs = A, having = H}) ->
+    G ++ [Ag#agg.arg || Ag <- A] ++ [H];
+node_exprs(#p_sort{keys = K})              -> [E || {E, _, _} <- K];
+node_exprs(#p_project{exprs = E})          -> E;
+node_exprs(_Other)                         -> [].
+
+node_children(#p_filter{input = In})            -> [In];
+node_children(#p_nl_join{left = L, right = R})  -> [L, R];
+node_children(#p_hash_join{left = L, right = R})-> [L, R];
+node_children(#p_agg{input = In})               -> [In];
+node_children(#p_sort{input = In})              -> [In];
+node_children(#p_limit{input = In})             -> [In];
+node_children(#p_distinct{input = In})          -> [In];
+node_children(#p_project{input = In})           -> [In];
+node_children(#p_derived{input = In})           -> [In];
+node_children(#p_setop{left = L, right = R})    -> [L, R];
+node_children(_Other)                           -> [].
+
+%% 式が外側の列を参照しているか。
+%% 副問い合わせの中まで見る(入れ子の内側から外側を参照することがある)。
+has_outer({outer, _, _})        -> true;
+has_outer({comp, _, L, R})      -> has_outer(L) orelse has_outer(R);
+has_outer({arith, _, L, R})     -> has_outer(L) orelse has_outer(R);
+has_outer({'and', Es})          -> lists:any(fun has_outer/1, Es);
+has_outer({'or', Es})           -> lists:any(fun has_outer/1, Es);
+has_outer({'not', E})           -> has_outer(E);
+has_outer({neg, E})             -> has_outer(E);
+has_outer({is_null, E})         -> has_outer(E);
+has_outer({is_not_null, E})     -> has_outer(E);
+has_outer({func, _, Args})      -> lists:any(fun has_outer/1, Args);
+has_outer({like, A, P})         -> has_outer(A) orelse has_outer(P);
+has_outer({in, A, Es})          -> has_outer(A) orelse lists:any(fun has_outer/1, Es);
+has_outer({'case', Ws, E}) ->
+    lists:any(fun({C, V}) -> has_outer(C) orelse has_outer(V) end, Ws)
+        orelse (E =/= undefined andalso has_outer(E));
+has_outer({scalar_subquery, P}) -> correlated(P);
+has_outer({exists_subquery, P}) -> correlated(P);
+has_outer({in_subquery, A, P})  -> has_outer(A) orelse correlated(P);
+has_outer(_)                    -> false.
 
 %% スカラー副問い合わせは1行1列でなければならない。
 %% 0行なら NULL(標準SQL)。2行以上はエラー。
@@ -548,10 +638,10 @@ to_tuple(Row) when is_tuple(Row) -> Row.
 %% **鍵にNULLを含む行は入れない。** NULL = NULL は unknown なので
 %% 決して一致しない。ハッシュ表に入れると NULL 同士が衝突して
 %% 一致してしまう。
-build_hash(Rows, Keys) ->
+build_hash(Rows, Keys, Env) ->
     Table = lists:foldl(
               fun({_I, Row} = P, Acc) ->
-                      case join_key(Keys, Row) of
+                      case join_key(Keys, Row, Env) of
                           null -> Acc;
                           K    -> maps:update_with(K, fun(L) -> [P | L] end,
                                                    [P], Acc)
@@ -564,53 +654,53 @@ build_hash(Rows, Keys) ->
 %%
 %% 値は sql_value:group_key/1 で正規化する。素の項を鍵にすると
 %% 100 と 100.0 が別の鍵になるが、SQLの `=` では等しい。
-join_key(Exprs, Row) -> join_key(Exprs, Row, []).
+join_key(Exprs, Row, Env) -> join_key(Exprs, Row, Env, []).
 
-join_key([], _Row, Acc) ->
+join_key([], _Row, _Env, Acc) ->
     lists:reverse(Acc);
-join_key([E | T], Row, Acc) ->
-    case sql_expr:eval(E, Row) of
+join_key([E | T], Row, Env, Acc) ->
+    case sql_expr:eval(E, Row, Env) of
         null -> null;
-        V    -> join_key(T, Row, [sql_value:group_key(V) | Acc])
+        V    -> join_key(T, Row, Env, [sql_value:group_key(V) | Acc])
     end.
 
 %% 状態遷移は入れ子ループと同じ。違うのは、右側の候補を
 %% 全件ではなくハッシュ表から取ってくるところだけ。
-hj_next(Op, #{stage := drain, rest := []} = St) ->
+hj_next(Op, #{stage := drain, rest := []} = St, _Env) ->
     {eof, Op#op{st = St}};
-hj_next(Op, #{stage := drain, rest := [{_I, R} | Rest], lwidth := LW} = St) ->
+hj_next(Op, #{stage := drain, rest := [{_I, R} | Rest], lwidth := LW} = St, _Env) ->
     {row, pad_left(R, LW), Op#op{st = St#{rest => Rest}}};
 hj_next(Op, #{cur := undefined, left := Left, lkeys := LK, table := Tab,
-              type := Type} = St) ->
+              type := Type} = St, Env) ->
     case next(Left) of
         {eof, Left2} ->
             St1 = St#{left => Left2},
             case outer_right(Type) of
-                true  -> hj_next(Op, St1#{stage => drain, rest => unmatched(St1)});
+                true  -> hj_next(Op, St1#{stage => drain, rest => unmatched(St1)}, Env);
                 false -> {eof, Op#op{st = St1}}
             end;
         {row, Row, Left2} ->
             %% 鍵がNULLの左の行は決して一致しない。
             %% 右側も、鍵がNULLの行はハッシュ表に入っていないので
             %% 未一致として drain で出る
-            Matches = case join_key(LK, Row) of
+            Matches = case join_key(LK, Row, Env) of
                           null -> [];
                           K    -> maps:get(K, Tab, [])
                       end,
             hj_next(Op, St#{left => Left2, cur => Row,
-                            rest => Matches, matched => false})
+                            rest => Matches, matched => false}, Env)
     end;
 hj_next(Op, #{rest := [], type := Type, matched := false,
-              cur := Cur, rwidth := RW} = St) when Type =:= left; Type =:= full ->
+              cur := Cur, rwidth := RW} = St, _Env) when Type =:= left; Type =:= full ->
     {row, pad_right(Cur, RW), Op#op{st = St#{cur => undefined, matched => true}}};
-hj_next(Op, #{rest := []} = St) ->
-    hj_next(Op, St#{cur => undefined});
-hj_next(Op, #{rest := [{I, R} | Rest], cur := Cur, pred := Pred, seen := Seen} = St) ->
+hj_next(Op, #{rest := []} = St, Env) ->
+    hj_next(Op, St#{cur => undefined}, Env);
+hj_next(Op, #{rest := [{I, R} | Rest], cur := Cur, pred := Pred, seen := Seen} = St, Env) ->
     Joined = concat_rows(Cur, R),
-    case sql_expr:eval_pred(Pred, Joined) of
+    case sql_expr:eval_pred(Pred, Joined, Env) of
         true  -> {row, Joined, Op#op{st = St#{rest => Rest, matched => true,
                                               seen => Seen#{I => []}}}};
-        false -> hj_next(Op, St#{rest => Rest})
+        false -> hj_next(Op, St#{rest => Rest}, Env)
     end.
 
 limit_next(#op{st = {0, _Offset, _Child}} = Op) ->
@@ -637,20 +727,20 @@ decr(N) -> N - 1.
 %%
 %% グループの出現順を保つ。SQLに順序の保証は無いが、決まっていないと
 %% テストが書けないため。
-aggregate([], Aggs, Rows) ->
+aggregate([], Aggs, Rows, Env) ->
     %% GROUP BY が無い場合は全体で1グループ。
     %% 入力が空でも1行返る(COUNT(*) が 0 を返すため)。
-    [[finish(A, acc_rows(A, Rows)) || A <- Aggs]];
-aggregate(Keys, Aggs, Rows) ->
-    Grouped = group_rows(Keys, Rows),
-    [KeyVals ++ [finish(A, acc_rows(A, GroupRows)) || A <- Aggs]
+    [[finish(A, acc_rows(A, Rows, Env)) || A <- Aggs]];
+aggregate(Keys, Aggs, Rows, Env) ->
+    Grouped = group_rows(Keys, Rows, Env),
+    [KeyVals ++ [finish(A, acc_rows(A, GroupRows, Env)) || A <- Aggs]
      || {KeyVals, GroupRows} <- Grouped].
 
-group_rows(Keys, Rows) ->
+group_rows(Keys, Rows, Env) ->
     {Order, Map} =
         lists:foldl(
           fun(Row, {Ord, M}) ->
-                  Vals = [sql_expr:eval(K, Row) || K <- Keys],
+                  Vals = [sql_expr:eval(K, Row, Env) || K <- Keys],
                   %% グルーピングのキーは group_key/1 を通す。
                   %% NULL同士は同じ組、100 と 100.0 も同じ組にする。
                   GKey = [sql_value:group_key(V) || V <- Vals],
@@ -663,11 +753,11 @@ group_rows(Keys, Rows) ->
      || K <- lists:reverse(Order)].
 
 %% そのグループの行から、集約に使う値を取り出す。
-acc_rows(#agg{func = count_star}, Rows) ->
+acc_rows(#agg{func = count_star}, Rows, _Env) ->
     length(Rows);
-acc_rows(#agg{arg = Arg, distinct = Dist}, Rows) ->
+acc_rows(#agg{arg = Arg, distinct = Dist}, Rows, Env) ->
     %% NULLは集約の対象から外す(COUNT(*) 以外はすべてこの規則)
-    Vals = [V || Row <- Rows, (V = sql_expr:eval(Arg, Row)) =/= null],
+    Vals = [V || Row <- Rows, (V = sql_expr:eval(Arg, Row, Env)) =/= null],
     case Dist of
         false -> Vals;
         true -> distinct_values(Vals)

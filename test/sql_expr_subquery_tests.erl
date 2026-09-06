@@ -28,7 +28,12 @@ subquery_test_() ->
       fun not_in_with_null_is_never_true/1,
       fun exists_and_not_exists/1,
       fun subquery_must_return_one_column/1,
-      fun correlated_reference_is_rejected/1,
+      fun correlated_exists/1,
+      fun correlated_scalar/1,
+      fun correlated_in/1,
+      fun correlated_aggregate/1,
+      fun nested_correlation/1,
+      fun uncorrelated_is_folded_once/1,
       fun explain_shows_the_subplan/1]}.
 
 scalar_subquery_in_where(_) ->
@@ -128,13 +133,76 @@ subquery_must_return_one_column(_) ->
                      q(C, "SELECT name FROM emp WHERE dept IN (SELECT id, dname FROM dept)"))
     end.
 
-%% 相関副問い合わせは扱わない。外側の列は副問い合わせのスコープに無い。
-correlated_reference_is_rejected(_) ->
+%%%===================================================================
+%%% 相関副問い合わせ
+%%%
+%%% 外側の列を参照するので、**外側の1行ごとに実行し直す**。
+%%% 相関しないものは実行前に1回だけ評価して定数へ畳む。
+%%%===================================================================
+
+correlated_exists(_) ->
     fun() ->
         C = seeded(),
-        ?assertMatch({error, {column_not_found, _}},
-                     q(C, "SELECT name FROM emp WHERE EXISTS "
-                          "(SELECT 1 FROM dept WHERE dept.id = emp.dept)"))
+        ?assertEqual([[<<"ada">>], [<<"cy">>]],
+                     rows(C, "SELECT e.name FROM emp e WHERE EXISTS "
+                             "(SELECT 1 FROM dept d WHERE d.id = e.dept) "
+                             "ORDER BY e.name")),
+        %% dan は dept が NULL。d.id = NULL は unknown なので一致しない
+        ?assertEqual([[<<"bob">>], [<<"dan">>]],
+                     rows(C, "SELECT e.name FROM emp e WHERE NOT EXISTS "
+                             "(SELECT 1 FROM dept d WHERE d.id = e.dept) "
+                             "ORDER BY e.name"))
+    end.
+
+correlated_scalar(_) ->
+    fun() ->
+        C = seeded(),
+        ?assertEqual([[<<"ada">>, <<"eng">>],
+                      [<<"bob">>, null],
+                      [<<"cy">>, <<"eng">>],
+                      [<<"dan">>, null]],
+                     rows(C, "SELECT e.name, (SELECT d.dname FROM dept d "
+                             "WHERE d.id = e.dept) AS dn FROM emp e ORDER BY e.name"))
+    end.
+
+correlated_in(_) ->
+    fun() ->
+        C = seeded(),
+        ?assertEqual([[<<"ada">>], [<<"cy">>]],
+                     rows(C, "SELECT e.name FROM emp e WHERE e.dept IN "
+                             "(SELECT d.id FROM dept d WHERE d.id = e.dept) "
+                             "ORDER BY e.name"))
+    end.
+
+%% 外側の行ごとに集約をやり直す。
+correlated_aggregate(_) ->
+    fun() ->
+        C = seeded(),
+        %% dept 10 の平均は (500+700)/2 = 600。cy(700) だけが超える
+        ?assertEqual([[<<"cy">>]],
+                     rows(C, "SELECT e.name FROM emp e WHERE e.sal > "
+                             "(SELECT AVG(x.sal) FROM emp x WHERE x.dept = e.dept) "
+                             "ORDER BY e.name"))
+    end.
+
+%% 2段の入れ子。内側は1段外(中間)を見る。
+nested_correlation(_) ->
+    fun() ->
+        C = seeded(),
+        ?assertEqual([[<<"ada">>], [<<"cy">>]],
+                     rows(C, "SELECT e.name FROM emp e WHERE EXISTS "
+                             "(SELECT 1 FROM dept d WHERE d.id = e.dept "
+                             " AND EXISTS (SELECT 1 FROM emp x WHERE x.dept = d.id)) "
+                             "ORDER BY e.name"))
+    end.
+
+%% 相関しないものは1回だけ実行される。EXPLAIN では定数に畳まれた形は
+%% 見えない(EXPLAINは畳む前の計画を出す)ので、結果で確かめる。
+uncorrelated_is_folded_once(_) ->
+    fun() ->
+        C = seeded(),
+        ?assertEqual(4, length(rows(C, "SELECT name FROM emp "
+                                       "WHERE EXISTS (SELECT 1 FROM dept)")))
     end.
 
 %% 副問い合わせの中身も木として出す。出さないと何をしているか分からない。

@@ -20,72 +20,104 @@
 %%%-------------------------------------------------------------------
 -module(sql_expr).
 
--export([eval/2, eval_pred/2, map_subqueries/2]).
+-export([eval/2, eval/3, eval_pred/2, eval_pred/3, map_subqueries/2]).
 
 %%----------------------------------------------------------------------
 %% @doc 式を1行に対して評価する。Row は行タプル。
+%%
+%% Env は相関副問い合わせのためにある。
+%%   outers  外側の行の並び(1つ目が1段外)
+%%   run     副問い合わせを実行する関数。実行器が入れる
+%% 相関を含まない式なら空のままでよい。
 %%----------------------------------------------------------------------
-eval({const, Value}, _Row) ->
+eval(Expr, Row) -> eval(Expr, Row, #{}).
+
+eval({const, Value}, _Row, _Env) ->
     Value;
-eval({ref, Pos}, Row) ->
+eval({ref, Pos}, Row, _Env) ->
     element(Pos, Row);
-eval({comp, Op, L, R}, Row) ->
-    comp_result(Op, sql_value:compare(eval(L, Row), eval(R, Row)));
-eval({'and', Exprs}, Row) ->
-    lists:foldl(fun(E, Acc) -> sql_value:truth_and(Acc, eval(E, Row)) end, true, Exprs);
-eval({'or', Exprs}, Row) ->
-    lists:foldl(fun(E, Acc) -> sql_value:truth_or(Acc, eval(E, Row)) end, false, Exprs);
-eval({'not', E}, Row) ->
-    sql_value:truth_not(eval(E, Row));
-eval({neg, E}, Row) ->
-    sql_value:arith('-', 0, eval(E, Row));
-eval({arith, Op, L, R}, Row) ->
-    sql_value:arith(Op, eval(L, Row), eval(R, Row));
+eval({comp, Op, L, R}, Row, Env) ->
+    comp_result(Op, sql_value:compare(eval(L, Row, Env), eval(R, Row, Env)));
+eval({'and', Exprs}, Row, Env) ->
+    lists:foldl(fun(E, Acc) -> sql_value:truth_and(Acc, eval(E, Row, Env)) end, true, Exprs);
+eval({'or', Exprs}, Row, Env) ->
+    lists:foldl(fun(E, Acc) -> sql_value:truth_or(Acc, eval(E, Row, Env)) end, false, Exprs);
+eval({'not', E}, Row, Env) ->
+    sql_value:truth_not(eval(E, Row, Env));
+eval({neg, E}, Row, Env) ->
+    sql_value:arith('-', 0, eval(E, Row, Env));
+eval({arith, Op, L, R}, Row, Env) ->
+    sql_value:arith(Op, eval(L, Row, Env), eval(R, Row, Env));
 %% x IN (...) の3値論理。
 %%   x が NULL          → unknown
 %%   一致がある         → true
 %%   一致が無くNULL有り → unknown(そのNULLが x かもしれない)
 %%   一致が無くNULL無し → false
 %% CASE。条件が **true** の最初の枝を採る。null と false は等しく飛ばす。
-eval({'case', Whens, Else}, Row) ->
-    case first_true(Whens, Row) of
+eval({'case', Whens, Else}, Row, Env) ->
+    case first_true(Whens, Row, Env) of
         {ok, V}   -> V;
         not_found -> case Else of
                          undefined -> null;
-                         _         -> eval(Else, Row)
+                         _         -> eval(Else, Row, Env)
                      end
     end;
-eval({like, A, P}, Row) ->
-    sql_value:like(eval(A, Row), eval(P, Row));
-eval({func, Name, Args}, Row) ->
-    sql_func:apply(Name, [eval(A, Row) || A <- Args]);
-eval({in, A, Exprs}, Row) ->
-    case eval(A, Row) of
+eval({like, A, P}, Row, Env) ->
+    sql_value:like(eval(A, Row, Env), eval(P, Row, Env));
+eval({func, Name, Args}, Row, Env) ->
+    sql_func:apply(Name, [eval(A, Row, Env) || A <- Args]);
+eval({in, A, Exprs}, Row, Env) ->
+    case eval(A, Row, Env) of
         null -> null;
-        V    -> in_truth(V, [eval(E, Row) || E <- Exprs])
+        V    -> in_truth(V, [eval(E, Row, Env) || E <- Exprs])
     end;
 %% 副問い合わせは実行前に定数へ畳まれている。ここに来たら組み立ての誤り。
-eval({scalar_subquery, _}, _Row) ->
-    error(unresolved_subquery);
-eval({exists_subquery, _}, _Row) ->
-    error(unresolved_subquery);
-eval({in_subquery, _, _}, _Row) ->
-    error(unresolved_subquery);
-eval({is_null, E}, Row) ->
-    sql_value:is_null(eval(E, Row));
-eval({is_not_null, E}, Row) ->
-    not sql_value:is_null(eval(E, Row)).
+%% 外側の行の列。Level 段だけ外の行から引く。
+eval({outer, Level, Pos}, _Row, Env) ->
+    Outers = maps:get(outers, Env, []),
+    case length(Outers) >= Level of
+        true  -> element(Pos, lists:nth(Level, Outers));
+        false -> error({no_outer_row, Level})
+    end;
+
+%% 相関副問い合わせ。**行ごとに実行し直す。**
+%% 相関しないものは実行前に定数へ畳まれているので、ここへは来ない。
+eval({scalar_subquery, Plan}, Row, Env) ->
+    case run_sub(Plan, Row, Env) of
+        []      -> null;
+        [[V]]   -> V;
+        Rows    -> error({scalar_subquery_returned_rows, length(Rows)})
+    end;
+eval({exists_subquery, Plan}, Row, Env) ->
+    run_sub(Plan, Row, Env) =/= [];
+eval({in_subquery, A, Plan}, Row, Env) ->
+    case eval(A, Row, Env) of
+        null -> null;
+        V    -> in_truth(V, [X || [X] <- run_sub(Plan, Row, Env)])
+    end;
+eval({is_null, E}, Row, Env) ->
+    sql_value:is_null(eval(E, Row, Env));
+eval({is_not_null, E}, Row, Env) ->
+    not sql_value:is_null(eval(E, Row, Env)).
 
 %%----------------------------------------------------------------------
 %% @doc 述語として評価し、行を通すかどうかを返す。
 %% NULL(unknown)は false と同じく通さない。
 %%----------------------------------------------------------------------
-first_true([], _Row) ->
+first_true([], _Row, _Env) ->
     not_found;
-first_true([{C, V} | T], Row) ->
-    case sql_value:keep(eval(C, Row)) of
-        true  -> {ok, eval(V, Row)};
-        false -> first_true(T, Row)
+first_true([{C, V} | T], Row, Env) ->
+    case sql_value:keep(eval(C, Row, Env)) of
+        true  -> {ok, eval(V, Row, Env)};
+        false -> first_true(T, Row, Env)
+    end.
+
+%% 副問い合わせを、いまの行を外側として実行する。
+%% 実行器が run を入れていなければ、相関副問い合わせは使えない。
+run_sub(Plan, Row, Env) ->
+    case maps:get(run, Env, undefined) of
+        undefined -> error(no_subquery_runner);
+        Run       -> Run(Plan, Row)
     end.
 
 in_truth(_V, []) ->
@@ -101,10 +133,12 @@ in_truth(V, Vals) ->
             end
     end.
 
-eval_pred(undefined, _Row) ->
+eval_pred(Expr, Row) -> eval_pred(Expr, Row, #{}).
+
+eval_pred(undefined, _Row, _Env) ->
     true;
-eval_pred(Expr, Row) ->
-    sql_value:keep(eval(Expr, Row)).
+eval_pred(Expr, Row, Env) ->
+    sql_value:keep(eval(Expr, Row, Env)).
 
 %% 比較の結果(lt|eq|gt|null)を演算子に応じた真偽値に落とす。
 %% 比較が null なら結果も null(3値論理)。
