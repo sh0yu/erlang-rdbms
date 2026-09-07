@@ -28,3 +28,4 @@ src/sql_parser.erl
 
 # シェルが作るデータ置き場
 data/
+test/slt/*.test

@@ -481,7 +481,7 @@ bind_plain_select(#select_stmt{columns = Cols, where = Where, order_by = Order,
                 {ok, Exprs, Names} ->
                     %% 並べ替えは射影の**前**に置く。ORDER BY のキーは
                     %% 出力に含まれないカラムでもよい(SELECT name ... ORDER BY price)。
-                    case bind_order(Order, Columns) of
+                    case bind_order(Order, Columns, Exprs) of
                         {error, Reason} ->
                             {error, Reason};
                         {ok, Keys} ->
@@ -528,7 +528,7 @@ bind_grouped_select(#select_stmt{columns = Cols, where = Where, group_by = Group
                               %% 並べ替えは集約と射影の**間**に置く。
                               %% ORDER BY のキーは集約後の行の位置を指しており、
                               %% 射影の後(出力行)ではその位置が変わる。
-                              case bind_order_after_agg(Order, Ctx1) of
+                              case bind_order_after_agg(Order, Ctx1, Exprs) of
                                   {error, Reason} ->
                                       {error, Reason};
                                   {ok, SortKeys} ->
@@ -697,15 +697,25 @@ agg_func(Name, star) -> {error, {star_not_allowed, Name}};
 agg_func(Name, _) -> {error, {unknown_function, Name}}.
 
 %% ORDER BY は射影後の行を指すので、出力カラム名で解決する。
-bind_order_after_agg(Items, Ctx) ->
-    bind_order_after_agg(Items, Ctx, []).
+bind_order_after_agg(Items, Ctx, Proj) ->
+    bind_order_after_agg(Items, Ctx, Proj, []).
 
-bind_order_after_agg([], _Ctx, Acc) ->
+bind_order_after_agg([], _Ctx, _Proj, Acc) ->
     {ok, lists:reverse(Acc)};
-bind_order_after_agg([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Ctx, Acc) ->
+bind_order_after_agg([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Ctx, Proj, Acc) ->
+    case agg_order_key(E, Ctx, Proj) of
+        {error, Reason} -> {error, Reason};
+        {ok, Bound} -> bind_order_after_agg(T, Ctx, Proj,
+                                            [{Bound, Dir, nulls_for(Dir, Nulls)} | Acc])
+    end.
+
+%% 集約つきでも裸の整数は出力列の位置。
+agg_order_key(#const{value = N}, _Ctx, Proj) when is_integer(N) ->
+    ordinal(N, Proj);
+agg_order_key(E, Ctx, _Proj) ->
     case rewrite(E, Ctx) of
         {error, Reason} -> {error, Reason};
-        {ok, Bound, _} -> bind_order_after_agg(T, Ctx, [{Bound, Dir, nulls_for(Dir, Nulls)} | Acc])
+        {ok, Bound, _}  -> {ok, Bound}
     end.
 
 index_of_key(Bound, Keys) -> index_of(Bound, Keys).
@@ -759,9 +769,12 @@ contains_func(#aliased{expr = E}) -> contains_func(E);
 contains_func(#binop{left = L, right = R}) -> contains_func(L) orelse contains_func(R);
 contains_func(#unop{arg = A}) -> contains_func(A);
 contains_func(#is_null{arg = A}) -> contains_func(A);
-contains_func(#case_expr{whens = Ws, else_ = E}) ->
-    lists:any(fun({C, V}) -> contains_func(C) orelse contains_func(V) end, Ws)
+contains_func(#case_expr{arg = A, whens = Ws, else_ = E}) ->
+    (A =/= undefined andalso contains_func(A))
+        orelse lists:any(fun({C, V}) -> contains_func(C) orelse contains_func(V) end, Ws)
         orelse (E =/= undefined andalso contains_func(E));
+contains_func(#between_expr{arg = A, low = Lo, high = Hi}) ->
+    contains_func(A) orelse contains_func(Lo) orelse contains_func(Hi);
 contains_func(#like_expr{arg = A, pattern = P}) ->
     contains_func(A) orelse contains_func(P);
 contains_func(#in_expr{arg = A, values = Vs}) ->
@@ -805,16 +818,37 @@ default_offset(N) -> N.
 
 %% ORDER BY のキーを束縛する。
 %% NULLの位置の既定はPostgreSQLに合わせ、ASCならlast、DESCならfirst。
-bind_order(Items, Columns) ->
-    bind_order(Items, Columns, []).
+%%----------------------------------------------------------------------
+%% ORDER BY のキーを束縛する。
+%%
+%% 裸の整数は**出力列の位置**を指す(SQLの規則)。式ではない。
+%% `SELECT a, b FROM t ORDER BY 1` は「a で並べる」であって
+%% 「定数1で並べる」ではない。定数で並べても順序は決まらないので、
+%% 式として扱うと **黙って並べ替えなしになる**。
+%%
+%% 並べ替えは射影の前に置いてあるので、位置 N は射影の N 番目の式
+%% (すでに束縛済み)に読み替える。
+%%----------------------------------------------------------------------
+bind_order(Items, Columns, ProjExprs) ->
+    bind_order(Items, Columns, ProjExprs, []).
 
-bind_order([], _Columns, Acc) ->
+bind_order([], _Columns, _Proj, Acc) ->
     {ok, lists:reverse(Acc)};
-bind_order([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Columns, Acc) ->
-    case bind_expr(E, Columns) of
+bind_order([#sort_item{expr = E, dir = Dir, nulls = Nulls} | T], Columns, Proj, Acc) ->
+    case order_key(E, Columns, Proj) of
         {error, Reason} -> {error, Reason};
-        {ok, Bound} -> bind_order(T, Columns, [{Bound, Dir, nulls_for(Dir, Nulls)} | Acc])
+        {ok, Bound} -> bind_order(T, Columns, Proj, [{Bound, Dir, nulls_for(Dir, Nulls)} | Acc])
     end.
+
+order_key(#const{value = N}, _Columns, Proj) when is_integer(N) ->
+    ordinal(N, Proj);
+order_key(E, Columns, _Proj) ->
+    bind_expr(E, Columns).
+
+ordinal(N, Proj) when N >= 1, N =< length(Proj) ->
+    {ok, lists:nth(N, Proj)};
+ordinal(N, Proj) ->
+    {error, {order_by_position_out_of_range, N, length(Proj)}}.
 
 nulls_for(asc, default) -> nulls_last;
 nulls_for(desc, default) -> nulls_first;
@@ -1001,6 +1035,39 @@ bind_expr(#unop{op = '-', arg = A}, Columns) ->
 %% 外を参照していれば「そんな列は無い」で落ちる。相関副問い合わせは
 %% 外側の1行ごとに実行し直す必要があり、別の仕組みになる。
 %%----------------------------------------------------------------------
+%% BETWEEN は比較2つに開く。規格の定義そのもの。
+%%
+%%   x BETWEEN a AND b      →  x >= a AND x <= b
+%%   x NOT BETWEEN a AND b  →  NOT (x >= a AND x <= b)
+%%
+%% NULL の扱いも一致する。x が NULL なら両方の比較が unknown になり、
+%% AND も unknown。NOT unknown も unknown。
+%%
+%% x は2度評価される。式は副作用を持たないので結果は変わらないが、
+%% x が副問い合わせを含むと2回走る。
+bind_expr(#between_expr{arg = A, low = Lo, high = Hi, negated = Neg}, Columns) ->
+    Body = #binop{op = 'and',
+                  left  = #binop{op = '>=', left = A, right = Lo},
+                  right = #binop{op = '<=', left = A, right = Hi}},
+    bind_expr(case Neg of
+                  true  -> #unop{op = 'not', arg = Body};
+                  false -> Body
+              end, Columns);
+
+%% 簡易CASE は探索CASE に開いてから束縛する。
+%%
+%%   CASE x WHEN v1 THEN r1 WHEN v2 THEN r2 ELSE e END
+%%     → CASE WHEN x = v1 THEN r1 WHEN x = v2 THEN r2 ELSE e END
+%%
+%% NULL の扱いも一致する。x が NULL なら x = v は unknown で、
+%% どの枝も選ばれず ELSE になる。これは規格どおり。
+%%
+%% x は枝の数だけ評価される。式は副作用を持たないので結果は変わらないが、
+%% x が副問い合わせを含むと**その回数だけ走る**。
+bind_expr(#case_expr{arg = Arg, whens = Whens, else_ = Else}, Columns)
+  when Arg =/= undefined ->
+    Expanded = [{#binop{op = '=', left = Arg, right = V}, R} || {V, R} <- Whens],
+    bind_expr(#case_expr{whens = Expanded, else_ = Else}, Columns);
 bind_expr(#case_expr{whens = Whens, else_ = Else}, Columns) ->
     case bind_whens(Whens, Columns, []) of
         {error, Reason} ->

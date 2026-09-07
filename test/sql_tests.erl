@@ -126,9 +126,6 @@ string_literal_does_not_match_atom(_) ->
 unsupported_syntax_is_reported(_) ->
     fun() ->
         C = fixture(),
-        %% BETWEEN
-        ?assertMatch({error, {syntax_error, _, _}},
-                     q(C, "SELECT * FROM fruit WHERE price BETWEEN 1 AND 2")),
         %% ALTER TABLE
         ?assertMatch({error, {syntax_error, _, _}},
                      q(C, "ALTER TABLE fruit ADD COLUMN c INTEGER")),

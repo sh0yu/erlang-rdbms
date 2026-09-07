@@ -196,3 +196,77 @@ rows(C, Sql) ->
 
 connect() -> {ok, Pid} = gen_connection:connect(), Pid.
 q(C, Sql) -> query_exec:exec_query(C, {sql, Sql}).
+
+%%%===================================================================
+%%% BETWEEN と簡易CASE
+%%%
+%%% どちらも糖衣で、意味解析で開いてから束縛する。
+%%% 開き方が規格どおりか(特に NULL)をここで押さえる。
+%%%===================================================================
+
+between_test_() ->
+    {setup, fun start/0, fun stop/1,
+     fun({_Ctx, C}) ->
+         [?_assertEqual([[2], [3], [4]], rows(C, "a", "a BETWEEN 2 AND 4")),
+          %% 境界を含む
+          ?_assertEqual([[2]], rows(C, "a", "a BETWEEN 2 AND 2")),
+          %% 下限 > 上限なら空。x >= lo AND x <= hi に開くので自然にそうなる
+          ?_assertEqual([], rows(C, "a", "a BETWEEN 4 AND 2")),
+          %% NOT BETWEEN は NOT (…) で、NULL は通さない
+          ?_assertEqual([[1], [5]], rows(C, "a", "a NOT BETWEEN 2 AND 4")),
+          %% NULL は BETWEEN でも NOT BETWEEN でも通らない(unknown)
+          ?_assertEqual([], rows(C, "a", "a IS NULL AND a BETWEEN 1 AND 9")),
+          ?_assertEqual([], rows(C, "a", "a IS NULL AND a NOT BETWEEN 1 AND 9")),
+          %% 両辺は算術式でよい
+          ?_assertEqual([[2], [3], [4]], rows(C, "a", "b / 10 BETWEEN 1 + 1 AND 2 * 2")),
+          %% 後ろに AND が続いても、BETWEEN の AND と取り違えない
+          ?_assertEqual([[3], [4]], rows(C, "a", "a BETWEEN 2 AND 4 AND b > 20")),
+          ?_assertEqual([[1], [2], [3], [4]],
+                        rows(C, "a", "a BETWEEN 1 AND 2 OR a BETWEEN 3 AND 4")),
+          %% 括弧で囲めば中はフル式に戻る
+          ?_assertEqual([[1], [2]],
+                        rows(C, "a", "a BETWEEN (SELECT min(a) FROM t) AND 2"))]
+     end}.
+
+simple_case_test_() ->
+    {setup, fun start/0, fun stop/1,
+     fun({_Ctx, C}) ->
+         [?_assertEqual([[<<"one">>]],
+                        rows(C, "CASE a WHEN 1 THEN 'one' END", "a = 1")),
+          %% 一致しなければ ELSE
+          ?_assertEqual([[<<"other">>]],
+                        rows(C, "CASE a WHEN 1 THEN 'one' ELSE 'other' END", "a = 3")),
+          %% ELSE が無ければ NULL
+          ?_assertEqual([[null]], rows(C, "CASE a WHEN 1 THEN 'one' END", "a = 3")),
+          %% NULL はどの枝にも一致しない(x = NULL は unknown)
+          ?_assertEqual([[<<"other">>]],
+                        rows(C, "CASE a WHEN NULL THEN 'null' ELSE 'other' END",
+                             "a IS NULL")),
+          %% 先に書いた枝が勝つ
+          ?_assertEqual([[<<"first">>]],
+                        rows(C, "CASE a WHEN 1 THEN 'first' WHEN 1 THEN 'second' END",
+                             "a = 1"))]
+     end}.
+
+%%%===================================================================
+
+rows(C, Select, Where) ->
+    Sql = "SELECT " ++ Select ++ " FROM t WHERE " ++ Where ++ " ORDER BY 1",
+    ok = q(C, "BEGIN READ ONLY"),
+    {ok, _, R} = q(C, Sql),
+    ok = q(C, "COMMIT"),
+    R.
+
+start() ->
+    Ctx = db_test_helper:start_db(),
+    C = connect(),
+    ok = q(C, "CREATE TABLE t (a INTEGER, b INTEGER)"),
+    ok = q(C, "BEGIN"),
+    [{ok, _} = q(C, lists:flatten(io_lib:format("INSERT INTO t VALUES (~p, ~p)", [A, A * 10])))
+     || A <- [1, 2, 3, 4, 5]],
+    {ok, _} = q(C, "INSERT INTO t VALUES (NULL, 0)"),
+    ok = q(C, "COMMIT"),
+    {Ctx, C}.
+
+stop({Ctx, _C}) ->
+    db_test_helper:stop_db(Ctx).

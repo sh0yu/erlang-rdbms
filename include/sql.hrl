@@ -132,10 +132,20 @@
 %% SELECT * の *
 -record(star, {}).
 
-%% CASE WHEN cond THEN val ... [ELSE val] END
+%% CASE WHEN cond THEN val ... [ELSE val] END          (探索CASE)
+%% CASE x WHEN v THEN val ... [ELSE val] END            (簡易CASE)
 -record(case_expr, {
-    whens = [],   % [{Cond, Val}]
+    arg,          % 簡易CASEの比較対象。探索CASEでは undefined
+    whens = [],   % [{Cond, Val}] 簡易CASEでは Cond は比較する値
     else_          % 省略時は undefined(結果は NULL)
+}).
+
+%% x BETWEEN lo AND hi。lo <= x <= hi の糖衣。
+-record(between_expr, {
+    arg,
+    low,
+    high,
+    negated = false
 }).
 
 %% x LIKE 'pat'。`%` は任意の並び、`_` は任意の1文字。

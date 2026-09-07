@@ -1,0 +1,14 @@
+#!/bin/sh
+# sqllogictest のコーパスを test/slt/ に落とす。
+#
+# 他所のものなので repo には入れていない。置いてあれば
+# rebar3 eunit が拾って流す(test/slt_tests.erl)。
+set -e
+dir="$(cd "$(dirname "$0")/.." && pwd)/test/slt"
+base="https://raw.githubusercontent.com/gregrahn/sqllogictest/master/test"
+mkdir -p "$dir"
+for f in select1 select2 select3 select4 select5; do
+    echo "fetching $f.test"
+    curl -sSf --max-time 120 -o "$dir/$f.test" "$base/$f.test"
+done
+echo "done: $dir"

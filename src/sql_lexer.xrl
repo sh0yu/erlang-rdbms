@@ -25,6 +25,7 @@ Rules.
 %% 「左の expr を還元するか not を読み進めるか」が1トークン先読みでは
 %% 決まらず、yecc が shift/reduce 衝突を出す。
 [Nn][Oo][Tt]{WS}+[Ii][Nn]  : {token, {'not_in', TokenLine}}.
+[Nn][Oo][Tt]{WS}+[Bb][Ee][Tt][Ww][Ee][Ee][Nn] : {token, {'not_between', TokenLine}}.
 %% NOT LIKE も同じ理由で1トークンにする。
 [Nn][Oo][Tt]{WS}+[Ll][Ii][Kk][Ee] : {token, {'not_like', TokenLine}}.
 {L}{A}*             : {token, keyword_or_identifier(TokenChars, TokenLine)}.
@@ -66,7 +67,7 @@ keywords() ->
      "order", "by", "asc", "desc", "limit", "offset", "distinct",
      "nulls", "first", "last",
      "group", "having",
-     "explain", "index", "analyze", "read", "only", "committed",
+     "explain", "index", "analyze", "read", "only", "committed", "between",
      "union", "intersect", "except", "all",
      "in", "exists",
      %% RIGHT / FULL は未実装だが予約語にしておく。

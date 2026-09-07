@@ -31,6 +31,7 @@ Nonterminals
     query set_expr set_term select_core opt_all
     case_expr when_list when_item opt_else
     neg opt_distinct opt_order sort_list sort_item opt_dir opt_nulls opt_limit
+    b_expr
     opt_group opt_having expr_list func_call
     from_item join_kw opt_alias
     column_defs column_def type_name
@@ -51,6 +52,7 @@ Terminals
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
     'group' 'having' 'explain' 'index' 'analyze' 'read' 'only' 'committed'
+    'between' 'not_between'
     'union' 'intersect' 'except' 'all' 'in' 'exists' 'not_in'
     'right' 'full'
     'case' 'when' 'then' 'else' 'end' 'like' 'not_like'
@@ -79,7 +81,7 @@ Left  100 'or'.
 Left  200 'and'.
 Unary 300 'not'.
 Nonassoc 400 'is'.
-Nonassoc 450 'in' 'not_in' 'like' 'not_like'.
+Nonassoc 450 'in' 'not_in' 'like' 'not_like' 'between' 'not_between'.
 Nonassoc 500 '=' '<>' '<' '<=' '>' '>='.
 Left  600 '+' '-'.
 Left  700 '*' '/'.
@@ -139,6 +141,13 @@ type_name -> 'integer' : integer.
 type_name -> 'float'   : float.
 type_name -> 'varchar' : varchar.
 type_name -> 'boolean' : boolean.
+%% VARCHAR(30) のような長さ指定は受け取って**捨てる**。
+%% 値は Erlang の binary で持っていて、長さで表現が変わらないため。
+%% 受け取らないと CREATE TABLE ごと落ちて、その表への操作が全部倒れる。
+%% 長さで入力を弾く検査は入れていない(切り詰めも拒否もしない)。
+type_name -> 'integer' '(' int_lit ')' : integer.
+type_name -> 'float'   '(' int_lit ')' : float.
+type_name -> 'varchar' '(' int_lit ')' : varchar.
 
 drop_stmt -> drop table identifier : #drop_table_stmt{table = value_of('$3')}.
 
@@ -330,6 +339,35 @@ expr -> case_expr : '$1'.
 %% BETWEEN の AND が論理演算の AND と同じ優先度(200)になってしまう。
 %% その結果 `x BETWEEN 1 AND 2 AND y > 3` の切り方が決まらず衝突する。
 %% 糖衣なので `x >= a AND x <= b` と書けばよい。
+%% BETWEEN の両辺は **b_expr** で、AND や OR を含めない。
+%%
+%% ここを expr にすると、`x BETWEEN 1 AND 2` を読んだ時点で
+%% 「BETWEEN の AND」なのか「論理の AND」なのか決められず、
+%% yecc が reduce/reduce で詰まる(実際38件出た)。yecc には
+%% PostgreSQL の gram.y が使う %prec に相当する指定が無いので、
+%% 優先順位では解けない。
+%%
+%% SQLの規格も BETWEEN の両辺を row value predicand に限っていて、
+%% 論理演算子は入らない。括弧で囲めば中はフル式に戻せる。
+expr -> expr 'between' b_expr 'and' b_expr :
+    #between_expr{arg = '$1', low = '$3', high = '$5'}.
+expr -> expr 'not_between' b_expr 'and' b_expr :
+    #between_expr{arg = '$1', low = '$3', high = '$5', negated = true}.
+
+%% 論理演算子を含まない式。算術と原子だけ。
+b_expr -> b_expr '+' b_expr : #binop{op = '+', left = '$1', right = '$3'}.
+b_expr -> b_expr '-' b_expr : #binop{op = '-', left = '$1', right = '$3'}.
+b_expr -> b_expr '*' b_expr : #binop{op = '*', left = '$1', right = '$3'}.
+b_expr -> b_expr '/' b_expr : #binop{op = '/', left = '$1', right = '$3'}.
+b_expr -> neg b_expr        : #unop{op = '-', arg = '$2'}.
+b_expr -> '(' expr ')'      : '$2'.
+b_expr -> '(' query ')'     : #scalar_subquery{query = '$2'}.
+b_expr -> func_call         : '$1'.
+b_expr -> case_expr         : '$1'.
+b_expr -> literal           : '$1'.
+b_expr -> identifier                : #col_ref{name = value_of('$1')}.
+b_expr -> identifier '.' identifier : #col_ref{table = value_of('$1'),
+                                               name = value_of('$3')}.
 expr -> expr 'like' expr     : #like_expr{arg = '$1', pattern = '$3'}.
 expr -> expr 'not_like' expr : #like_expr{arg = '$1', pattern = '$3', negated = true}.
 expr -> 'exists' '(' query ')' : #exists_expr{query = '$3'}.
@@ -384,6 +422,10 @@ expr -> literal       : '$1'.
 %% CASE WHEN ... THEN ... [ELSE ...] END
 case_expr -> 'case' when_list opt_else 'end' :
     #case_expr{whens = '$2', else_ = '$3'}.
+%% 簡易CASE。CASE x WHEN v THEN ... は CASE WHEN x = v THEN ... と同じ。
+%% 展開は意味解析でやる(ここで作ると、xを何度も書くことになる)。
+case_expr -> 'case' expr when_list opt_else 'end' :
+    #case_expr{arg = '$2', whens = '$3', else_ = '$4'}.
 
 when_list -> when_item           : ['$1'].
 when_list -> when_list when_item : '$1' ++ ['$2'].
