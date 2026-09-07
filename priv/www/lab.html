@@ -50,6 +50,11 @@
   .fix{background:#12181f;border:1px solid var(--line);border-radius:8px;
        padding:11px 14px;font-size:12.5px;color:#b9c1cc;margin:14px 0}
   .fix .h{color:var(--ok);font-size:11px;font-weight:700;display:block;margin-bottom:3px}
+  .fix.how{border-left:3px solid var(--accent)}
+  .fix.how .h{color:var(--accent)}
+  .fix.how div{padding:2px 0}
+  .fix code{background:#0c1016;border:1px solid var(--line);border-radius:4px;
+            padding:1px 6px;color:var(--warn);font-size:12px}
   .sec{margin:0 0 18px}
   .sec h3{font-size:14px;margin:0 0 6px;color:#dfe5ec}
   .sec p{margin:0 0 8px;font-size:13px;color:#c3cad4}
@@ -112,14 +117,15 @@ const $=s=>document.querySelector(s);
 const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
                    if(x!==undefined)n.textContent=x;return n;};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const md=s=>String(s||"").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>");
+const md=s=>String(s||"").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
+                         .replace(/`([^`]+)`/g,"<code>$1</code>");
 const KIND={timeline:"時系列で追う",compare:"方式を並べて比べる",
             matrix:"表で見る",notes:"整理",flow:"押して辿る"};
 
 let BOOK=[], FLAT=[], speed=1500, run=0, cur=null;
 
 async function boot(){
-  BOOK = await (await fetch("/api/tether_web:book")).json();
+  BOOK = await (await fetch("/api/tether_web:book",{cache:"no-store"})).json();
   const toc=$("#toc");
   BOOK.forEach(ch=>{
     toc.append(el("div","ch",ch.title));
@@ -162,6 +168,12 @@ function show(id){
   else if(it.kind==="matrix") matrix(m,it);
   else notes(m,it);
 
+  if(it.how){
+    const h=el("div","fix how");
+    h.innerHTML='<span class="h">具体的には</span>'+
+                md(it.how).split("\n").map(x=>"<div>"+x+"</div>").join("");
+    m.append(h);
+  }
   if(it.fix&&it.fix!=="—"){
     const f=el("div","fix"); f.innerHTML='<span class="h">どう防ぐか</span>'+md(it.fix);
     m.append(f);

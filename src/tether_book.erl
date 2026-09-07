@@ -71,7 +71,8 @@ raw() ->
 
      #{id => "lock", title => "2. ロック — 1台での解き方",
        intro => "競合を防ぐ最も直接的な手段。代償は待ちとデッドロック。",
-       items => [lock_modes(), two_phase(), deadlock(), mvcc(), optimistic()]},
+       items => [lock_modes(), two_phase(), deadlock(), mvcc(),
+                 pessimistic(), optimistic(), opt_vs_pes()]},
 
      #{id => "why", title => "3. なぜ分散するのか（そして、しないのか）",
        intro => "理由の大半は、実は単一ノードのままでも満たせる。"
@@ -418,31 +419,73 @@ mvcc() ->
              "Oracle の UNDO 表領域）。放っておくと膨らむ。",
       seealso => ["nonrepeatable", "write_skew"]}.
 
+pessimistic() ->
+    #{id => "pessimistic", kind => "timeline",
+      title => "悲観制御 — 先にロックを取る",
+      why => "**触る前に、他人が触れないようにする。** 誰も失敗しない。ただし待つ。"
+             "「悲観」は「競合は起きるだろう」と見込んでいる、という意味。",
+      actors => ["T1", "T2"],
+      rows =>
+        [r(1, "T1", "SELECT x FOR UPDATE", "x=100 ロック:T1", "**この時点で占有する**", false),
+         r(2, "T2", "SELECT x FOR UPDATE", "待ち", "**T2 はここで止まる。失敗はしない**", false),
+         r(3, "T1", "UPDATE x = 99", "x=99 ロック:T1", "", false),
+         r(4, "T1", "COMMIT", "x=99 ロック解放", "", false),
+         r(5, "T2", "（待ちが解けた）x を読む", "x=99", "**T1 の結果を見てから進む**", false),
+         r(6, "T2", "UPDATE x = 98 → COMMIT", "x=98", "誰も失敗していない。順に通っただけ", false)],
+      how => "PostgreSQL / MySQL — `SELECT ... FOR UPDATE`\n"
+             "SQL Server — `SELECT ... WITH (UPDLOCK, ROWLOCK)`\n"
+             "待ちたくないとき — `FOR UPDATE NOWAIT`（即座にエラー）\n"
+             "並ばず飛ばしたいとき — `FOR UPDATE SKIP LOCKED`"
+             "（**DBでジョブキューを作るときの定番**）\n"
+             "複数行に跨って取ると**デッドロックが出る**。取る順序を固定すること。",
+      fix => "—",
+      seealso => ["optimistic", "opt_vs_pes", "deadlock"]}.
+
 optimistic() ->
-    #{id => "optimistic", kind => "compare",
-      title => "悲観 vs 楽観 — いつ競合を確かめるか",
-      why => "先にロックを取る（悲観）か、書くときに前提が変わっていないか"
-             "確かめる（楽観）か。**競合が稀なら楽観が速く、多いと再試行の嵐になる。**",
-      policies => [p("pessimistic", "悲観（先にロック）"),
-                   p("optimistic", "楽観（後で検証）")],
-      steps =>
-        [s("在庫は100。20クライアントが同時に1個ずつ売ろうとする。",
-           #{"pessimistic" => "全員が行ロックを待つ列に並ぶ",
-             "optimistic"  => "全員がまず 100 を読む"}),
-         s("処理が進む。",
-           #{"pessimistic" => "1人ずつ順に通る。待ちはあるが確実",
-             "optimistic"  => "1人だけ成功。19人は前提が古く中止"}),
-         s("中止した側は?",
-           #{"pessimistic" => "中止しない",
-             "optimistic"  => "**読み直してやり直す。また19人中18人が失敗**"}),
-         s("結果",
-           #{"pessimistic" => "20回の待ち",
-             "optimistic"  => "**再試行の嵐。競合が多いほど悪化する**"})],
-      verdict => #{"pessimistic" => "競合が多い場所ではこちら。待つが進む",
-                   "optimistic"  => "競合が稀な場所ではこちら。ホット行では破綻する"},
-      good => ["pessimistic"],
-      note => "実測: 200並行で1行に read-modify-write をかけると、"
-              "20000件の売上に対して**160万回の再試行**が出た。"}.
+    #{id => "optimistic", kind => "timeline",
+      title => "楽観制御 — 書くときに前提を確かめる",
+      why => "**ロックを取らない。書く瞬間に「読んだときから変わっていないか」を"
+             "確かめ、変わっていたら中止する。** 誰も待たない。"
+             "その代わり、負けた方の**やり直しはアプリが書く**。",
+      actors => ["T1", "T2"],
+      rows =>
+        [r(1, "T1", "SELECT x, version → 100, v1", "x=100 (v1)", "**ロックを取らない**", false),
+         r(2, "T2", "SELECT x, version → 100, v1", "x=100 (v1)", "**T2 も同じ版を見た。待たない**", false),
+         r(3, "T1", "UPDATE x=99 WHERE version=1", "x=99 (v2)", "1行更新 → 成功", false),
+         r(4, "T2", "UPDATE x=99 WHERE version=1", "x=99 (v2)", "**0行更新。前提が古い → 中止**", true),
+         r(5, "T2", "読み直す", "x=99 (v2)", "アプリが自分で再試行を書く", false),
+         r(6, "T2", "UPDATE x=98 WHERE version=2", "x=98 (v3)", "今度は通った", false)],
+      how => "版番号の列 + `UPDATE ... WHERE version = ?` → **更新行数が0なら中止**\n"
+             "更新時刻でも同じことができる（ただし時計に依存する）\n"
+             "JPA / Hibernate — `@Version`\n"
+             "DynamoDB — 条件付き書き込み（`ConditionExpression`）\n"
+             "HTTP — `ETag` と `If-Match`（同じ考え方）\n"
+             "PostgreSQL の SERIALIZABLE (SSI) も、原理としては楽観側",
+      fix => "—",
+      seealso => ["pessimistic", "opt_vs_pes", "lost_update"]}.
+
+opt_vs_pes() ->
+    #{id => "opt_vs_pes", kind => "matrix",
+      title => "どちらを選ぶか",
+      why => "**「どちらが優れているか」ではなく「競合がどれだけ起きるか」で決まる。**"
+             "同じデータベースの中でも、表によって答えが変わる。",
+      cols => ["悲観（先にロック）", "楽観（後で検証）"],
+      rows =>
+        [m("競合が稀なとき", ["遅い。毎回ロックの費用を払う", "**速い。ほぼ素通り**"],
+           "実際の負荷の大半はこちら"),
+         m("**競合が多いとき**", ["**進む。** 待つが、必ず順に通る", "**再試行の嵐。悪化する**"],
+           "ホット行では致命的"),
+         m("待ち", ["ある", "無い"], ""),
+         m("失敗", ["しない", "**する。** 再試行をアプリが書く"], ""),
+         m("デッドロック", ["**ある**", "無い"], "取る順序を固定して予防する"),
+         m("長い取引", ["ロックを長く持ち、他を止める", "最後に落ちる。**それまでの計算が無駄**"], ""),
+         m("読み手への影響", ["ロックの種類による", "**まったく邪魔しない**"], ""),
+         m("実測（1行に200並行の read-modify-write）",
+           ["20000件を順に処理", "**160万回の再試行**（1件あたり81回）"],
+           "escrow で競合そのものを消すと、協調は5%まで減った")],
+      note => "**第3の道がある。** 悲観も楽観も「同じ行を通る」ことを前提にしている。"
+              "escrow は**通らせない**。持ち分を先に配ってしまえば競合そのものが"
+              "起きないので、どちらの費用も払わない。ただし数値の下限にしか使えない。"}.
 
 %%%===================================================================
 %%% 3. なぜ分散するのか
@@ -720,6 +763,3 @@ r(T, Who, Act, State, Note, Bad) ->
 
 m(Label, Cells, Note) -> #{label => Label, cells => Cells, note => Note}.
 
-p(K, N) -> #{key => K, name => N}.
-
-s(Say, State) -> #{say => Say, state => State}.

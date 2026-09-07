@@ -139,7 +139,7 @@ const $ = s => document.querySelector(s);
 const el = (t,c,x)=>{const n=document.createElement(t); if(c)n.className=c;
                      if(x!==undefined)n.textContent=x; return n;};
 
-async function load(){ S = await (await fetch("/api/tether_web:state")).json(); draw(); }
+async function load(){ S = await (await fetch("/api/tether_web:state",{cache:"no-store"})).json(); draw(); }
 async function act(c,a){ S = await (await fetch("/api/tether_web:act",
                           {method:"POST",body:`client=${c}&action=${a}`})).json(); draw(); }
 
