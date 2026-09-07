@@ -120,7 +120,7 @@ tether_sessions   ETS名簿と購読の配布。引くのにプロセスを経�
 
 手で押すこともできる。色で差が出る。
 
-### /lab.html — 分散DBの系譜（36項目）
+### /lab.html — 分散DBの系譜（40項目）
 
 **tether の実装とは独立した一般論。**
 最初のページが**選び方**で、押して辿ると答えに着く。
@@ -166,7 +166,8 @@ tether_sessions   ETS名簿と購読の配布。引くのにプロセスを経�
 4. 分散すると何が壊れるか
      CAP / PACELC / 再送 / 時計のずれ / 在庫の下限 / 削除の復活 / 複数行の原子性
 5. 解き方の系譜
-     単一リーダー+合意 / 決定的実行(Calvin) / durable execution / local-first
+     単一リーダー+合意 / **CRDT（考え方・カウンタ・集合・限界）** /
+     決定的実行(Calvin) / durable execution / local-first
 6. 対応表 — 何がどれを防ぐか
 ```
 
