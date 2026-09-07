@@ -41,9 +41,18 @@
        border-radius:0 8px 8px 0;padding:12px 15px;font-size:13px;color:#c3cad4;margin:0 0 20px}
   b{color:var(--fg)}
   .why b{color:#fff}
-  table{width:100%;border-collapse:collapse;margin:6px 0 14px;font-size:12.5px}
+  /* 日本語は既定でどこでも改行するので、括弧の途中で割れる。
+     keep-all で語の途中を割らせず、はみ出す場合は横スクロールで逃がす。 */
+  .tw{overflow-x:auto;margin:6px 0 14px}
+  table{width:100%;border-collapse:collapse;margin:0;font-size:12.5px}
+  /* 日本語は既定で1文字単位で割れる。auto-phrase は文節で折り返す
+     (Chrome 119+。非対応なら従来通りに落ちるだけ)。
+     短いセルは keep-all で、括弧の途中を割らせない。 */
+  td,th{word-break:auto-phrase}
+  .nb{word-break:keep-all;line-break:strict}
   th{text-align:left;color:var(--dim);font-weight:600;padding:6px 10px;
      border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+
   td{padding:7px 10px;border-bottom:1px solid #1c222b;vertical-align:top}
   tr.bad td{background:rgba(235,87,87,.10)}
   tr.bad td:first-child{border-left:3px solid var(--err)}
@@ -64,7 +73,8 @@
             padding:1px 6px;color:var(--warn);font-size:12px}
   .sec{margin:0 0 18px}
   .sec h3{font-size:14px;margin:0 0 6px;color:#dfe5ec}
-  .sec p{margin:0 0 8px;font-size:13px;color:#c3cad4}
+  .sec p{margin:0 0 8px;font-size:13px;color:#c3cad4;word-break:auto-phrase}
+  .why,.abody,.note,.fix{word-break:auto-phrase}
   .sec .it{display:flex;gap:10px;padding:4px 0;font-size:12.5px}
   .sec .it .n{color:var(--accent);min-width:190px;font-weight:600}
   .sec .it .d{color:#aeb6c2}
@@ -124,6 +134,8 @@ const $=s=>document.querySelector(s);
 const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
                    if(x!==undefined)n.textContent=x;return n;};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// 短いセルは語の途中で割らせない(○(届かない) が「届かな/い」になるのを防ぐ)
+const nb=t=>String(t||"").replace(/\*\*/g,"").length<=18?"nb":"";
 const md=s=>String(s||"").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
                          .replace(/`([^`]+)`/g,"<code>$1</code>");
 const KIND={timeline:"時系列で追う",compare:"方式を並べて比べる",
@@ -222,12 +234,12 @@ async function timeline(m,it,me){
   const bd=el("tbody");
   it.rows.forEach(rw=>{
     const tr=el("tr","hide"+(rw.bad?" bad":""));
-    tr.append(el("td","",rw.t), el("td","who",rw.who), el("td","",rw.act),
-              el("td","st",rw.state));
+    tr.append(el("td","",rw.t), el("td","who",rw.who),
+              el("td",nb(rw.act),rw.act), el("td","st nb",rw.state));
     const nt=el("td","note"); nt.innerHTML=md(rw.note); tr.append(nt);
     bd.append(tr);
   });
-  tb.append(hd,bd); m.append(tb);
+  wrap(m, tb);
   for(let i=0;i<bd.children.length;i++){
     if(me!==run) return;
     bd.children[i].className=(it.rows[i].bad?"bad ":"")+"now";
@@ -245,7 +257,7 @@ async function compare(m,it,me){
   const hd=el("thead"); hd.append(th);
   const br=el("tr"); it.policies.forEach(()=>br.append(el("td","","—")));
   const bd=el("tbody"); bd.append(br);
-  tb.append(hd,bd); m.append(tb);
+  wrap(m, tb);
 
   const ul=el("table"), ub=el("tbody");
   it.steps.forEach((s,i)=>{
@@ -254,7 +266,7 @@ async function compare(m,it,me){
     const td=el("td",""); td.innerHTML=md(s.say); tr.append(td);
     ub.append(tr);
   });
-  ul.append(ub); m.append(ul);
+  wrap(m, ul);
 
   const vd=el("div"); m.append(vd);
   const prev={};
@@ -291,8 +303,8 @@ function matrix(m,it){
   const bd=el("tbody");
   it.rows.forEach(rw=>{
     const tr=el("tr");
-    const lb=el("td",""); lb.innerHTML="<b>"+md(rw.label)+"</b>"; tr.append(lb);
-    rw.cells.forEach(c=>{const td=el("td",""); td.innerHTML=md(c); tr.append(td);});
+    const lb=el("td",nb(rw.label)); lb.innerHTML="<b>"+md(rw.label)+"</b>"; tr.append(lb);
+    rw.cells.forEach(c=>{const td=el("td",nb(c)); td.innerHTML=md(c); tr.append(td);});
     const nt=el("td","note"); nt.innerHTML=md(rw.note); tr.append(nt);
     bd.append(tr);
   });

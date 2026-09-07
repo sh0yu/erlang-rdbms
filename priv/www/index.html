@@ -8,7 +8,9 @@
         --accent:#5aa9e6;--ok:#6fcf97;--warn:#f2c94c;--err:#eb5757;--off:#7a839a;}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
-       font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+       font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       /* 日本語を1文字単位でなく文節で折り返す (Chrome 119+) */
+       word-break:auto-phrase}
   header{padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
   header h1{margin:0;font-size:15px;letter-spacing:.04em}
   .try{margin-top:6px;font-size:12px;color:var(--dim)}
