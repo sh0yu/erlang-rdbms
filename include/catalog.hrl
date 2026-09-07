@@ -52,5 +52,7 @@
 -record(column, {
     name     :: atom(),
     type     = any :: sql_type(),
-    position :: pos_integer()
+    position :: pos_integer(),
+    %% 列制約。primary_key は unique と not_null に開いて入れる。
+    constraints = [] :: [unique | not_null]
 }).

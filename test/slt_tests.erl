@@ -20,7 +20,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% ここまでは通る、という下限。下回ったら退行。
--define(MIN_PASS, 9264).
+-define(MIN_PASS, 10700).
 
 slt_test_() ->
     case filelib:wildcard("test/slt/*.test") of

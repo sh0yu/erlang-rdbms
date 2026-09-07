@@ -100,6 +100,47 @@ cartesian_product_is_deferred(_) ->
     end.
 
 %%%===================================================================
+%%% 修飾なしの列名
+%%%===================================================================
+
+%% `FROM a, b WHERE x = y` のように表名を書かない書き方でも、
+%% 結合条件として見えていること。
+%%
+%% 見えないと「つながりが無い」と判断して**直積**を選ぶ。エラーには
+%% ならず、答えも合うので、表が増えるまで気づけない。
+%% sqllogictest の select5(最大62表)がこれで終わらなくなっていた。
+unqualified_predicates_are_join_conditions_test_() ->
+    {setup, fun start/0, fun stop/1,
+     fun({_Ctx, C}) ->
+         [%% 修飾ありと修飾なしで同じ計画になること
+          ?_assertEqual(
+             plan(C, "SELECT v FROM small, mid, big "
+                     "WHERE big.m = mid.id2 AND mid.s = small.id3"),
+             plan(C, "SELECT v FROM small, mid, big WHERE m = id2 AND s = id3")),
+          %% 直積(条件のない入れ子ループ)が出ていないこと
+          ?_assertEqual([], [L || L <- plan(C, "SELECT v FROM small, mid, big "
+                                               "WHERE m = id2 AND s = id3"),
+                                  binary:match(L, <<"Nested Loop">>) =/= nomatch])]
+     end}.
+
+%%%===================================================================
+
+start() ->
+    Ctx = db_test_helper:start_db(),
+    C = connect(),
+    ok = q(C, "CREATE TABLE big (id1 INTEGER, m INTEGER)"),
+    ok = q(C, "CREATE TABLE mid (id2 INTEGER, s INTEGER)"),
+    ok = q(C, "CREATE TABLE small (id3 INTEGER, v VARCHAR)"),
+    ok = q(C, "BEGIN"),
+    _ = [{ok, _} = q(C, ins("big", I, I rem 10 + 1)) || I <- lists:seq(1, 40)],
+    _ = [{ok, _} = q(C, ins("mid", I, I rem 3 + 1))  || I <- lists:seq(1, 10)],
+    _ = [{ok, _} = q(C, lists:flatten(io_lib:format(
+                          "INSERT INTO small VALUES (~p, 'v~p')", [I, I])))
+         || I <- lists:seq(1, 3)],
+    ok = q(C, "COMMIT"),
+    {Ctx, C}.
+
+stop({Ctx, _C}) -> db_test_helper:stop_db(Ctx).
 
 seeded() ->
     C = connect(),

@@ -69,8 +69,9 @@ stop(Pid) ->
 %% @doc テーブル定義を登録する。
 %%
 %% ColumnList は2つの形を受ける。
-%%   [name, price]                     型なし(すべて any)。古いタプルAPI用
-%%   [{name, varchar}, {price, integer}]  型つき。SQLのCREATE TABLE用
+%%   [name, price]                          型なし(すべて any)。タプルAPI用
+%%   [{name, varchar}, {price, integer}]     型つき
+%%   [{id, integer, [unique, not_null]}]     型と列制約つき。SQLのCREATE TABLE用
 %%
 %% Returns: ok | {error, table_already_exists} | {error, invalid_column_list}
 %%----------------------------------------------------------------------
@@ -372,10 +373,14 @@ validate(_TableName, _ColumnList) ->
 
 valid_column(Name) when is_atom(Name) -> true;
 valid_column({Name, Type}) when is_atom(Name) -> lists:member(Type, types());
+valid_column({Name, Type, Cs}) when is_atom(Name), is_list(Cs) ->
+    lists:member(Type, types())
+        andalso lists:all(fun(C) -> lists:member(C, [unique, not_null]) end, Cs);
 valid_column(_) -> false.
 
 name_of(Name) when is_atom(Name) -> Name;
 name_of({Name, _Type}) -> Name;
+name_of({Name, _Type, _Cs}) -> Name;
 name_of(_) -> undefined.
 
 types() -> [integer, float, varchar, boolean, any].
@@ -386,6 +391,9 @@ normalize(ColumnList) ->
 
 normalize([], _N, Acc) ->
     lists:reverse(Acc);
+normalize([{Name, Type, Cs} | T], N, Acc) ->
+    normalize(T, N + 1,
+              [#column{name = Name, type = Type, position = N, constraints = Cs} | Acc]);
 normalize([{Name, Type} | T], N, Acc) ->
     normalize(T, N + 1, [#column{name = Name, type = Type, position = N} | Acc]);
 normalize([Name | T], N, Acc) ->

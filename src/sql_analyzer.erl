@@ -47,6 +47,14 @@
 %%----------------------------------------------------------------------
 analyze(Stmt) -> analyze(Stmt, []).
 
+%% PRIMARY KEY は UNIQUE かつ NOT NULL。規格の定義そのもの。
+%% ここで開いておくと、下の層は unique と not_null だけを知ればよい。
+expand_constraints(Cs) ->
+    lists:usort(lists:append([expand_constraint(C) || C <- Cs])).
+
+expand_constraint(primary_key) -> [unique, not_null];
+expand_constraint(C)           -> [C].
+
 %% 副問い合わせへ入るとき、いまのスコープを1段外側にする。
 outer_scope(Columns) -> [S#sc{level = S#sc.level + 1} || S <- Columns].
 
@@ -54,8 +62,9 @@ analyze(#tx_stmt{op = Op}, _Outer) ->
     {ok, {tx, Op}};
 
 analyze(#create_table_stmt{table = TableStr, columns = Defs}, _Outer) ->
-    case duplicate_names([N || {N, _T} <- Defs]) of
-        [] -> {ok, {create_table, to_atom(TableStr), [{to_atom(N), T} || {N, T} <- Defs]}};
+    case duplicate_names([N || {N, _T, _C} <- Defs]) of
+        [] -> {ok, {create_table, to_atom(TableStr),
+                    [{to_atom(N), T, expand_constraints(C)} || {N, T, C} <- Defs]}};
         Dups -> {error, {duplicate_columns, Dups}}
     end;
 
@@ -320,7 +329,9 @@ reorder_joins(From, Where) ->
                     %% つながりを見るときは WHERE も含める。
                     %% FROM a, b WHERE a.x = b.y という書き方では、
                     %% 結合条件が ON ではなく WHERE にある
-                    Links = [pred_keys(P) || P <- OnPreds ++ and_parts(Where)],
+                    Owners = column_owners(Tables),
+                    Links = [pred_keys(P, Owners)
+                             || P <- OnPreds ++ and_parts(Where)],
                     rebuild(greedy_order(Tables, Links, Sizes), OnPreds)
             end
     end.
@@ -431,19 +442,56 @@ connected(Keys, Key, Links) ->
                           lists:any(fun(K) -> lists:member(K, L) end, Keys)
               end, Links).
 
-%% 条件が触れている表(別名)の集合。修飾なしの名前は判断できないので
-%% 空にする。空はどの表ともつながらない扱いになり、順序を動かさない。
-pred_keys(Expr) ->
-    lists:usort(col_tables(Expr)).
+%%----------------------------------------------------------------------
+%% 条件が触れている表(別名)の集合。
+%%
+%% **修飾なしの列名も引く。** `FROM t1, t2 WHERE a1 = b2` のように、
+%% 表名を書かずに結合するのは普通の書き方で、これを「どの表か分からない」
+%% として捨てると、結合条件が1つも見えなくなる。つながりが見えないと
+%% 貪欲法は素直に直積を選ぶので、表が増えるほど爆発する。
+%%
+%% 実際 sqllogictest の select5(最大62表の結合)がこれで止まっていた。
+%%
+%% どの表の列かはカタログを引けば分かる。同じ名前が複数の表にあるときは
+%% 決められないので、そのときだけ空にする(あいまいな参照は後段で弾かれる)。
+%%----------------------------------------------------------------------
+pred_keys(Expr, Owners) ->
+    lists:usort(col_tables(Expr, Owners)).
 
-col_tables(#col_ref{table = undefined}) -> [];
-col_tables(#col_ref{table = T})         -> [T];
-col_tables(#binop{left = L, right = R}) -> col_tables(L) ++ col_tables(R);
-col_tables(#unop{arg = A})              -> col_tables(A);
-col_tables(#is_null{arg = A})           -> col_tables(A);
-col_tables(#func{args = Args}) when is_list(Args) ->
-    lists:append([col_tables(A) || A <- Args]);
-col_tables(_Other)                      -> [].
+%% 列名 -> その名前を持つ表の並び。1つに決まるものだけが手がかりになる。
+column_owners(Tables) ->
+    lists:foldl(
+      fun(T, Acc) ->
+              case resolve_table(T#table_ref.name) of
+                  {error, _} ->
+                      Acc;
+                  {ok, _Name, Columns} ->
+                      Key = key_of(T),
+                      lists:foldl(fun(#column{name = C}, A) ->
+                                          maps:update_with(C, fun(Ks) -> [Key | Ks] end,
+                                                           [Key], A)
+                                  end, Acc, Columns)
+              end
+      end, #{}, Tables).
+
+col_tables(#col_ref{table = undefined, name = N}, Owners) ->
+    case to_existing_atom(N) of
+        error     -> [];
+        {ok, Atom} ->
+            case maps:get(Atom, Owners, []) of
+                [Key] -> [Key];      % 1つに決まるときだけ手がかりにする
+                _     -> []
+            end
+    end;
+col_tables(#col_ref{table = T}, _Owners)         -> [T];
+col_tables(#binop{left = L, right = R}, O)       -> col_tables(L, O) ++ col_tables(R, O);
+col_tables(#unop{arg = A}, O)                    -> col_tables(A, O);
+col_tables(#is_null{arg = A}, O)                 -> col_tables(A, O);
+col_tables(#between_expr{arg = A, low = Lo, high = Hi}, O) ->
+    col_tables(A, O) ++ col_tables(Lo, O) ++ col_tables(Hi, O);
+col_tables(#func{args = Args}, O) when is_list(Args) ->
+    lists:append([col_tables(A, O) || A <- Args]);
+col_tables(_Other, _Owners)                      -> [].
 
 %% この問い合わせ自身の列だけ。行の並びを表すのはこちら。
 own(Scope) -> [S || #sc{level = 0} = S <- Scope].

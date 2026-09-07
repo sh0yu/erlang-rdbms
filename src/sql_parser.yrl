@@ -34,7 +34,7 @@ Nonterminals
     b_expr
     opt_group opt_having expr_list func_call
     from_item join_kw opt_alias
-    column_defs column_def type_name
+    column_defs column_def type_name col_constraints col_constraint
     opt_column_names column_names
     value_list
     assignments assignment.
@@ -52,7 +52,7 @@ Terminals
     'order' 'by' 'asc' 'desc' 'limit' 'offset' 'distinct'
     'nulls' 'first' 'last'
     'group' 'having' 'explain' 'index' 'analyze' 'read' 'only' 'committed'
-    'between' 'not_between'
+    'between' 'not_between' 'primary' 'key' 'unique'
     'union' 'intersect' 'except' 'all' 'in' 'exists' 'not_in'
     'right' 'full'
     'case' 'when' 'then' 'else' 'end' 'like' 'not_like'
@@ -135,7 +135,17 @@ create_stmt -> create table identifier '(' column_defs ')' :
 column_defs -> column_def                  : ['$1'].
 column_defs -> column_def ',' column_defs  : ['$1' | '$3'].
 
-column_def -> identifier type_name : {value_of('$1'), '$2'}.
+column_def -> identifier type_name col_constraints :
+    {value_of('$1'), '$2', '$3'}.
+
+%% 列制約。順不同で並べられる。
+col_constraints -> '$empty' : [].
+col_constraints -> col_constraint col_constraints : ['$1' | '$2'].
+
+%% PRIMARY KEY は UNIQUE かつ NOT NULL。規格どおり展開しておく。
+col_constraint -> 'primary' 'key' : primary_key.
+col_constraint -> 'unique'        : unique.
+col_constraint -> 'not' null      : not_null.
 
 type_name -> 'integer' : integer.
 type_name -> 'float'   : float.

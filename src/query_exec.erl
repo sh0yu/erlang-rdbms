@@ -578,8 +578,13 @@ do_sql_update(State, Table, Assigns, Pred) ->
                 {error, Reason} ->
                     {reply, {error, Reason}, State};
                 ok ->
-                    {reply, {ok, length(Updated)},
-                     record_update(State, Table, Columns, Updated)}
+                    case check_update_constraints(State, Table, Updated) of
+                        {error, Reason} ->
+                            {reply, {error, Reason}, State};
+                        ok ->
+                            {reply, {ok, length(Updated)},
+                             record_update(State, Table, Columns, Updated)}
+                    end
             end
     end.
 
@@ -603,6 +608,23 @@ record_update(State, Table, Columns, Updated) ->
                 end, lists:zip3(ColumnList, OldVal, NewVal))
       end, Updated),
     add_query_id(State, QueryId).
+
+%% タプルAPIの更新は1行ずつ書くので、その場で確かめて例外で戻す。
+ensure_constraints(State, Table, Row, Oid) ->
+    case check_constraints(State, Table, Row, Oid) of
+        ok              -> ok;
+        {error, Reason} -> throw({abort, Reason})
+    end.
+
+%% 更新後の行が列制約を破らないかを確かめる。自分自身は衝突相手から外す。
+%% 型検査と同じく、1行でも通らなければ何も書かない。
+check_update_constraints(_State, _Table, []) ->
+    ok;
+check_update_constraints(State, Table, [{Oid, _Old, New} | T]) ->
+    case check_constraints(State, Table, New, Oid) of
+        ok              -> check_update_constraints(State, Table, T);
+        {error, Reason} -> {error, Reason}
+    end.
 
 %% 代入が式の場合、値は行ごとに決まるので型検査は実行時になる。
 check_update_types(_Columns, []) ->
@@ -695,6 +717,7 @@ do_update_1(State, TableName, SetQuery, ColName, Val, ColumnList) ->
           fun({Oid, OldVal}, Count) ->
                   begin
                           NewVal = simple_db_server:build_new_val(OldVal, SetQueryConverted),
+                          ok = ensure_constraints(State, TableName, NewVal, Oid),
                           %% 更新前値を消して更新後値を入れる、をローカル領域に記録する
                           ets:insert(LKvstore, {QueryId, del, TableName, Oid, OldVal}),
                           ets:insert(LKvstore, {QueryId, ins, TableName, Oid, NewVal}),
@@ -1083,14 +1106,86 @@ create_local_tables() ->
     {LKvstore, LColumnIndex}.
 
 %% テーブルが存在し、カラム数が合っているかを確かめる。
-check_table(_State, TableName, Val) ->
+check_table(State, TableName, Val) ->
     case sys_tbl_mng:get_column_list(whereis(sys_tbl_mng), TableName) of
         {error, table_not_found} ->
             {error, table_not_found};
         {ok, ColumnList} when length(ColumnList) =/= length(Val) ->
             {error, column_count_mismatch};
         {ok, _ColumnList} ->
-            ok
+            check_constraints(State, TableName, Val, undefined)
+    end.
+
+%%----------------------------------------------------------------------
+%% 列制約(NOT NULL / UNIQUE)を確かめる。
+%%
+%% ExcludeOid は UPDATE のときの自分自身。自分と衝突したことにしない。
+%%
+%% == UNIQUE をスナップショットで見てはいけない ==
+%%
+%% 一意性は「いまコミットされている全体」に対する条件であって、
+%% 自分が見ている版に対する条件ではない。自分のスナップショットで
+%% 探すと、自分が始めた後に入った行を見落として重複を通す。
+%% よってここだけは共有データを直に引く。PostgreSQL も同じで、
+%% 一意制約の検査は分離水準の外にある。
+%%
+%% == 並行して同じ鍵を入れる2本 ==
+%%
+%% 双方とも「まだ無い」と判断してしまう。どちらの行も相手の
+%% 未コミット領域にあって、共有データには現れていないため。
+%%
+%% そこで**鍵そのものに書き込みロックを取る**。
+%%
+%%   {unique, 表, 列, 値}
+%%
+%% これは行ではないので、共有データに実体が無くてもロックできる。
+%% 先に取った方が進み、後から来た方は待つ。ロックが解放されるのは
+%% コミットの**適用が終わった後**(tx_mng が最後に解放する)なので、
+%% 待っていた方が共有データを引いた時点では相手の行が見えている。
+%%
+%% 残っている穴を1つ書いておく。衝突相手の行を別の接続が削除しようと
+%% していて、まだコミットしていない場合、こちらはその行を「ある」と見て
+%% 断る。PostgreSQL は相手の決着を待つ。待たずに断るぶん厳しい側に外れる。
+%%----------------------------------------------------------------------
+check_constraints(State, TableName, Row, ExcludeOid) ->
+    case sys_tbl_mng:get_columns(whereis(sys_tbl_mng), TableName) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Columns} ->
+            check_each(State, TableName, lists:zip(Columns, Row), ExcludeOid)
+    end.
+
+check_each(_State, _T, [], _Exclude) ->
+    ok;
+check_each(State, T, [{#column{constraints = []}, _V} | Rest], Exclude) ->
+    check_each(State, T, Rest, Exclude);
+check_each(State, T, [{#column{name = N, constraints = Cs}, V} | Rest], Exclude) ->
+    case check_column(State, T, N, Cs, V, Exclude) of
+        ok              -> check_each(State, T, Rest, Exclude);
+        {error, Reason} -> {error, Reason}
+    end.
+
+check_column(_State, _T, Name, Cs, null, _Exclude) ->
+    case lists:member(not_null, Cs) of
+        true  -> {error, {not_null_violation, Name}};
+        %% NULL は一意性の対象外。複数あってよい(規格どおり)
+        false -> ok
+    end;
+check_column(State, T, Name, Cs, Value, Exclude) ->
+    case lists:member(unique, Cs) of
+        false ->
+            ok;
+        true ->
+            %% 鍵を押さえてから探す。順序が逆だと、探した後・入れる前に
+            %% 別の接続が同じ鍵を入れられる
+            ok = acquire_lock(State, [{unique, T, Name, Value}], write),
+            Others = [Oid || Oid <- select_object_id_list(State, T, Name, Value,
+                                                          get_query_id_list(State)),
+                             Oid =/= Exclude],
+            case Others of
+                [] -> ok;
+                _  -> {error, {unique_violation, Name, Value}}
+            end
     end.
 
 %% 条件に一致するオブジェクトIDのリストを返す。

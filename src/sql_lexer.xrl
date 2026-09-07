@@ -68,6 +68,7 @@ keywords() ->
      "nulls", "first", "last",
      "group", "having",
      "explain", "index", "analyze", "read", "only", "committed", "between",
+     "primary", "key", "unique",
      "union", "intersect", "except", "all",
      "in", "exists",
      %% RIGHT / FULL は未実装だが予約語にしておく。
