@@ -227,6 +227,11 @@ function show(id){
   m.append(nv);
 }
 
+// 幅の足りない表は横スクロールで逃がす
+function wrap(m, tb){
+  const w=el("div","tw"); w.append(tb); m.append(w);
+}
+
 async function timeline(m,it,me){
   const tb=el("table"), th=el("tr");
   ["","誰が","何をした","状態",""].forEach(h=>th.append(el("th","",h)));
@@ -234,11 +239,13 @@ async function timeline(m,it,me){
   const bd=el("tbody");
   it.rows.forEach(rw=>{
     const tr=el("tr","hide"+(rw.bad?" bad":""));
-    tr.append(el("td","",rw.t), el("td","who",rw.who),
-              el("td",nb(rw.act),rw.act), el("td","st nb",rw.state));
+    const ac=el("td",nb(rw.act)); ac.innerHTML=md(rw.act);
+    const st=el("td","st "+nb(rw.state)); st.innerHTML=md(rw.state);
+    tr.append(el("td","",rw.t), el("td","who",rw.who), ac, st);
     const nt=el("td","note"); nt.innerHTML=md(rw.note); tr.append(nt);
     bd.append(tr);
   });
+  tb.append(hd,bd);
   wrap(m, tb);
   for(let i=0;i<bd.children.length;i++){
     if(me!==run) return;
@@ -257,6 +264,7 @@ async function compare(m,it,me){
   const hd=el("thead"); hd.append(th);
   const br=el("tr"); it.policies.forEach(()=>br.append(el("td","","—")));
   const bd=el("tbody"); bd.append(br);
+  tb.append(hd,bd);
   wrap(m, tb);
 
   const ul=el("table"), ub=el("tbody");
@@ -266,6 +274,7 @@ async function compare(m,it,me){
     const td=el("td",""); td.innerHTML=md(s.say); tr.append(td);
     ub.append(tr);
   });
+  ul.append(ub);
   wrap(m, ul);
 
   const vd=el("div"); m.append(vd);
@@ -308,7 +317,8 @@ function matrix(m,it){
     const nt=el("td","note"); nt.innerHTML=md(rw.note); tr.append(nt);
     bd.append(tr);
   });
-  tb.append(hd,bd); m.append(tb);
+  tb.append(hd,bd);
+  wrap(m, tb);
 }
 
 //----------------------------------------------------------------------
