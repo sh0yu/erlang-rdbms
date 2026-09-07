@@ -61,7 +61,7 @@ deep_key(K)                 -> deep(K).
 raw() ->
     [#{id => "choose", title => "0. 選び方",
        intro => "先に結論から。**分散DBが要ると思ったら、まず1台で足りないかを疑う。**",
-       items => [choose(), symptoms()]},
+       items => [choose(), symptoms(), glossary()]},
 
      #{id => "conflict", title => "1. 競合 — 一つのデータを二人が触る",
        intro => "分散の前に、1台でも起きる。ここを押さえないと、"
@@ -247,6 +247,79 @@ symptoms() ->
            "暗号通貨の出金で無限造幣バグになる型")],
       note => "上の6行は**1台でも起きる**。分散はそこに問題を足すだけで、"
               "元からある問題を消してはくれない。"}.
+
+glossary() ->
+    #{id => "glossary", kind => "matrix",
+      title => "用語 — 略語の綴りと意味",
+      why => "**略語は綴りを見れば半分わかる。** 分からないまま使うと、"
+             "議論が噛み合わなくなる。",
+      cols => ["綴り", "意味"],
+      rows =>
+        [m("CAP", ["Consistency / Availability / Partition tolerance",
+                   "**「3つから2つ」ではない。** P は選べないので、"
+                   "分断時に A か C かの二択"], ""),
+         m("PACELC", ["if (Partition) A or C, **Else** L or C",
+                      "**if 文として読む。** 分断時の選択(PA/PC)と、"
+                      "平常時の選択(EL/EC)を分けて言う"], "Abadi, 2010"),
+         m("ACID", ["Atomicity / Consistency / Isolation / Durability",
+                    "原子性・一貫性・分離性・永続性。**C だけが毛色が違い**、"
+                    "アプリが定義する制約の話"], ""),
+         m("BASE", ["**B**asically **A**vailable, **S**oft state, "
+                    "**E**ventual consistency",
+                    "ACID の対義語として作られた言葉。"
+                    "「だいたい使えて、状態は揺れて、いずれ揃う」"], ""),
+         m("2PL", ["Two-**Phase** Locking",
+                   "2相ロック。**取る局面と放す局面を分ける**"], ""),
+         m("2PC", ["Two-**Phase** Commit",
+                   "2相コミット。準備(prepare)してから確定(commit)する"], ""),
+         m("MVCC", ["**M**ulti-**V**ersion **C**oncurrency **C**ontrol",
+                    "多版同時実行制御。**上書きせず版を増やす**ので、"
+                    "読み手がロックを取らない"], ""),
+         m("SI", ["**S**napshot **I**solation",
+                  "スナップショット分離。取引開始時点の版を見る。"
+                  "**書き込み偏斜だけが残る**"], ""),
+         m("SSI", ["**S**erializable **S**napshot **I**solation",
+                   "SI に検査を足して直列化可能にしたもの。PostgreSQL の SERIALIZABLE"], ""),
+         m("CRDT", ["**C**onflict-free **R**eplicated **D**ata **T**ype",
+                    "競合しない複製データ型。**統合の順序によらず同じ結果になる**"
+                    "ように作った型。収束は保証、不変条件は保証しない"], ""),
+         m("LWW", ["**L**ast **W**rite **W**ins",
+                   "最後の書き込みが勝つ。**「最後」は時刻で決める**ので、"
+                   "時計がずれると壊れる"], ""),
+         m("WAL", ["**W**rite-**A**head **L**ogging",
+                   "先行書き込みログ。**データを書く前にログを書く**"], ""),
+         m("VSR", ["**V**iew**s**tamped **R**eplication",
+                   "Paxos / Raft と同類の合意手法。TigerBeetle が採用"], ""),
+         m("HLC", ["**H**ybrid **L**ogical **C**lock",
+                   "物理時計と論理時計を組み合わせたもの。CockroachDB 等"], ""),
+         m("I-confluence", ["**I**nvariant **C**onfluence",
+                            "**不変条件の合流性。** どの2つの正しい状態を統合しても"
+                            "正しいなら、協調は要らない"], "Bailis, 2014"),
+         m("escrow", ["（英）第三者預託",
+                      "**先に持ち分を切り出して預ける。** 使い切るまでは"
+                      "問い合わせずに消費できる"], "O'Neil, 1986"),
+         m("tombstone", ["（英）墓標",
+                         "削除を「消した」という**記録**で表す。"
+                         "複製に削除を伝えるために要る"], ""),
+         m("read repair", ["（英）読み取り修復",
+                           "読んだときに複製の食い違いに気づいて直す"], ""),
+         m("hinted handoff", ["（英）ヒント付き引き渡し",
+                              "届かなかった書き込みを別ノードが預かり、"
+                              "復帰したら渡す"], ""),
+         m("gc_grace_seconds", ["garbage collection grace",
+                                "**墓標を回収するまでの猶予**（Cassandra、既定10日）。"
+                                "この間に修復しないと削除が復活する"], ""),
+         m("phantom", ["（英）幽霊",
+                       "行の**値**ではなく**集合**が変わる。まだ無い行はロックできない"], ""),
+         m("write skew", ["（英）書き込みの偏斜",
+                          "**別々の行を書くので競合しないのに、全体の制約が破れる**"], ""),
+         m("exactly-once", ["ちょうど1回",
+                            "再送しても、実行は1回きり。**at-least-once（1回以上）と"
+                            "at-most-once（1回以下）の両立**"], "")],
+      note => "**BASE は ACID に引っ掛けた造語**（酸と塩基）。"
+              "こういう命名が多いので、綴りを確かめる習慣がないと混乱する。"}.
+
+t(Term, En, Ja) -> #{term => Term, en => En, ja => Ja}.
 
 q(Id, Q, Opts) -> #{id => Id, q => Q, opts => Opts}.
 o(Label, Goto) -> #{label => Label, goto => Goto}.
@@ -579,7 +652,16 @@ products() ->
 cap() ->
     #{id => "cap", kind => "timeline",
       title => "CAP — 分断したら、どちらかを選ぶ",
-      why => "ネットワークが割れている間、**一貫性と可用性は両立しない**。"
+      terms =>
+        [t("C", "Consistency", "一貫性。ここでは**線形化可能性** — "
+           "書き込んだ直後は、どの読み手も必ずその新しい値を見る"),
+         t("A", "Availability", "可用性。**落ちていないノードは、必ず応答を返す**。"
+           "「エラーを返す」は応答ではない"),
+         t("P", "Partition tolerance", "分断耐性。**ネットワークが割れても動き続ける**")],
+      why => "**よくある誤読: 「3つから2つ選ぶ」。** 実際は P は選べない — "
+             "ネットワークは割れる。だから「**分断が起きたとき A と C の"
+             "どちらを取るか**」という二択の話になる。"
+             "ネットワークが割れている間、**一貫性と可用性は両立しない**。"
              "選ぶのは「分断が起きたとき」の話であって、平常時の話ではない。"
              "そして分断は「起きるかどうか」ではなく「いつ起きるか」である。",
       actors => ["東京", "大阪"],
@@ -602,8 +684,19 @@ cap() ->
 pacelc() ->
     #{id => "pacelc", kind => "matrix",
       title => "PACELC — 平常時にも選択がある",
-      why => "CAP は分断時の話しかしていない。**分断していない時にも、"
-             "一貫性を強くすれば遅くなる**。そちらの方が、実際には毎日効いてくる。",
+      terms =>
+        [t("PA / PC", "if (Partition) then Availability or Consistency",
+           "**分断している間**は、可用性か一貫性か"),
+         t("EL / EC", "Else then Latency or Consistency",
+           "**そうでないとき（平常時）**は、遅延か一貫性か"),
+         t("読み方", "if (P) A or C, else (E) L or C",
+           "**if 文としてそのまま読む。** 「PA/EL」なら"
+           "「分断時は可用性、平常時は遅延を取る」")],
+      why => "Daniel Abadi による CAP の拡張（2010）。"
+             "**CAP は分断時の話しかしていない。** 分断は稀にしか起きないのに、"
+             "そこだけを議論しているのがおかしい、という指摘。"
+             "分断していない時にも、一貫性を強くすれば遅くなる。"
+             "**そちらの方が毎日効いてくる。**",
       cols => ["分断時 (P)", "平常時 (E)", "例"],
       rows =>
         [m("PC/EC", ["一貫性を取る", "**一貫性を取る（遅くなる）**",

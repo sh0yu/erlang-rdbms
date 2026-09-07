@@ -30,6 +30,13 @@
   main{padding:22px 26px 80px;max-width:1050px;min-width:0}
   h2{font-size:18px;margin:0 0 4px}
   .kind{font-size:10.5px;color:var(--dim);margin-bottom:12px}
+  .terms{margin:0 0 14px;background:#12181f;border:1px solid var(--line);
+         border-radius:8px;padding:10px 14px}
+  .tr2{display:flex;gap:12px;padding:4px 0;font-size:12.5px;align-items:baseline;
+       flex-wrap:wrap}
+  .tr2 .tm{color:var(--warn);font-weight:700;min-width:70px}
+  .tr2 .en{color:var(--accent);min-width:260px}
+  .tr2 .ja{color:#aeb6c2;flex:1;min-width:240px}
   .why{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
        border-radius:0 8px 8px 0;padding:12px 15px;font-size:13px;color:#c3cad4;margin:0 0 20px}
   b{color:var(--fg)}
@@ -159,6 +166,17 @@ function show(id){
   const m=$("#main"); m.textContent=""; m.scrollIntoView&&window.scrollTo(0,0);
   m.append(el("h2","",it.title));
   m.append(el("div","kind",(it.chapter?it.chapter+"　/　":"")+(KIND[it.kind]||"")));
+  if(it.terms&&it.terms.length){
+    const tt=el("div","terms");
+    it.terms.forEach(x=>{
+      const r=el("div","tr2");
+      r.innerHTML='<span class="tm">'+x.term+'</span>'+
+                  '<span class="en">'+x.en+'</span>'+
+                  '<span class="ja">'+md(x.ja)+'</span>';
+      tt.append(r);
+    });
+    m.append(tt);
+  }
   const w=el("div","why"); w.innerHTML=md(it.why); m.append(w);
 
   const me=++run;
