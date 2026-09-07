@@ -5,7 +5,7 @@
 
 query_exec_test_() ->
     {foreach, fun db_test_helper:start_db/0, fun db_test_helper:stop_db/1,
-     [fun query_without_transaction/1,
+     [fun statements_without_begin_are_autocommitted/1,
       fun ddl_needs_no_transaction/1,
       fun insert_is_visible_to_self/1,
       fun insert_rejects_unknown_table/1,
@@ -30,12 +30,16 @@ query_exec_test_() ->
 %%%===================================================================
 
 %% begin_txしていないDMLは弾かれること
-query_without_transaction(_) ->
+%% BEGIN していない文は、その1文だけのトランザクションで走る。
+%% COMMIT / ROLLBACK だけは対象外。開いていないものは閉じられない。
+statements_without_begin_are_autocommitted(_) ->
     fun() ->
         C = connect(),
         ok = q(C, {create_table, fruit, [name, price]}),
-        ?assertEqual(transaction_not_found, q(C, {insert, fruit, [apple, 100]})),
-        ?assertEqual(transaction_not_found, q(C, {select, fruit, name, apple})),
+        ?assertMatch({ok, _}, q(C, {insert, fruit, [apple, 100]})),
+        %% 確定しているので、別の接続からも見える
+        C2 = connect(),
+        ?assertEqual([[apple, 100]], q(C2, {select, fruit, name, apple})),
         ?assertEqual(transaction_not_found, q(C, {commit_tx})),
         ?assertEqual(transaction_not_found, q(C, {rollback_tx}))
     end.

@@ -79,7 +79,7 @@ exec_query(Pid, Query) ->
 %% @doc この接続の状態。
 %% グローバルなトランザクションの有無ではなく、**この接続が**
 %% トランザクションを開いているかを返す。
-%% Returns: #{in_transaction => boolean(), txid => term()}
+%% Returns: #{in_transaction, txid, readonly, isolation, snapshot, statements}
 %%----------------------------------------------------------------------
 status(Pid) ->
     gen_server:call(Pid, status).
@@ -165,9 +165,15 @@ handle_call({exec_query, {begin_read_only}}, _From, #state{txid = undefined} = S
 handle_call({exec_query, {begin_read_only}}, _From, State) ->
     {reply, {error, transaction_already_started}, State};
 
+%% COMMIT / ROLLBACK は自動コミットの対象外。開いていないのに
+%% 「開いて閉じた」ことにすると、書き手の勘違いを黙って通す。
+handle_call({exec_query, {commit_tx}}, _From, #state{txid = undefined} = State) ->
+    {reply, transaction_not_found, State};
 handle_call({exec_query, {commit_tx}}, _From, State) ->
     with_transaction(State, fun(S) -> do_commit(S) end);
 
+handle_call({exec_query, {rollback_tx}}, _From, #state{txid = undefined} = State) ->
+    {reply, transaction_not_found, State};
 handle_call({exec_query, {rollback_tx}}, _From, State) ->
     with_transaction(State, fun(S) -> do_rollback(S) end);
 
@@ -204,8 +210,19 @@ handle_call({exec_query, {delete, TableName, ColName, Val}}, _From, State) ->
 handle_call({exec_query, Query}, _From, State) ->
     {reply, {error, {unsupported_query, Query}}, State};
 
-handle_call(status, _From, #state{txid = Txid} = State) ->
-    {reply, #{in_transaction => Txid =/= undefined, txid => Txid}, State};
+handle_call(status, _From, #state{txid = Txid, readonly = RO, isolation = Iso,
+                                  snapshot = Snap, queryId = QIds} = State) ->
+    %% 画面やシェルから内部を覗くための窓。
+    %% どの版を見ているか、いくつ文を溜めているかまで返す。
+    {reply, #{in_transaction => Txid =/= undefined,
+              txid          => Txid,
+              readonly      => RO,
+              isolation     => case RO of true -> read_only; false -> Iso end,
+              snapshot      => case Snap of
+                                   undefined  -> none;
+                                   {_Ref, Seq} -> Seq
+                               end,
+              statements    => length(QIds)}, State};
 
 handle_call(terminate, _From, State) ->
     {stop, normal, ok, State};
@@ -294,6 +311,26 @@ with_write_transaction(State, Fun) ->
 %%----------------------------------------------------------------------
 -define(MAX_RESTARTS, 100).
 
+%%----------------------------------------------------------------------
+%% トランザクションが開いていなければ、その1文だけのトランザクションを
+%% 開いて閉じる(自動コミット)。
+%%
+%% SQL では文はかならずトランザクションの中で走る。明示的に BEGIN して
+%% いない場合は「その文だけのトランザクション」になる、というのが規格の
+%% 決まりで、どのクライアントもそう振る舞う。
+%%
+%% 以前は BEGIN していないDMLを transaction_not_found で断っていた。
+%% 断ると SELECT 1本にも BEGIN/COMMIT が要ることになり、標準の
+%% ツールもコーパスも通らない。
+%%
+%% COMMIT / ROLLBACK だけは対象外。開いていないものは閉じられない。
+%%----------------------------------------------------------------------
+with_transaction(#state{txid = undefined} = State, Fun) ->
+    Txid = tx_mng:begin_tx(get_tx_mng_pid(State)),
+    Snap = snapshot_mng:acquire(),
+    Implicit = State#state{txid = Txid, snapshot = Snap, queryId = []},
+    {reply, Reply, State1} = run_statement(statement_start(Implicit), Fun, ?MAX_RESTARTS),
+    finish_implicit(Reply, State1);
 with_transaction(State, Fun) ->
     case ask_transaction(State) of
         transaction_not_found ->
@@ -301,6 +338,29 @@ with_transaction(State, Fun) ->
         ok ->
             run_statement(statement_start(State), Fun, ?MAX_RESTARTS)
     end.
+
+%% 暗黙のトランザクションを閉じる。文が通ったならコミット、
+%% だめならロールバック。返すのは**文の結果**で、コミットの結果ではない。
+%% ただしコミット自体が失敗したら、そちらを返さないと嘘になる。
+finish_implicit(Reply, #state{txid = undefined} = State) ->
+    %% 文の中で捨てられている(デッドロックなど)。もう閉じるものが無い
+    {reply, Reply, State};
+finish_implicit(Reply, State) ->
+    case is_error_reply(Reply) of
+        true ->
+            {reply, _, State2} = do_rollback(State),
+            {reply, Reply, State2};
+        false ->
+            case do_commit(State) of
+                {reply, ok, State2}         -> {reply, Reply, State2};
+                {reply, {error, R}, State2} -> {reply, {error, R}, State2};
+                {reply, _Other, State2}     -> {reply, Reply, State2}
+            end
+    end.
+
+is_error_reply({error, _})          -> true;
+is_error_reply(transaction_not_found) -> true;
+is_error_reply(_)                   -> false.
 
 run_statement(State, _Fun, 0) ->
     %% やり直しが尽きた。これ以上粘っても同じなので捨てる

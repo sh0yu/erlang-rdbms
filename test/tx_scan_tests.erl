@@ -12,7 +12,7 @@
 
 tx_scan_test_() ->
     {foreach, fun db_test_helper:start_db/0, fun db_test_helper:stop_db/1,
-     [fun scan_needs_a_transaction/1,
+     [fun scan_without_begin_is_autocommitted/1,
       fun scan_unknown_table/1,
       fun scan_empty_table/1,
       fun sees_committed_rows/1,
@@ -26,11 +26,17 @@ tx_scan_test_() ->
       fun scan_spans_many_pages/1,
       fun scan_matches_index_lookup/1]}.
 
-scan_needs_a_transaction(_) ->
+%% BEGIN していなくても、その1文だけのトランザクションで走る(自動コミット)。
+%% 以前は断っていたが、SQL では文はかならずトランザクションの中で走り、
+%% 明示していなければ「その文だけ」になる、というのが規格の決まり。
+scan_without_begin_is_autocommitted(_) ->
     fun() ->
         C = connect(),
         ok = q(C, {create_table, fruit, [name, price]}),
-        ?assertEqual(transaction_not_found, q(C, {scan, fruit}))
+        ?assertEqual([], q(C, {scan, fruit})),
+        %% 書き込みも同じ。1文で確定する
+        ?assertMatch({ok, _}, q(C, {insert, fruit, [apple, 100]})),
+        ?assertEqual([[apple, 100]], q(C, {scan, fruit}))
     end.
 
 scan_unknown_table(_) ->
