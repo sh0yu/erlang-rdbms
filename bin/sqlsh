@@ -1,0 +1,51 @@
+#!/bin/sh
+# transaction_db の対話SQLシェル。
+#
+#   bin/sqlsh              対話シェルを開く
+#   bin/sqlsh --tour       同梱のツアー(priv/tour.sql)を流す
+#   bin/sqlsh FILE.sql     ファイルの文を順に実行する
+#
+# データは ./data に置かれる。消したいときは rm -rf data。
+set -e
+
+# ファイル引数は cd する前に絶対パスにしておく。
+# このスクリプトはリポジトリ直下へ移動するので、
+# 相対パスのまま渡すと呼び出し元から見た位置がずれる。
+ARG="$1"
+case "$ARG" in
+    ""|--tour) ;;
+    /*)        ;;
+    *)         ARG="$(pwd)/$ARG" ;;
+esac
+
+cd "$(dirname "$0")/.."
+
+# Erlang は /usr/bin/erl にある想定。rebar3 は apt に無いので
+# ~/.local/bin に置いてあることがある。
+if [ -x "$HOME/.local/bin/rebar3" ]; then PATH="$HOME/.local/bin:$PATH"; fi
+export PATH
+
+if ! command -v erl >/dev/null 2>&1; then
+    echo "erl が見つかりません。Erlang/OTP 25 以降を入れてください:" >&2
+    echo "  sudo apt install erlang-nox erlang-dev erlang-parsetools erlang-dialyzer" >&2
+    exit 1
+fi
+
+EBIN=_build/default/lib/transaction_db/ebin
+
+if [ ! -d "$EBIN" ] || [ ! -f "$EBIN/sql_shell.beam" ]; then
+    if ! command -v rebar3 >/dev/null 2>&1; then
+        echo "rebar3 が見つかりません。make でもビルドできます。" >&2
+        exit 1
+    fi
+    echo "building..." >&2
+    rebar3 compile >/dev/null
+fi
+
+case "$ARG" in
+    --tour) EXPR='sql_shell:run_file("priv/tour.sql"), halt().' ;;
+    "")     EXPR='sql_shell:start(), halt().' ;;
+    *)      EXPR="sql_shell:run_file(\"$ARG\"), halt()." ;;
+esac
+
+exec erl -noshell +pc unicode -pa "$EBIN" -eval "$EXPR"

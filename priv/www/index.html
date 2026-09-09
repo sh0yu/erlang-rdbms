@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>transaction_db</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#161a21; --panel2:#12161c; --line:#262c36;
+    --fg:#d7dce3; --dim:#8b94a3; --accent:#5aa9e6; --ok:#6fcf97;
+    --err:#eb5757; --warn:#e2b93b; --null:#7a839a; --b:#c98bdb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; height:100vh; display:flex; background:var(--bg); color:var(--fg);
+    font:13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size:13px; margin:0; letter-spacing:.04em; }
+  .sub { color:var(--dim); font-size:11px; }
+
+  /* ---- 左: 台本 ---- */
+  aside {
+    width:290px; flex:none; border-right:1px solid var(--line);
+    background:var(--panel); display:flex; flex-direction:column; min-height:0;
+  }
+  aside header { padding:12px 14px; border-bottom:1px solid var(--line); }
+  #demos { overflow-y:auto; flex:1; padding:8px 0; }
+  .demo > .t {
+    padding:7px 14px; cursor:pointer; color:var(--fg);
+    display:flex; gap:8px; align-items:baseline;
+  }
+  .demo > .t:hover { background:#1c222b; }
+  .demo.open > .t { color:var(--accent); }
+  .demo .n { color:var(--dim); font-size:11px; }
+  .demo .about {
+    display:none; padding:2px 14px 8px; color:var(--dim);
+    font-size:11px; white-space:pre-wrap;
+  }
+  .demo.open .about { display:block; }
+  .steps { display:none; margin:0 0 8px; padding:0; list-style:none; }
+  .demo.open .steps { display:block; }
+  .steps li {
+    padding:5px 14px 5px 22px; border-left:2px solid transparent; cursor:pointer;
+  }
+  .steps li:hover { background:#1c222b; }
+  .steps li.done { border-left-color:#33414f; opacity:.55; }
+  .steps li.next { border-left-color:var(--accent); background:#1a2husk; }
+  .steps li.next { background:#1b2430; }
+  .steps .note { color:var(--dim); font-size:11px; }
+  .steps .sqlline { color:var(--fg); font-size:11px; white-space:pre-wrap; word-break:break-all; }
+  .steps .cA { color:var(--accent); }
+  .steps .cB { color:var(--b); }
+  .steps .bang { color:var(--warn); }
+
+  /* ---- 中央 ---- */
+  main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  .bar {
+    display:flex; align-items:center; gap:8px; padding:10px 14px;
+    border-bottom:1px solid var(--line); background:var(--panel2); flex-wrap:wrap;
+  }
+  button.run {
+    background:var(--accent); color:#08111a; border:0; border-radius:6px;
+    padding:7px 16px; font:inherit; font-weight:700; cursor:pointer;
+  }
+  button.run:hover { filter:brightness(1.1); }
+  button.run:disabled { opacity:.45; cursor:default; }
+  .chip {
+    all:unset; cursor:pointer; color:var(--dim); font-size:11px;
+    border:1px solid var(--line); border-radius:999px; padding:3px 9px;
+  }
+  .chip:hover { color:var(--fg); border-color:var(--accent); }
+  .chip.on { color:#08111a; background:var(--accent); border-color:var(--accent); }
+  .chip.onB { color:#08111a; background:var(--b); border-color:var(--b); }
+  .grow { flex:1; }
+  .editor { padding:10px 14px; }
+  textarea {
+    width:100%; height:88px; resize:vertical;
+    background:#0b0d11; color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:10px; font:inherit; font-size:13px; outline:none;
+  }
+  textarea:focus { border-color:var(--accent); }
+  #out { flex:1; overflow-y:auto; padding:4px 14px 20px; min-height:0; }
+  .entry { margin-bottom:14px; border-left:2px solid var(--line); padding-left:10px; }
+  .entry.A { border-left-color:var(--accent); }
+  .entry.B { border-left-color:var(--b); }
+  .entry .head { display:flex; gap:8px; align-items:baseline; }
+  .tag { font-size:10px; padding:0 5px; border-radius:3px; color:#08111a; font-weight:700; }
+  .tag.A { background:var(--accent); } .tag.B { background:var(--b); }
+  .stepnote { color:var(--dim); font-size:11px; margin-bottom:3px; }
+  .q { color:var(--fg); white-space:pre-wrap; }
+  .msg.ok { color:var(--ok); } .msg.err { color:var(--err); white-space:pre-wrap; }
+  .msg.expected { color:var(--warn); }
+  table { border-collapse:collapse; font-size:12px; margin-top:4px; }
+  th,td { border:1px solid var(--line); padding:2px 8px; text-align:left; }
+  th { color:var(--dim); background:#11151b; }
+  td.null { color:var(--null); font-style:italic; }
+  td.num { text-align:right; }
+  .count { color:var(--dim); font-size:11px; margin-top:2px; }
+
+  /* ---- 右: 内部 ---- */
+  .inspect {
+    width:390px; flex:none; border-left:1px solid var(--line);
+    background:var(--panel); overflow-y:auto; padding:0 0 20px;
+  }
+  .sec { border-bottom:1px solid var(--line); padding:10px 14px; }
+  .sec h2 {
+    font-size:11px; margin:0 0 6px; color:var(--dim);
+    text-transform:uppercase; letter-spacing:.08em; font-weight:600;
+  }
+  pre.plan {
+    margin:0; white-space:pre; font-size:12px; color:var(--fg);
+    overflow-x:auto; line-height:1.5;
+  }
+  pre.plan .op { color:var(--accent); }
+  pre.plan .idx { color:var(--ok); }
+  .note { color:var(--dim); font-size:11px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:1px 10px; font-size:12px; }
+  .kv .k { color:var(--dim); }
+  .conn { border:1px solid var(--line); border-radius:6px; padding:7px 9px; margin-bottom:7px; }
+  .conn.A { border-left:3px solid var(--accent); }
+  .conn.B { border-left:3px solid var(--b); }
+  .conn .title { font-weight:700; margin-bottom:3px; }
+  .conn.idle .title { color:var(--dim); }
+  .badge { font-size:10px; padding:0 5px; border-radius:3px; background:#243040; color:var(--dim); }
+  .badge.tx { background:#1d3a2a; color:var(--ok); }
+  .warnline { color:var(--warn); font-size:11px; }
+</style>
+</head>
+<body>
+
+<aside>
+  <header>
+    <h1>transaction_db</h1>
+    <div class="sub">SQL を1文ずつ流して、中で何が起きているかを見る</div>
+  </header>
+  <div id="demos"></div>
+</aside>
+
+<main>
+  <div class="bar">
+    <button class="run" id="next">▶ 次の1文</button>
+    <button class="chip" id="rest">このデモを最後まで</button>
+    <button class="chip" id="reset">はじめから</button>
+    <span class="grow"></span>
+    <span class="sub">手で流す接続:</span>
+    <button class="chip on" data-conn="A">A</button>
+    <button class="chip" data-conn="B">B</button>
+  </div>
+  <div class="editor">
+    <textarea id="sql" spellcheck="false"
+      placeholder="ここに直接書いて Ctrl+Enter でも流せます。複数文は ; 区切り。"></textarea>
+  </div>
+  <div class="bar" style="border-top:1px solid var(--line);border-bottom:0">
+    <button class="run" id="run">Run</button>
+    <span class="sub">Ctrl+Enter</span>
+  </div>
+  <div id="out"></div>
+</main>
+
+<div class="inspect">
+  <div class="sec">
+    <h2>実行計画 (プランナが選んだもの)</h2>
+    <div id="plan"><div class="note">まだ何も流していません</div></div>
+  </div>
+  <div class="sec">
+    <h2>接続</h2>
+    <div id="conns"></div>
+  </div>
+  <div class="sec">
+    <h2>スナップショットと undo</h2>
+    <div id="snap"></div>
+  </div>
+  <div class="sec">
+    <h2>待ち</h2>
+    <div id="waiting"><div class="note">誰も待っていません</div></div>
+  </div>
+  <div class="sec">
+    <h2>カタログ (プランナが見ているもの)</h2>
+    <div id="cat"></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const out = $("#out");
+let demos = [], cursor = { d: 0, s: 0 }, manualConn = "A", busy = false;
+
+// ---- 台本 -------------------------------------------------------------
+async function loadDemos() {
+  demos = (await (await fetch("/api/web_ui:demos")).json()).demos;
+  renderDemos();
+}
+
+function renderDemos() {
+  const box = $("#demos");
+  box.textContent = "";
+  demos.forEach((d, di) => {
+    const wrap = el("div", "demo" + (di === cursor.d ? " open" : ""));
+    const t = el("div", "t");
+    t.append(el("span", "n", String(di + 1).padStart(2, "0")), el("span", "", d.title));
+    t.onclick = () => { cursor = { d: di, s: 0 }; renderDemos(); };
+    wrap.append(t, el("div", "about", d.about));
+    const ul = el("ul", "steps");
+    d.steps.forEach((st, si) => {
+      const li = el("li", stepClass(di, si));
+      const head = el("div", "note");
+      head.append(el("span", "c" + st.conn, "@" + st.conn + " "));
+      if (st.expect === "error") head.append(el("span", "bang", "!error "));
+      head.append(document.createTextNode(st.note || ""));
+      li.append(head, el("div", "sqlline", st.sql));
+      li.onclick = () => { cursor = { d: di, s: si }; renderDemos(); };
+      ul.append(li);
+    });
+    wrap.append(ul);
+    box.append(wrap);
+  });
+}
+
+function stepClass(di, si) {
+  if (di !== cursor.d) return "";
+  if (si < cursor.s) return "done";
+  if (si === cursor.s) return "next";
+  return "";
+}
+
+// ---- 実行 -------------------------------------------------------------
+// 接続は URL で分ける。mod_esi はクエリ文字列を経路に乗せないため。
+async function post(path, conn, body) {
+  const res = await fetch(path + (conn === "B" ? "_b" : ""), { method: "POST", body });
+  return res.json();
+}
+
+async function runStep() {
+  const d = demos[cursor.d];
+  if (!d || cursor.s >= d.steps.length) return false;
+  const st = d.steps[cursor.s];
+  const r = await post("/api/web_ui:query", st.conn, strip(st.sql));
+  render(r, st);
+  cursor.s++;
+  if (cursor.s >= d.steps.length && cursor.d < demos.length - 1) {
+    cursor = { d: cursor.d + 1, s: 0 };
+  }
+  renderDemos();
+  return true;
+}
+
+async function guard(fn) {
+  if (busy) return;
+  busy = true;
+  $("#next").disabled = $("#run").disabled = true;
+  try { await fn(); } finally {
+    busy = false;
+    $("#next").disabled = $("#run").disabled = false;
+  }
+}
+
+async function runManual() {
+  const text = $("#sql").value.trim();
+  if (!text) return;
+  for (const sql of splitStatements(text)) {
+    render(await post("/api/web_ui:query", manualConn, sql), null);
+  }
+}
+
+// 文字列リテラル内の ; では切らない
+function splitStatements(text) {
+  const stmts = []; let cur = "", inStr = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "'") {
+      if (inStr && text[i + 1] === "'") { cur += "''"; i++; continue; }
+      inStr = !inStr; cur += c;
+    } else if (c === ";" && !inStr) {
+      if (cur.trim()) stmts.push(cur.trim()); cur = "";
+    } else cur += c;
+  }
+  if (cur.trim()) stmts.push(cur.trim());
+  return stmts;
+}
+
+const strip = s => s.trim().replace(/;+$/, "");
+
+// ---- 結果 -------------------------------------------------------------
+function render(r, step) {
+  const conn = r.conn || "A";
+  const e = el("div", "entry " + conn);
+  if (step && step.note) e.append(el("div", "stepnote", step.note));
+  const head = el("div", "head");
+  head.append(el("span", "tag " + conn, conn), el("span", "q", r.sql));
+  e.append(head);
+  const res = r.result;
+  if (res.kind === "rows") {
+    e.append(tableOf(res));
+    e.append(el("div", "count", res.count + " row" + (res.count === 1 ? "" : "s")));
+  } else if (res.kind === "error") {
+    const expected = step && step.expect === "error";
+    e.append(el("div", "msg " + (expected ? "expected" : "err"),
+                (expected ? "断られました(これが正しい): " : "") + res.message));
+  } else {
+    e.append(el("div", "msg ok", res.message));
+  }
+  out.append(e);
+  out.scrollTop = out.scrollHeight;
+  showPlan(r.plan);
+  showState(r.state);
+}
+
+function tableOf(res) {
+  const t = el("table"), tr = el("tr");
+  res.columns.forEach(c => tr.append(el("th", "", c)));
+  t.append(tr);
+  res.rows.forEach(row => {
+    const r = el("tr");
+    row.forEach(c => r.append(el("td", c.t === "null" ? "null" : (c.t === "num" ? "num" : ""), c.v)));
+    t.append(r);
+  });
+  return t;
+}
+
+// ---- 右: 内部 ---------------------------------------------------------
+function showPlan(plan) {
+  const box = $("#plan");
+  box.textContent = "";
+  if (!plan) return;
+  if (plan.lines) {
+    const pre = el("pre", "plan");
+    plan.lines.forEach(l => {
+      const line = el("div");
+      // 演算子の名前だけ色を変える
+      const m = l.match(/^(\s*)(\S[^(]*?)(\s|\(|$)/);
+      if (m) {
+        line.append(document.createTextNode(m[1]));
+        const cls = /Index Scan/.test(l) ? "idx" : "op";
+        line.append(el("span", cls, m[2]));
+        line.append(document.createTextNode(l.slice(m[1].length + m[2].length)));
+      } else line.textContent = l;
+      pre.append(line);
+    });
+    box.append(pre);
+  } else {
+    box.append(el("div", "note", plan.note || ""));
+  }
+}
+
+function showState(st) {
+  if (!st) return;
+  const cb = $("#conns"); cb.textContent = "";
+  st.conns.forEach(c => {
+    const d = el("div", "conn " + c.id + (c.open && c.in_tx ? "" : " idle"));
+    const title = el("div", "title");
+    title.append(document.createTextNode("接続 " + c.id + " "));
+    title.append(el("span", "badge" + (c.in_tx ? " tx" : ""),
+                    c.open ? (c.in_tx ? "トランザクション中" : "アイドル") : "未使用"));
+    d.append(title);
+    if (c.open) {
+      d.append(kv([
+        ["分離水準", c.in_tx ? jp(c.isolation) : "-"],
+        ["見ている版", c.snapshot === "none" ? "-" : c.snapshot],
+        ["溜めた文", String(c.statements)],
+        ["ロック中", c.locks.length ? c.locks.join(", ") : "なし"],
+      ]));
+    }
+    cb.append(d);
+  });
+
+  const s = st.snapshot;
+  $("#snap").textContent = "";
+  $("#snap").append(kv([
+    ["採番済みの版", String(s.next)],
+    ["適用中", String(s.applying)],
+    ["保持している undo", String(s.undo) + " 版"],
+    ["生きているスナップショット", String(s.snapshots)],
+    ["捨てた版", String(s.discarded)],
+  ]));
+
+  const w = $("#waiting"); w.textContent = "";
+  if (!st.waiting.length) w.append(el("div", "note", "誰も待っていません"));
+  else st.waiting.forEach(x => w.append(el("div", "warnline", x)));
+
+  const cat = $("#cat"); cat.textContent = "";
+  if (!st.tables.length) cat.append(el("div", "note", "表がありません"));
+  st.tables.forEach(t => {
+    cat.append(kv([[t.name,
+      (t.indexed.length ? "索引: " + t.indexed.join(", ") : "索引なし")
+      + " / " + (t.rows === null ? "統計なし" : t.rows + " 行(統計)")]]));
+  });
+}
+
+function jp(iso) {
+  return { repeatable_read: "REPEATABLE READ", read_committed: "READ COMMITTED",
+           read_only: "READ ONLY" }[iso] || iso;
+}
+
+function kv(pairs) {
+  const d = el("div", "kv");
+  pairs.forEach(([k, v]) => { d.append(el("div", "k", k), el("div", "", v)); });
+  return d;
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// ---- 配線 -------------------------------------------------------------
+$("#next").onclick = () => guard(runStep);
+$("#rest").onclick = () => guard(async () => {
+  const d = cursor.d;
+  while (cursor.d === d && await runStep()) {}
+});
+$("#reset").onclick = () => { cursor = { d: 0, s: 0 }; out.textContent = ""; renderDemos(); };
+$("#run").onclick = () => guard(runManual);
+$("#sql").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); guard(runManual); }
+});
+document.querySelectorAll("[data-conn]").forEach(b => {
+  b.onclick = () => {
+    manualConn = b.dataset.conn;
+    document.querySelectorAll("[data-conn]").forEach(x => {
+      x.className = "chip" + (x.dataset.conn === manualConn
+        ? (manualConn === "B" ? " onB" : " on") : "");
+    });
+  };
+});
+
+loadDemos();
+</script>
+</body>
+</html>

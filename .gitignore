@@ -8,3 +8,24 @@ ebin/*.beam
 rel/example_project
 .concrete/DEV_MODE
 .rebar
+*.dat
+*.sys
+
+.DS_Store
+_build/
+rebar.lock
+
+# build output
+ebin/
+*.LOG
+*.siz
+*.idx
+query.log
+
+# leex/yecc が .xrl/.yrl から生成するソース
+src/sql_lexer.erl
+src/sql_parser.erl
+
+# シェルが作るデータ置き場
+data/
+test/slt/*.test
